@@ -29,7 +29,8 @@ COMMENTATOR_INSTRUCTIONS = (
     "text. The text must be plain spoken English with no markup. Do not state any "
     "number unless that value appears in a supplied fact. Use the supplied deterministic "
     "score phrase verbatim whenever stating the score. Refer to players by name, never "
-    "by shirt number. Match the "
+    "by shirt number. For statistics, name the team and the metric in the same sentence "
+    "as the number, using only the fully qualified supplied facts. Match the "
     "line_id and insight_id exactly."
 )
 

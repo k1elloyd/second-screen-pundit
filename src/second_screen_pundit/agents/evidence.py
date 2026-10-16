@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -140,6 +141,10 @@ def _fact_number_values(fact: Fact) -> set[float]:
     return set()
 
 
+def _is_score_fact(fact: Fact) -> bool:
+    return fact.label.casefold().startswith("match-level score")
+
+
 def _team_name_mentioned(name: str, text: str) -> bool:
     variants = (name, re.sub(r"\s+FC$", "", name, flags=re.IGNORECASE))
     folded = text.casefold()
@@ -147,11 +152,100 @@ def _team_name_mentioned(name: str, text: str) -> bool:
 
 
 def _matches_value(number: NumberMention, allowed: set[float]) -> bool:
-    target = abs(number.value)
-    if target in allowed:
+    return abs(number.value) in allowed
+
+
+def _metric_mentioned(fact: Fact, text: str) -> bool:
+    label = fact.label.casefold()
+    sentence = text.casefold()
+    metrics = (
+        (("shots on target", "on target"), ("on target",)),
+        (("best chance",), ("best chance",)),
+        (("progressive passes", "progressive pass"), ("progressive pass", "progressive passes")),
+        (("passing pair",), ("passing pair", "passes")),
+        (("defensive actions per minute",), ("defensive actions", "pressing")),
+        (("high turnovers",), ("high turnover", "turnovers")),
+        (("possession",), ("possession",)),
+        (("shots", "shot"), ("shots", "shot", "attempts")),
+        (("xg",), ("xg", "expected goals")),
+        (("cards", "card"), ("cards", "card", "bookings")),
+        (("players on the pitch",), ("players",)),
+    )
+    for label_terms, sentence_terms in metrics:
+        if any(term in label for term in label_terms):
+            return any(term in sentence for term in sentence_terms)
+    return False
+
+
+def _is_score_context(text: str) -> bool:
+    return bool(re.search(r"\b(score|lead|leads|leading|ahead|behind|level|draw|nil)\b", text, re.I))
+
+
+def _has_statistic_term(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(possession|shots?|on target|xg|expected goals|cards?|bookings|"
+            r"turnovers?|pressing|defensive actions|passes|players)\b",
+            text,
+            re.I,
+        )
+    )
+
+
+def _number_is_grounded(
+    number: NumberMention,
+    sentence: str,
+    cited_facts: list[Fact],
+    *,
+    info: MatchInfo | None,
+) -> bool:
+    score_mentions = list(_SCORE.finditer(sentence))
+    if any(
+        match.start() <= sentence.casefold().find(number.text.casefold()) < match.end()
+        for match in score_mentions
+    ):
         return True
-    tolerance = 0.5 * (10 ** -number.decimals) * number.scale
-    return any(abs(value - target) <= tolerance + 1e-9 for value in allowed)
+
+    metric_is_stated = _has_statistic_term(sentence)
+    if _is_score_context(sentence) and not metric_is_stated:
+        if any(
+            _is_score_fact(fact) and _matches_value(number, _fact_number_values(fact))
+            for fact in cited_facts
+        ):
+            return True
+
+    for fact in cited_facts:
+        if _is_score_fact(fact) or not _metric_mentioned(fact, sentence):
+            continue
+        values = _fact_number_values(fact)
+        if (
+            fact.label.casefold().startswith("match-level ")
+            and not (
+                info is not None
+                and any(
+                    _team_name_mentioned(name, sentence)
+                    for name in (info.home.name, info.away.name)
+                )
+            )
+            and re.search(r"\b(match|overall|total)\b", sentence, re.I)
+            and _matches_value(number, values)
+        ):
+            return True
+        if info is None:
+            continue
+        team_name = next(
+            (
+                name
+                for name in (info.home.name, info.away.name)
+                if fact.label.casefold().startswith(name.casefold())
+            ),
+            None,
+        )
+        if team_name is None or not _team_name_mentioned(team_name, sentence):
+            continue
+        if _matches_value(number, values):
+            return True
+    return False
 
 
 def _score_matches(
@@ -162,7 +256,7 @@ def _score_matches(
     scores = [
         (fact, str(fact.value))
         for fact in cited_facts
-        if fact.label.casefold() == "score" and isinstance(fact.value, str)
+        if _is_score_fact(fact) and isinstance(fact.value, str)
     ]
     failures: list[str] = []
     for match in _SCORE.finditer(text):
@@ -197,11 +291,22 @@ def _score_matches(
     return failures
 
 
-def _formation_matches(text: str, cited_facts: list[Fact]) -> list[str]:
+def _formation_matches(
+    text: str,
+    cited_facts: list[Fact],
+    info: MatchInfo | None,
+) -> list[str]:
     formations = [
         str(fact.value)
         for fact in cited_facts
-        if "formation" in fact.label.casefold() and isinstance(fact.value, str)
+        if "formation" in fact.label.casefold()
+        and isinstance(fact.value, str)
+        and info is not None
+        and any(
+            fact.label.casefold().startswith(name.casefold())
+            and _team_name_mentioned(name, text)
+            for name in (info.home.name, info.away.name)
+        )
     ]
     failures: list[str] = []
     for match in _FORMATION.finditer(text):
@@ -229,12 +334,22 @@ def check_evidence(
         raise ValueError("as_of must be a non-negative event sequence")
 
     event_by_id = {event.event_id: event for event in events}
+    all_fact_ids = [
+        fact.fact_id
+        for result in tool_results
+        for fact in result.facts
+    ]
+    duplicate_ids = [
+        fact_id for fact_id, count in Counter(all_fact_ids).items() if count > 1
+    ]
     facts_by_id = {
         fact.fact_id: fact
         for result in tool_results
         for fact in result.facts
     }
-    failures: list[str] = []
+    failures: list[str] = [
+        f"duplicate fact_id within run: {fact_id}" for fact_id in duplicate_ids
+    ]
 
     for event_id in output.event_ids:
         event = event_by_id.get(event_id)
@@ -249,7 +364,7 @@ def check_evidence(
 
     if isinstance(output, CommentaryLine) and info is not None:
         for fact in facts_by_id.values():
-            if fact.label.casefold() != "score" or not isinstance(fact.value, str):
+            if not _is_score_fact(fact) or not isinstance(fact.value, str):
                 continue
             score_match = _SCORE.fullmatch(fact.value)
             if score_match is None:
@@ -303,25 +418,29 @@ def check_evidence(
             elif event.seq > as_of:
                 failures.append(f"future event_id: {event_id} is after as_of {as_of}")
         cited_facts = [facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id]
-        allowed_numbers = {
-            value
-            for fact in cited_facts
-            for value in _fact_number_values(fact)
-        }
-        for event_id in event_ids:
-            event = event_by_id.get(event_id)
-            if event is not None and event.seq <= as_of:
-                allowed_numbers.update(
-                    {float(event.minute), float(event.added_minute), float(event.minute + event.added_minute)}
-                )
-
-        for number in extract_numbers(text):
-            if number.ordinal and 1 <= number.value <= 10:
-                continue
-            if not _matches_value(number, allowed_numbers):
-                failures.append(f"ungrounded number {number.text!r}")
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            score_spans = list(_SCORE.finditer(sentence))
+            formation_spans = list(_FORMATION.finditer(sentence))
+            back_line_spans = list(_BACK_LINE.finditer(sentence))
+            for number in extract_numbers(sentence):
+                if number.ordinal and 1 <= number.value <= 10:
+                    continue
+                number_start = sentence.casefold().find(number.text.casefold())
+                if any(match.start() <= number_start < match.end() for match in score_spans):
+                    continue
+                if any(match.start() <= number_start < match.end() for match in formation_spans):
+                    continue
+                if any(match.start() <= number_start < match.end() for match in back_line_spans):
+                    continue
+                if not _number_is_grounded(
+                    number,
+                    sentence,
+                    cited_facts,
+                    info=info,
+                ):
+                    failures.append(f"ungrounded number {number.text!r}")
         failures.extend(_score_matches(text, cited_facts, info))
-        failures.extend(_formation_matches(text, cited_facts))
+        failures.extend(_formation_matches(text, cited_facts, info))
 
     unique_failures = tuple(dict.fromkeys(failures))
     return EvidenceReport(passed=not unique_failures, failures=unique_failures)

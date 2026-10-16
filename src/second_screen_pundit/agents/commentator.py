@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 
 from agent_framework import FunctionMiddleware
 from azure.core.credentials import TokenCredential
@@ -24,7 +25,7 @@ _EVENT_ID_PATTERN = re.compile(r"\bm\d{2}-e\d{4,}\b", re.IGNORECASE)
 _FACT_ID_PATTERN = re.compile(
     r"\b(?:match_state|possession_window|xg_timeline|shot_summary|"
     r"pressing_intensity|pass_network|formation_at|key_moments|"
-    r"compare_windows|tactical_signals):[a-z0-9_]+\b",
+    r"compare_windows|tactical_signals):[a-z0-9_:-]+\b",
     re.IGNORECASE,
 )
 
@@ -65,7 +66,7 @@ def console_tool_results(
         MatchStateParams(minute=minute),
         as_of=event.seq,
     )
-    score = next(fact for fact in state.facts if fact.label == "Score")
+    score = next(fact for fact in state.facts if fact.label.startswith("Match-level score"))
     results = [
         ToolResult(tool=state.tool, facts=[score]),
     ]
@@ -84,8 +85,8 @@ def console_tool_results(
                     tool="shot_summary",
                     facts=[
                         Fact(
-                            fact_id=f"shot_summary:scoring_shot_xg_{event.seq}",
-                            label="Scoring shot xG",
+                            fact_id=f"shot_summary:{event.seq}:scoring_shot_xg",
+                            label=f"{team_display_name(info, event.team or 'home')} scoring shot xG at {minute}'",
                             value=shot.xg or 0.0,
                             unit="xG",
                             event_ids=[shot.event_id],
@@ -104,11 +105,18 @@ def console_tool_results(
         ])
         return results
     if event.type == "card":
-        label = "Home cards" if event.team == "home" else "Away cards"
         results.append(
             ToolResult(
                 tool=state.tool,
-                facts=[fact for fact in state.facts if fact.label == label],
+                facts=[
+                    fact
+                    for fact in state.facts
+                    if fact.label.startswith(
+                        f"{info.home.name} cards"
+                        if event.team == "home"
+                        else f"{info.away.name} cards"
+                    )
+                ],
             )
         )
         return results
@@ -128,7 +136,7 @@ def console_tool_results(
                 facts=[
                     fact
                     for fact in summary.facts
-                    if fact.label in {"xG", "Best chance"}
+                    if " xG" in fact.label or "best chance xG" in fact.label
                 ],
             )
         ])
@@ -180,8 +188,14 @@ def build_console_insight(
     event: Event,
     info: MatchInfo,
     events: list[Event],
+    *,
+    tool_results: Sequence[ToolResult] | None = None,
 ) -> ConsoleInsight:
-    results = console_tool_results(event, info, events)
+    results = (
+        console_tool_results(event, info, events)
+        if tool_results is None
+        else list(tool_results)
+    )
     facts = [fact for result in results for fact in result.facts]
     team_name = (
         info.home.name if event.team == "home" else info.away.name if event.team == "away" else "The match"
@@ -207,7 +221,7 @@ def build_console_insight(
         headline=headline,
         score_phrase=score_phrase(
             info,
-            str(next(fact.value for fact in facts if fact.label == "Score")),
+            str(next(fact.value for fact in facts if fact.label.startswith("Match-level score"))),
         ),
         event_context=_event_context(event, info),
         facts=[fact.model_dump(mode="json") for fact in facts],

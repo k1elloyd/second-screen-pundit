@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from agent_framework import MiddlewareFailure
 
 from second_screen_pundit.agents.cache import load_cached_match
 from second_screen_pundit.agents.clients import create_foundry_agent
@@ -23,7 +24,14 @@ from second_screen_pundit.agents.pipeline import (
     _cached_tool_results,
     _workflow_models,
 )
-from second_screen_pundit.agents.tools.analytics import MatchStateParams, match_state
+from second_screen_pundit.agents.tools.analytics import (
+    Fact,
+    MatchStateParams,
+    ShotSummaryParams,
+    ToolResult,
+    match_state,
+    shot_summary,
+)
 from second_screen_pundit.agents.signals import SignalTracker
 from second_screen_pundit.agents.tools.runtime import ToolResultCapture
 from second_screen_pundit.agents.config import AgentSettings
@@ -122,6 +130,177 @@ def test_three_ahead_is_rejected_when_cited_score_is_zero_two() -> None:
 
     assert not report.passed
     assert any("ungrounded number 'three'" in failure for failure in report.failures)
+
+
+def test_team_statistics_are_not_grounded_by_a_score_fact() -> None:
+    events = generate_match("m01")
+    info = get_match_info("m01")
+    goal = next(event for event in events if event.type == "goal")
+    score = Fact(
+        fact_id="match_state:review-case:score",
+        label="Match-level score through 90'",
+        value="2-1",
+        event_ids=[goal.event_id],
+    )
+    line = CommentaryLine(
+        line_id=f"m01-l{goal.seq:03d}",
+        text="Ashbridge Rovers have had 2 shots and 1 on target.",
+        insight_id="m01-i0001",
+        fact_ids=[score.fact_id],
+        event_ids=[goal.event_id],
+        tone="measured",
+    )
+
+    report = check_evidence(
+        line,
+        events=events,
+        as_of=goal.seq,
+        tool_results=[ToolResult(tool="match_state", facts=[score])],
+        info=info,
+    )
+
+    assert not report.passed
+    assert sum("ungrounded number" in failure for failure in report.failures) == 2
+
+
+def test_team_statistics_pass_when_their_facts_and_team_are_cited() -> None:
+    events = generate_match("m01")
+    info = get_match_info("m01")
+    as_of = events[-1].seq
+    stats = shot_summary(
+        events,
+        ShotSummaryParams(team="home", start=0, end=91),
+        as_of=as_of,
+    )
+    shots, on_target = stats.facts[:2]
+    line = CommentaryLine(
+        line_id=f"m01-l{as_of:03d}",
+        text=(
+            f"{info.home.name} have had {shots.value} shots and "
+            f"{on_target.value} on target."
+        ),
+        insight_id="m01-i0001",
+        fact_ids=[shots.fact_id, on_target.fact_id],
+        event_ids=list(dict.fromkeys([*shots.event_ids, *on_target.event_ids])),
+        tone="measured",
+    )
+
+    report = check_evidence(
+        line,
+        events=events,
+        as_of=as_of,
+        tool_results=[stats],
+        info=info,
+    )
+
+    assert report.passed, report.failures
+
+
+def test_fact_ids_are_unique_across_calls_and_duplicates_are_rejected() -> None:
+    events = generate_match("m01")
+    info = get_match_info("m01")
+    as_of = events[-1].seq
+    params = ShotSummaryParams(team="home", start=0, end=45)
+    first = shot_summary(events, params, as_of=as_of)
+    second = shot_summary(events, params, as_of=as_of)
+    first_ids = {fact.fact_id for fact in first.facts}
+    second_ids = {fact.fact_id for fact in second.facts}
+    assert first_ids.isdisjoint(second_ids)
+
+    shots, on_target = first.facts[:2]
+    line = CommentaryLine(
+        line_id=f"m01-l{as_of:03d}",
+        text=(
+            f"{info.home.name} have had {shots.value} shots and "
+            f"{on_target.value} on target."
+        ),
+        insight_id="m01-i0001",
+        fact_ids=[shots.fact_id, on_target.fact_id],
+        event_ids=list(dict.fromkeys([*shots.event_ids, *on_target.event_ids])),
+        tone="measured",
+    )
+    report = check_evidence(
+        line,
+        events=events,
+        as_of=as_of,
+        tool_results=[first, second],
+        info=info,
+    )
+    assert report.passed, report.failures
+
+    duplicated = second.model_copy(
+        update={
+            "facts": [
+                fact.model_copy(update={"fact_id": first.facts[index].fact_id})
+                for index, fact in enumerate(second.facts)
+            ]
+        }
+    )
+    duplicate_report = check_evidence(
+        line,
+        events=events,
+        as_of=as_of,
+        tool_results=[first, duplicated],
+        info=info,
+    )
+    assert not duplicate_report.passed
+    assert any("duplicate fact_id within run" in failure for failure in duplicate_report.failures)
+
+
+@pytest.mark.parametrize(
+    ("operation", "error"),
+    [
+        ("question", RuntimeError("HTTP 429 throttled")),
+        ("question", MiddlewareFailure("invalid minute=93 argument")),
+        ("recap", RuntimeError("HTTP 429 throttled")),
+        ("recap", MiddlewareFailure("invalid minute=93 argument")),
+    ],
+)
+def test_question_and_recap_fall_back_after_agent_or_tool_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    error: Exception,
+) -> None:
+    class FailingAgent:
+        async def run(self, _: object) -> object:
+            raise error
+
+    class PassthroughWorkflow:
+        def __init__(self, *, start_executor: object) -> None:
+            self.agent = start_executor
+
+        def build(self) -> PassthroughWorkflow:
+            return self
+
+        async def run(self, message: object) -> object:
+            return await self.agent.run(message.contents)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        "second_screen_pundit.agents.pipeline.AgentExecutor",
+        lambda agent: agent,
+    )
+    monkeypatch.setattr(
+        "second_screen_pundit.agents.pipeline.WorkflowBuilder",
+        PassthroughWorkflow,
+    )
+    events = generate_match("m01")
+    info = get_match_info("m01")
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+    monkeypatch.setattr(pipeline, "_agent", lambda *_args, **_kwargs: FailingAgent())
+    as_of = events[-1].seq
+
+    if operation == "question":
+        result = asyncio.run(
+            pipeline.answer_question(info, events, "Why did the shape change?", as_of=as_of)
+        )
+        notice = result.explanation.notice
+    else:
+        result = asyncio.run(pipeline.produce_recap(info, events, as_of=as_of))
+        notice = result.recap.notice
+
+    assert result.attempts == 2
+    assert result.evidence.passed
+    assert notice is not None and type(error).__name__ in notice
 
 
 @pytest.mark.parametrize(
@@ -310,8 +489,12 @@ def test_goal_fast_path_cites_linked_scoring_shot_and_goal_once(
     assert roles == ["commentator"]
     assert shot_id in result.line.event_ids  # type: ignore[union-attr]
     assert goal.event_id in result.line.event_ids  # type: ignore[union-attr]
-    shot_fact = next(fact for item in result.tool_results for fact in item.facts
-                     if fact.label == "Scoring shot xG")
+    shot_fact = next(
+        fact
+        for item in result.tool_results
+        for fact in item.facts
+        if "scoring shot xG" in fact.label
+    )
     assert shot_fact.event_ids == [shot_id]
 
 
@@ -687,6 +870,7 @@ def test_speech_synthesizer_uses_entra_and_emits_mp3(
     assert observed["config"]["token_credential"] is not None  # type: ignore[index]
     assert observed["config"]["endpoint"] == "https://speech.example.invalid/"  # type: ignore[index]
     assert "region" not in observed["config"]  # type: ignore[operator]
+    assert observed["synthesizer"]["audio_config"] is None  # type: ignore[index]
     assert observed["format"] == "mp3"
     assert observed["text"] == "A synthetic commentary line."
     assert artifact.duration_seconds == 121

@@ -42,6 +42,7 @@ class SpeechSynthesizer:
         try:
             synthesizer = speechsdk.SpeechSynthesizer(
                 speech_config=self._config,
+                audio_config=None,
             )
             result = synthesizer.speak_text_async(text).get()
             if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:

@@ -22,7 +22,10 @@ def test_console_insight_has_deterministic_facts_and_event_references() -> None:
     assert insight.insight_id == f"m01-i{goal.seq:04d}"
     assert insight.event_ids[0] == goal.event_id
     assert insight.fact_ids
-    score = next(fact for fact in insight.facts if fact["label"] == "Score")
+    score = next(
+        fact for fact in insight.facts
+        if fact["label"].startswith("Match-level score")
+    )
     assert score["value"] == "1-2"
     assert goal.event_id in score["event_ids"]
 

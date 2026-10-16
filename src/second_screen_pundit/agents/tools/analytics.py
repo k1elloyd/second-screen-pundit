@@ -5,6 +5,7 @@ from collections import Counter
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any, TypeVar
+from uuid import uuid4
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -138,7 +139,7 @@ def _fact(
 ) -> Fact:
     slug = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_")
     return Fact(
-        fact_id=f"{tool}:{slug}",
+        fact_id=f"{tool}:{uuid4().hex}:{slug}",
         label=label,
         value=value,
         unit=unit,
@@ -150,6 +151,13 @@ def _fact(
 
 def _team_events(events: list[Event], team: Team) -> list[Event]:
     return [event for event in events if event.team == team]
+
+
+def _team_name(events: list[Event], team: Team) -> str:
+    info = get_match_info(events[0].match_id) if events else None
+    if info is None:
+        return team.title()
+    return info.home.name if team == "home" else info.away.name
 
 
 def _possession(events: list[Event], team: Team) -> tuple[float, list[Event]]:
@@ -193,6 +201,7 @@ def match_state(
     goals = [event for event in relevant if event.type == "goal"]
     shots = [event for event in relevant if event.type == "shot"]
     cards = [event for event in relevant if event.type == "card"]
+    home_name, away_name = _team_name(visible, "home"), _team_name(visible, "away")
     home_goals = [event for event in goals if event.team == "home"]
     away_goals = [event for event in goals if event.team == "away"]
     home_possession, home_pass_evidence = _possession(relevant, "home")
@@ -200,15 +209,25 @@ def match_state(
     away_formation, away_formation_events = _formation_at(relevant, "away", minute)
     score_evidence = goals
     facts = [
-        _fact("match_state", "Score", f"{len(home_goals)}-{len(away_goals)}", None, score_evidence),
-        _fact("match_state", "Home possession", home_possession, "%", home_pass_evidence),
-        _fact("match_state", "Shots", len(shots), "shots", shots),
-        _fact("match_state", "Home xG", round(sum(event.xg or 0 for event in shots if event.team == "home"), 3), "xG", [event for event in shots if event.team == "home"]),
-        _fact("match_state", "Away xG", round(sum(event.xg or 0 for event in shots if event.team == "away"), 3), "xG", [event for event in shots if event.team == "away"]),
-        _fact("match_state", "Home cards", sum(event.team == "home" for event in cards), "cards", [event for event in cards if event.team == "home"]),
-        _fact("match_state", "Away cards", sum(event.team == "away" for event in cards), "cards", [event for event in cards if event.team == "away"]),
-        _fact("match_state", "Home formation", home_formation, None, home_formation_events),
-        _fact("match_state", "Away formation", away_formation, None, away_formation_events),
+        _fact("match_state", f"Match-level score through {minute}'", f"{len(home_goals)}-{len(away_goals)}", None, score_evidence),
+        _fact("match_state", f"{home_name} possession through {minute}'", home_possession, "%", home_pass_evidence),
+        *[
+            _fact(
+                "match_state",
+                f"{_team_name(visible, team)} shots through {minute}'",
+                sum(event.team == team for event in shots),
+                "shots",
+                [event for event in shots if event.team == team],
+            )
+            for team in ("home", "away")
+        ],
+        _fact("match_state", f"Match-level total shots through {minute}'", len(shots), "shots", shots),
+        _fact("match_state", f"{home_name} xG through {minute}'", round(sum(event.xg or 0 for event in shots if event.team == "home"), 3), "xG", [event for event in shots if event.team == "home"]),
+        _fact("match_state", f"{away_name} xG through {minute}'", round(sum(event.xg or 0 for event in shots if event.team == "away"), 3), "xG", [event for event in shots if event.team == "away"]),
+        _fact("match_state", f"{home_name} cards through {minute}'", sum(event.team == "home" for event in cards), "cards", [event for event in cards if event.team == "home"]),
+        _fact("match_state", f"{away_name} cards through {minute}'", sum(event.team == "away" for event in cards), "cards", [event for event in cards if event.team == "away"]),
+        _fact("match_state", f"{home_name} formation through {minute}'", home_formation, None, home_formation_events),
+        _fact("match_state", f"{away_name} formation through {minute}'", away_formation, None, away_formation_events),
     ]
     return ToolResult(tool="match_state", facts=facts, caveats=caveats)
 
@@ -230,7 +249,7 @@ def possession_window(
     facts = [
         _fact(
             "possession_window",
-            f"{team.title()} possession",
+            f"{_team_name(visible, team)} possession, {start}-{end}'",
             round(sum(event.team == team for event in successful) / denominator * 100, 1)
             if denominator
             else 0.0,
@@ -269,7 +288,7 @@ def xg_timeline(
             facts.append(
                 _fact(
                     "xg_timeline",
-                    f"{team.title()} cumulative xG through {bucket}'",
+                    f"{_team_name(visible, team)} cumulative xG through {bucket}'",
                     value,
                     "xG",
                     [event for prior_bucket in range(5, bucket + 1, 5) for event in buckets.get(prior_bucket, {"home": [], "away": []})[team]],
@@ -296,12 +315,12 @@ def shot_summary(
     on_target = [event for event in shots if event.outcome == "success"]
     best = max(shots, key=lambda event: (event.xg or 0, -event.seq), default=None)
     facts = [
-        _fact("shot_summary", "Shots", len(shots), "shots", shots),
-        _fact("shot_summary", "On target", len(on_target), "shots", on_target),
-        _fact("shot_summary", "xG", round(sum(event.xg or 0 for event in shots), 3), "xG", shots),
+        _fact("shot_summary", f"{_team_name(visible, params.team)} shots, {start}-{end}'", len(shots), "shots", shots),
+        _fact("shot_summary", f"{_team_name(visible, params.team)} shots on target, {start}-{end}'", len(on_target), "shots", on_target),
+        _fact("shot_summary", f"{_team_name(visible, params.team)} xG, {start}-{end}'", round(sum(event.xg or 0 for event in shots), 3), "xG", shots),
         _fact(
             "shot_summary",
-            "Best chance",
+            f"{_team_name(visible, params.team)} best chance xG, {start}-{end}'",
             best.xg or 0.0 if best else 0.0,
             "xG",
             [best] if best else [],
@@ -343,8 +362,8 @@ def pressing_intensity(
     duration = max(0, end - start)
     rate = round(len(defensive) / duration, 2) if duration else 0.0
     facts = [
-        _fact("pressing_intensity", "Defensive actions per minute", rate, "actions/min", defensive),
-        _fact("pressing_intensity", "High turnovers", len(high_turnovers), "turnovers", high_turnovers),
+        _fact("pressing_intensity", f"{_team_name(visible, params.team)} defensive actions per minute, {start}-{end}'", rate, "actions/min", defensive),
+        _fact("pressing_intensity", f"{_team_name(visible, params.team)} high turnovers, {start}-{end}'", len(high_turnovers), "turnovers", high_turnovers),
     ]
     return ToolResult(tool="pressing_intensity", facts=facts, caveats=caveats)
 
@@ -388,11 +407,11 @@ def pass_network(
         for passer, receiver in top_pairs
     ]
     facts = [
-        _fact("pass_network", "Progressive passes", len(progressive), "passes", progressive),
+        _fact("pass_network", f"{_team_name(visible, params.team)} progressive passes, {start}-{end}'", len(progressive), "passes", progressive),
         *[
             _fact(
                 "pass_network",
-                f"Passing pair {passer} to {receiver}",
+                f"{_team_name(visible, params.team)} passing pair {passer} to {receiver}, {start}-{end}'",
                 pairs[(passer, receiver)],
                 "passes",
                 pair_events[(passer, receiver)],
@@ -415,7 +434,7 @@ def formation_at(
     formation, evidence = _formation_at(visible, params.team, minute)
     return ToolResult(
         tool="formation_at",
-        facts=[_fact("formation_at", f"{params.team.title()} formation", formation, None, evidence)],
+        facts=[_fact("formation_at", f"{_team_name(visible, params.team)} formation at {minute}'", formation, None, evidence)],
         caveats=caveats,
     )
 
@@ -454,7 +473,7 @@ def key_moments(
     facts = [
         _fact(
             "key_moments",
-            f"{label} at {event.minute + event.added_minute}'",
+            f"{_team_name(visible, event.team) if event.team else 'Match-level'} {label.casefold()} at {event.minute + event.added_minute}'",
             event.type,
             None,
             [event],
@@ -539,11 +558,11 @@ def compare_windows(
     )
     delta = round(after_value - before_value, 3)
     facts = [
-        _fact("compare_windows", "Before", before_value, unit, before_events),
-        _fact("compare_windows", "After", after_value, unit, after_events),
+        _fact("compare_windows", f"{_team_name(visible, params.team)} {params.metric} before, {before_start}-{before_end}'", before_value, unit, before_events),
+        _fact("compare_windows", f"{_team_name(visible, params.team)} {params.metric} after, {after_start}-{after_end}'", after_value, unit, after_events),
         _fact(
             "compare_windows",
-            "Change",
+            f"{_team_name(visible, params.team)} {params.metric} change, {before_start}-{before_end}' vs {after_start}-{after_end}'",
             delta,
             unit,
             [*before_events, *after_events],

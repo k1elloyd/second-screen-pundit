@@ -3,13 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeVar
 
-from agent_framework import Agent, AgentExecutor, FunctionMiddleware, Message, WorkflowBuilder
+from agent_framework import (
+    Agent,
+    AgentExecutor,
+    FunctionExecutor,
+    FunctionMiddleware,
+    Message,
+    WorkflowBuilder,
+    WorkflowContext,
+)
 from agent_framework.exceptions import ChatClientException
 from agent_framework.foundry import FoundryChatClient
 from azure.core.credentials import TokenCredential
@@ -194,29 +203,47 @@ def _cached_tool_results(
     if not visible:
         raise ValueError("Cannot validate cached output without visible events")
     minute = max(_event_clock(event) for event in visible)
-    results = [match_state(events, MatchStateParams(minute=minute), as_of=as_of)]
+    state = match_state(events, MatchStateParams(minute=minute), as_of=as_of)
+    results = [state.model_copy(update={
+        "facts": [
+            fact.model_copy(update={"fact_id": "match_state:score"})
+            if fact.label.startswith("Match-level score")
+            else fact
+            for fact in state.facts
+        ]
+    })]
     if "formation_at:home_formation" in fact_ids:
         from second_screen_pundit.agents.tools.analytics import formation_at
         from second_screen_pundit.agents.tools.parameters import FormationAtParams
 
-        results.append(
-            formation_at(
-                events,
-                FormationAtParams(team="home", minute=minute),
-                as_of=as_of,
-            )
+        home_formation = formation_at(
+            events,
+            FormationAtParams(team="home", minute=minute),
+            as_of=as_of,
         )
+        results.append(home_formation.model_copy(update={
+            "facts": [
+                home_formation.facts[0].model_copy(
+                    update={"fact_id": "formation_at:home_formation"}
+                )
+            ]
+        }))
     if "formation_at:away_formation" in fact_ids:
         from second_screen_pundit.agents.tools.analytics import formation_at
         from second_screen_pundit.agents.tools.parameters import FormationAtParams
 
-        results.append(
-            formation_at(
-                events,
-                FormationAtParams(team="away", minute=minute),
-                as_of=as_of,
-            )
+        away_formation = formation_at(
+            events,
+            FormationAtParams(team="away", minute=minute),
+            as_of=as_of,
         )
+        results.append(away_formation.model_copy(update={
+            "facts": [
+                away_formation.facts[0].model_copy(
+                    update={"fact_id": "formation_at:away_formation"}
+                )
+            ]
+        }))
     return results
 
 
@@ -238,9 +265,17 @@ def _fallback_explanation(
 ) -> Explanation:
     facts_by_id = _result_fact_map(results)
     selected = list(facts_by_id.values())[:5]
+
+    def display_label(fact: Fact) -> str:
+        return re.sub(
+            r"\s+(?:through|at)\s+\d+'$|,\s*\d+-\d+'(?:\s+vs\s+\d+-\d+')?$",
+            "",
+            fact.label,
+        )
+
     claims = [
         Claim(
-            text=f"{fact.label}: {fact.value}{fact.unit or ''}.",
+            text=f"{display_label(fact)}: {fact.value}{f' {fact.unit}' if fact.unit else ''}.",
             fact_ids=[fact.fact_id],
             event_ids=fact.event_ids,
         )
@@ -302,7 +337,10 @@ def _fallback_recap(
             [*_all_event_ids(results), *(event_id for moment in moments for event_id in moment.event_ids)]
         )
     )
-    score = facts.get("match_state:score")
+    score = next(
+        (fact for fact in facts.values() if fact.label.startswith("Match-level score")),
+        None,
+    )
     score_text = f" The verified score is {score.value}." if score is not None else ""
     return Recap(
         headline="Verified match recap",
@@ -435,8 +473,14 @@ class PunditPipeline:
         clock = min(90, max(_event_clock(event) for event in visible))
         if must_say:
             event = next(event for event in window if is_must_say(event, events))
-            deterministic_console = build_console_insight(event, info, events)
-            accumulated_results.extend(console_tool_results(event, info, events))
+            console_results = console_tool_results(event, info, events)
+            deterministic_console = build_console_insight(
+                event,
+                info,
+                events,
+                tool_results=console_results,
+            )
+            accumulated_results.extend(console_results)
             deterministic_insight = Insight(
                 insight_id=deterministic_console.insight_id,
                 minute=deterministic_console.minute,
@@ -453,7 +497,8 @@ class PunditPipeline:
                 as_of=as_of,
             )
             score_fact = next(
-                fact for fact in score_result.facts if fact.label == "Score"
+                fact for fact in score_result.facts
+                if fact.label.startswith("Match-level score")
             )
             accumulated_results.append(
                 ToolResult(tool=score_result.tool, facts=[score_fact])
@@ -617,7 +662,7 @@ class PunditPipeline:
                         fact
                         for result in accumulated_results
                         for fact in result.facts
-                        if fact.label == "Score"
+                        if fact.label.startswith("Match-level score")
                     )
                     candidate = candidate.model_copy(
                         update={
@@ -731,8 +776,68 @@ class PunditPipeline:
                 tuple(timings),
             )
 
+        async def route_by_must_say(
+            fast_path: bool,
+            context: WorkflowContext[bool],
+        ) -> None:
+            await context.send_message(fast_path)
+
+        async def run_fast_route(
+            _: bool,
+            context: WorkflowContext[LiveWindowResult],
+        ) -> None:
+            await context.yield_output(await attempts())
+
+        async def run_tactical_route(
+            _: bool,
+            context: WorkflowContext[LiveWindowResult],
+        ) -> None:
+            await context.yield_output(await attempts())
+
+        route_executor = FunctionExecutor(
+            route_by_must_say,
+            id="live_path_router",
+            input=bool,
+            output=bool,
+        )
+        fast_executor = FunctionExecutor(
+            run_fast_route,
+            id="must_say_fast_path",
+            input=bool,
+            workflow_output=LiveWindowResult,
+        )
+        tactical_executor = FunctionExecutor(
+            run_tactical_route,
+            id="tactical_path",
+            input=bool,
+            workflow_output=LiveWindowResult,
+        )
+        workflow = (
+            WorkflowBuilder(
+                start_executor=route_executor,
+                output_from=[fast_executor, tactical_executor],
+            )
+            .add_edge(route_executor, fast_executor, condition=lambda fast_path: fast_path)
+            .add_edge(
+                route_executor,
+                tactical_executor,
+                condition=lambda fast_path: not fast_path,
+            )
+            .build()
+        )
         try:
-            return await asyncio.wait_for(attempts(), timeout=deadline)
+            run_result = await asyncio.wait_for(workflow.run(must_say), timeout=deadline)
+            result = next(
+                (
+                    output
+                    for output in run_result.get_outputs()
+                    if isinstance(output, LiveWindowResult)
+                ),
+                None,
+            )
+            if result is None:
+                raise RuntimeError("Live workflow returned no window result")
+            return result
         except TimeoutError:
             return LiveWindowResult(
                 "timed_out",
@@ -860,36 +965,46 @@ class PunditPipeline:
         deadline = self.settings.explainer_timeout_seconds
         accumulated_results: list[ToolResult] = []
         feedback = ""
+        last_failure: str | None = None
 
         async def attempts() -> QuestionResult | None:
-            nonlocal feedback
+            nonlocal feedback, last_failure
             for attempt in range(2):
-                tools, capture = build_analytics_tools(events, as_of=as_of)
-                explainer = self._agent(
-                    "explainer",
-                    EXPLAINER_INSTRUCTIONS,
-                    tools=tools,
-                    middleware=[capture],
-                    time_budget=deadline,
-                )
-                workflow = WorkflowBuilder(start_executor=AgentExecutor(explainer)).build()
-                prompt = json.dumps(
-                    {
-                        "match": {
-                            "id": info.match_id,
-                            "home": info.home.name,
-                            "away": info.away.name,
-                        },
-                        "question": question,
-                        "retry_feedback": feedback,
-                    }
-                )
+                capture = None
                 try:
+                    tools, capture = build_analytics_tools(events, as_of=as_of)
+                    explainer = self._agent(
+                        "explainer",
+                        EXPLAINER_INSTRUCTIONS,
+                        tools=tools,
+                        middleware=[capture],
+                        time_budget=deadline,
+                    )
+                    workflow = WorkflowBuilder(start_executor=AgentExecutor(explainer)).build()
+                    prompt = json.dumps(
+                        {
+                            "match": {
+                                "id": info.match_id,
+                                "home": info.home.name,
+                                "away": info.away.name,
+                            },
+                            "question": question,
+                            "retry_feedback": feedback,
+                        }
+                    )
                     run_result = await workflow.run(
                         Message(role="user", contents=prompt)
                     )
+                except Exception as exc:
+                    last_failure = type(exc).__name__
+                    feedback = (
+                        f"The previous agent or tool run failed with {last_failure}; "
+                        "retry with valid tool arguments."
+                    )
+                    continue
                 finally:
-                    accumulated_results.extend(capture.results)
+                    if capture is not None:
+                        accumulated_results.extend(capture.results)
                 explanation = next(
                     (
                         model
@@ -939,7 +1054,11 @@ class PunditPipeline:
             events,
             as_of,
             deterministic,
-            "The answer failed evidence checks; verified facts are shown instead.",
+            (
+                f"The live explanation failed ({last_failure}); verified facts are shown instead."
+                if last_failure is not None
+                else "The answer failed evidence checks; verified facts are shown instead."
+            ),
             2,
         )
 
@@ -1038,36 +1157,46 @@ class PunditPipeline:
         deadline = self.settings.recap_timeout_seconds
         accumulated_results: list[ToolResult] = []
         feedback = ""
+        last_failure: str | None = None
 
         async def attempts() -> RecapResult | None:
-            nonlocal feedback
+            nonlocal feedback, last_failure
             for attempt in range(2):
-                tools, capture = build_analytics_tools(events, as_of=as_of)
-                producer = self._agent(
-                    "recap",
-                    RECAP_INSTRUCTIONS,
-                    tools=tools,
-                    middleware=[capture],
-                    time_budget=deadline,
-                )
-                workflow = WorkflowBuilder(start_executor=AgentExecutor(producer)).build()
-                prompt = json.dumps(
-                    {
-                        "match": {
-                            "id": info.match_id,
-                            "home": info.home.name,
-                            "away": info.away.name,
-                        },
-                        "request": "Produce the full-time recap using analytics tools.",
-                        "retry_feedback": feedback,
-                    }
-                )
+                capture = None
                 try:
+                    tools, capture = build_analytics_tools(events, as_of=as_of)
+                    producer = self._agent(
+                        "recap",
+                        RECAP_INSTRUCTIONS,
+                        tools=tools,
+                        middleware=[capture],
+                        time_budget=deadline,
+                    )
+                    workflow = WorkflowBuilder(start_executor=AgentExecutor(producer)).build()
+                    prompt = json.dumps(
+                        {
+                            "match": {
+                                "id": info.match_id,
+                                "home": info.home.name,
+                                "away": info.away.name,
+                            },
+                            "request": "Produce the full-time recap using analytics tools.",
+                            "retry_feedback": feedback,
+                        }
+                    )
                     run_result = await workflow.run(
                         Message(role="user", contents=prompt)
                     )
+                except Exception as exc:
+                    last_failure = type(exc).__name__
+                    feedback = (
+                        f"The previous agent or tool run failed with {last_failure}; "
+                        "retry with valid tool arguments."
+                    )
+                    continue
                 finally:
-                    accumulated_results.extend(capture.results)
+                    if capture is not None:
+                        accumulated_results.extend(capture.results)
                 recap = next(
                     (
                         model
@@ -1109,7 +1238,11 @@ class PunditPipeline:
             events,
             as_of,
             deterministic,
-            "The recap failed evidence checks; verified facts are shown instead.",
+            (
+                f"The recap failed ({last_failure}); verified facts are shown instead."
+                if last_failure is not None
+                else "The recap failed evidence checks; verified facts are shown instead."
+            ),
             2,
         )
 

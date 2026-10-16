@@ -69,10 +69,29 @@ class LiveDispatcher:
         self._generation = 0
         self._in_flight = 0
 
-    async def run(self, source: AsyncIterator[Event]) -> None:
-        async for event in source:
-            self._on_event(event)
-        await asyncio.gather(*self._tasks)
+    async def run(
+        self,
+        source: AsyncIterator[Event],
+        *,
+        replay_stopped: Callable[[], bool] | None = None,
+    ) -> None:
+        try:
+            async for event in source:
+                self._on_event(event)
+            if replay_stopped is not None and replay_stopped():
+                await self.cancel()
+            else:
+                await asyncio.gather(*self._tasks)
+        except asyncio.CancelledError:
+            await self.cancel()
+            raise
+
+    async def cancel(self) -> None:
+        tasks = [task for task in self._tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _clock(event: Event) -> int:

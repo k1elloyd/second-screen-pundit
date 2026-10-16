@@ -76,10 +76,12 @@ def _fact(
     value: float | int | str,
     unit: str | None,
     event_ids: list[str],
+    *,
+    clock: int,
 ) -> Fact:
     return Fact(
-        fact_id=f"{SIGNAL_TOOL}:{key}_{name}",
-        label=label,
+        fact_id=f"{SIGNAL_TOOL}:{key}_{clock}_{name}",
+        label=f"{label} at {clock}'",
         value=value,
         unit=unit,
         event_ids=list(dict.fromkeys(event_ids))[-_MAX_EVIDENCE_EVENTS:],
@@ -174,6 +176,7 @@ class SignalTracker:
                                 11 - reds,
                                 "players",
                                 [event.event_id],
+                                clock=now,
                             ),
                         ),
                     )
@@ -207,14 +210,16 @@ class SignalTracker:
                                 new_formation,
                                 None,
                                 [event.event_id],
+                                clock=now,
                             ),
                             _fact(
                                 key,
                                 "previous_formation",
-                                f"{self._name(event.team)} previous formation",
+                                f"{self._name(event.team)} previous formation before {_clock(event)}'",
                                 str(previous.value),
                                 None,
                                 previous.event_ids,
+                                clock=now,
                             ),
                         ),
                     )
@@ -267,16 +272,34 @@ class SignalTracker:
                 f"minutes either side."
             ),
             facts=(
-                _fact(key, "pressing_before", f"{name} pressing before the substitution",
-                      rate_before.value, "actions/min", rate_before.event_ids),
-                _fact(key, "pressing_after", f"{name} pressing after the substitution",
-                      rate_after.value, "actions/min", rate_after.event_ids),
-                _fact(key, "high_turnovers_before", f"{name} high turnovers before the substitution",
-                      turnovers_before.value, "turnovers", turnovers_before.event_ids),
-                _fact(key, "high_turnovers_after", f"{name} high turnovers after the substitution",
-                      turnovers_after.value, "turnovers", turnovers_after.event_ids),
-                _fact(key, "window", "Comparison window either side of the substitution",
-                      window, "minutes", [substitution.event_id]),
+                _fact(
+                    key, "pressing_before",
+                    f"{name} defensive actions per minute before substitution, "
+                    f"{at - window}-{at}'",
+                    rate_before.value, "actions/min", rate_before.event_ids, clock=at,
+                ),
+                _fact(
+                    key, "pressing_after",
+                    f"{name} defensive actions per minute after substitution, "
+                    f"{at}-{at + window}'",
+                    rate_after.value, "actions/min", rate_after.event_ids, clock=at,
+                ),
+                _fact(
+                    key, "high_turnovers_before",
+                    f"{name} high turnovers before substitution, {at - window}-{at}'",
+                    turnovers_before.value, "turnovers", turnovers_before.event_ids, clock=at,
+                ),
+                _fact(
+                    key, "high_turnovers_after",
+                    f"{name} high turnovers after substitution, {at}-{at + window}'",
+                    turnovers_after.value, "turnovers", turnovers_after.event_ids, clock=at,
+                ),
+                _fact(
+                    key, "window",
+                    f"{name} pressing and high-turnover comparison window, "
+                    f"{at - window}-{at}' and {at}-{at + window}'",
+                    window, "minutes", [substitution.event_id], clock=at,
+                ),
             ),
         )
 
@@ -319,14 +342,29 @@ class SignalTracker:
                         f"{length} minutes with the {length} before."
                     ),
                     facts=(
-                        _fact(key, "before", f"{name} possession in the previous {length} minutes",
-                              prior_fact.value, "%", prior_fact.event_ids),
-                        _fact(key, "after", f"{name} possession in the last {length} minutes",
-                              recent_fact.value, "%", recent_fact.event_ids),
-                        _fact(key, "change", f"{name} possession swing",
-                              change, "percentage points", recent_fact.event_ids),
-                        _fact(key, "window", "Possession comparison window",
-                              length, "minutes", recent_fact.event_ids),
+                        _fact(
+                            key, "before",
+                            f"{name} possession in {now - 2 * length}-{now - length}'",
+                            prior_fact.value, "%", prior_fact.event_ids, clock=now,
+                        ),
+                        _fact(
+                            key, "after",
+                            f"{name} possession in {now - length}-{now}'",
+                            recent_fact.value, "%", recent_fact.event_ids, clock=now,
+                        ),
+                        _fact(
+                            key, "change",
+                            f"{name} possession swing, {now - 2 * length}-{now - length}' "
+                            f"vs {now - length}-{now}'",
+                            change, "percentage points", recent_fact.event_ids, clock=now,
+                        ),
+                        _fact(
+                            key, "window",
+                            f"{name} possession comparison windows, "
+                            f"{now - 2 * length}-{now - length}' and "
+                            f"{now - length}-{now}'",
+                            length, "minutes", recent_fact.event_ids, clock=now,
+                        ),
                     ),
                 )
             )
@@ -343,7 +381,7 @@ class SignalTracker:
                 ShotSummaryParams(team=team, start=now - length, end=now),
                 as_of=as_of,
             )
-            xg[team] = next(fact for fact in summary.facts if fact.label == "xG")
+            xg[team] = summary.facts[2]
         signals: list[TacticalSignal] = []
         for team, opponent in (("home", "away"), ("away", "home")):
             own, other = float(xg[team].value), float(xg[opponent].value)
@@ -362,12 +400,18 @@ class SignalTracker:
                         f"against {xg[opponent].value} for {other_name}."
                     ),
                     facts=(
-                        _fact(key, "xg", f"{name} xG in the last {length} minutes",
-                              xg[team].value, "xG", xg[team].event_ids),
-                        _fact(key, "opponent_xg", f"{other_name} xG in the last {length} minutes",
-                              xg[opponent].value, "xG", xg[opponent].event_ids),
-                        _fact(key, "window", "xG comparison window",
-                              length, "minutes", xg[team].event_ids),
+                        _fact(
+                            key, "xg", f"{name} xG, {now - length}-{now}'",
+                            xg[team].value, "xG", xg[team].event_ids, clock=now,
+                        ),
+                        _fact(
+                            key, "opponent_xg", f"{other_name} xG, {now - length}-{now}'",
+                            xg[opponent].value, "xG", xg[opponent].event_ids, clock=now,
+                        ),
+                        _fact(
+                            key, "window", f"{name} xG comparison window, {now - length}-{now}'",
+                            length, "minutes", xg[team].event_ids, clock=now,
+                        ),
                     ),
                 )
             )
@@ -424,22 +468,27 @@ class SignalTracker:
                             len(team_recent),
                             "turnovers",
                             [event.event_id for event in team_recent],
+                            clock=now,
                         ),
                         _fact(
                             key,
                             "match_average",
-                            f"{name} match-to-date high turnovers per {window} minutes",
+                            f"{name} match-to-date high turnovers per {window} minutes, "
+                            f"0-{now}'",
                             round(team_average, 2),
                             "turnovers",
                             [event.event_id for event in team_total],
+                            clock=now,
                         ),
                         _fact(
                             key,
                             "window",
-                            "High-turnover comparison window",
+                            f"{name} high-turnover comparison window, "
+                            f"{now - window}-{now}'",
                             window,
                             "minutes",
                             [event.event_id for event in team_recent],
+                            clock=now,
                         ),
                     ),
                 )

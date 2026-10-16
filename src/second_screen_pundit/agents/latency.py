@@ -136,7 +136,10 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
         replay.start()
         started = perf_counter()
         try:
-            await dispatcher.run(replay.stream())
+            await dispatcher.run(
+                replay.stream(),
+                replay_stopped=lambda: replay.state == "stopped",
+            )
             replay_ms = round((perf_counter() - started) * 1000)
             await viewer_task
         finally:

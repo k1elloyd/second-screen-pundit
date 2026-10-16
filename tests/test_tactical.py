@@ -9,6 +9,7 @@ from second_screen_pundit.agents.models import CommentaryLine
 from second_screen_pundit.agents.pipeline import LiveWindowResult, is_must_say
 from second_screen_pundit.agents.signals import SignalTracker, TacticalSignal
 from second_screen_pundit.engine.generate import generate_match, get_match_info
+from second_screen_pundit.engine.replay import Replay
 from second_screen_pundit.engine.schema import Event
 
 
@@ -286,3 +287,51 @@ def test_every_window_is_dispatched_with_as_of_equal_to_its_own_event(match_id: 
     assert {outcome.event.seq for outcome in dispatcher.outcomes} == {
         as_of for as_of, _ in pipeline.calls
     }
+
+
+def test_stopping_replay_cancels_in_flight_agent_runs() -> None:
+    async def run_test() -> None:
+        events = generate_match("m01")
+        info = get_match_info("m01")
+        goal = next(event for event in events if event.type == "goal")
+        replay = Replay([goal, events[-1]], speed=120)
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        calls = 0
+
+        class BlockingPipeline:
+            async def comment_on_window(
+                self,
+                *_: object,
+                **__: object,
+            ) -> LiveWindowResult:
+                nonlocal calls
+                calls += 1
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+                raise AssertionError("unreachable")
+
+        dispatcher = LiveDispatcher(
+            BlockingPipeline(), info, events, _settings()  # type: ignore[arg-type]
+        )
+        replay.start()
+        dispatch_task = asyncio.create_task(
+            dispatcher.run(
+                replay.stream(),
+                replay_stopped=lambda: replay.state == "stopped",
+            )
+        )
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await replay.stop()
+        await dispatch_task
+
+        assert cancelled.is_set()
+        assert calls == 1
+        assert not [task for task in dispatcher._tasks if not task.done()]
+
+    asyncio.run(run_test())

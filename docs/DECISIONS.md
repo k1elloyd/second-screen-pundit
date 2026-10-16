@@ -56,7 +56,7 @@ The following exact releases were reported by the package index on 2026-10-16 an
 ## Phase 2 implementation
 
 - A single `create_foundry_agent` factory builds all five roles with `max_tokens`, `store: False`, the Pydantic `response_format`, `include: ["reasoning.encrypted_content"]`, and a four-function-call limit. The Foundry Responses request uses `reasoning={"effort": "low"}` for the Director and Commentator; it does not use the Chat Completions `reasoning_effort` option.
-- `WorkflowBuilder`/`AgentExecutor` composes the conditional Director → Analyst → Commentator live route and separate Explainer and Recap runs. Function middleware captures the serialized analytics-tool result after invocation; the evidence checker validates only against those captured facts and the run's fixed `as_of` event sequence. Each two-attempt workflow has one enclosing deadline so retries share the configured budget.
+- `WorkflowBuilder`/`AgentExecutor` is used for the standalone Explainer and Recap runs. The live route is a typed `WorkflowBuilder` graph that conditionally routes a must-say window to its fast-path executor or a periodic window to its tactical-path executor. Function middleware captures serialized analytics-tool results; evidence checks use those captured facts and the run's fixed `as_of` event sequence.
 - The Speech synthesizer uses `SpeechConfig(token_credential=..., endpoint=...)`, the SDK's MP3 output-format enum, and the `SpeechSynthesisResult.audio_duration` property to verify actual output duration. `SPEECH_ENDPOINT` must be a custom Speech endpoint; local credentials are provided as a `TokenCredential` from `DefaultAzureCredential`. `SPEECH_REGION` remains required in configuration, but the Python SDK treats endpoint and region as alternative connection modes and rejects passing both; custom-endpoint Entra authentication uses the endpoint form.
 - Microsoft Learn's Python Speech reference describes `audio_duration` as the time duration of synthesized audio and marks it available since Speech SDK 1.21.0. The project pins `azure-cognitiveservices-speech==1.52.0`, so the property is available.
 
@@ -183,6 +183,28 @@ Command: `.venv\Scripts\python.exe -m second_screen_pundit.agents.gate --live-la
 Fast-path line count is lower than the previous 13 because each scoring shot and its linked goal now produce one line. Tactical lines produced at 21', 33', 57', 69', 75' and 87'; the 75' line covers Ashbridge Rovers' change to a 3-4-3. No run exceeded the unchanged 15-second budget. The two late viewer-facing lines followed event release by at most 656 ms; all 1,548 events were released after 10.000–10.047 seconds.
 
 Role-level Analyst timing was median 2,989 ms (slowest 5,927 ms), with median input/output/reasoning tokens of 1,326/123/0. The full gate reported 15 Commentator calls, including retries, and all 14 produced lines passed evidence checks.
+
+### Phase 2b review fixes
+
+- Each analytics fact ID has a unique per-fact component; `check_evidence` rejects any duplicate fact ID across the results supplied for one run. Cached outputs use compatibility IDs only when their deterministic check contains a single corresponding tool result.
+- Analytics and tactical facts identify the team (or explicitly say match-level), metric, and relevant minute/window in their labels. The score and match-total shot count are explicitly match-level.
+- For each numeric mention, the evidence check requires an exact numeric magnitude in a cited fact; it applies no rounding tolerance. A team-specific fact can ground the number only when its team and metric are named in the same sentence. A match-level score is checked as a score expression or score-oriented phrase. This is not a general semantic-entailment check: it does not establish every nonnumeric claim, causal explanation, or whether a model paraphrase preserves the full meaning of a fact.
+- After an agent or analytics-tool exception, including throttling and invalid tool arguments, Q&A and recap retry once and then return deterministic verified facts with a visible notice. Cancellation remains uncaught so stopping a run does not become a success-shaped fallback.
+- The live `WorkflowBuilder` graph routes `must_say` windows through `live_path_router` to `must_say_fast_path`; other windows go to `tactical_path`. The role sequence and evidence checks run within the selected route executor. Replay stop cancels and awaits pending dispatcher tasks; the latency gate connects this to `Replay.state`.
+- Speech synthesis explicitly uses `audio_config=None`, which prevents playback to the default speaker while retaining generated audio data.
+
+### Post-review live gate: m01 at 20x
+
+Command: `.venv\Scripts\python.exe -m second_screen_pundit.agents.gate --live-latency --match m01 --speed 20`. The 15,000 ms per-window budget was unchanged. The Foundry warm-up took 12,363 ms total (5,006 ms for token acquisition and 7,101 ms for the model call), separately from the replay. The replay completed in 294,528 ms.
+
+| Path | Windows | Lines | Commentator time per emitted line | Whole run per emitted line | Dropped lines |
+| :--- | ---: | ---: | :--- | :--- | :--- |
+| Must-say fast path | 8 | 6 | 6 samples; median 3,062.5 ms; slowest 4,295 ms | median 3,172 ms; slowest 4,407 ms | 2 (evidence check failed twice for ungrounded `0.31` and `0.34`) |
+| Tactical | 9 dispatched (30 boundaries) | 3 | 3 samples; median 4,504 ms; slowest 5,543 ms | median 10,640 ms; slowest 11,516 ms | 6 (budget expired: 1; Director declined: 1; invalid/truncated output: 2; unsupported formation: 1; unreturned evidence event IDs: 1) |
+
+All nine emitted lines completed within the 15,000 ms budget; one tactical run reached the budget and was dropped. Tactical lines were produced at 21' (possession swing), 39' (xG surge), and 81' (possession swing). At the 30 boundaries, 7 had no signal, 9 were dispatched, and 14 were held by cooldown.
+
+Role-level call timings (including retries): Director, 7 calls, median 2,765 ms and slowest 3,582 ms; Analyst, 11 calls, median 2,898 ms and slowest 5,613 ms; Commentator, 21 calls, median 2,708 ms and slowest 5,209 ms. Median Analyst input/output/reasoning tokens were 1,393/131/0; Commentator 765/274/123; Director 651/154/112. The viewer stream released all 1,548 events after 10.000–10.469 seconds; 2 lines were ready after their event release, by at most 1,828 ms. The full suite passed: 73 passed, 2 deselected.
 
 ## Microsoft Learn sources
 

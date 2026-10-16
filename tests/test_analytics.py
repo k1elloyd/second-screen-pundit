@@ -140,7 +140,7 @@ def fixture_events() -> list[Event]:
 
 
 def _value(result: ToolResult, label: str):
-    return next(fact.value for fact in result.facts if fact.label == label)
+    return next(fact.value for fact in result.facts if label.casefold() in fact.label.casefold())
 
 
 def test_match_state_computes_score_possession_shots_xg_cards_and_formations(
@@ -152,15 +152,15 @@ def test_match_state_computes_score_possession_shots_xg_cards_and_formations(
         as_of=13,
     )
 
-    assert _value(result, "Score") == "1-0"
-    assert _value(result, "Home possession") == 50
-    assert _value(result, "Shots") == 2
-    assert _value(result, "Home xG") == 0.3
-    assert _value(result, "Away xG") == 0.25
-    assert _value(result, "Home cards") == 0
-    assert _value(result, "Away cards") == 1
-    assert _value(result, "Home formation") == "3-4-3"
-    assert _value(result, "Away formation") == "4-2-3-1"
+    assert _value(result, "Match-level score") == "1-0"
+    assert _value(result, "Ashbridge Rovers possession") == 50
+    assert _value(result, "Match-level total shots") == 2
+    assert _value(result, "Ashbridge Rovers xG") == 0.3
+    assert _value(result, "Port Calder FC xG") == 0.25
+    assert _value(result, "Ashbridge Rovers cards") == 0
+    assert _value(result, "Port Calder FC cards") == 1
+    assert _value(result, "Ashbridge Rovers formation") == "3-4-3"
+    assert _value(result, "Port Calder FC formation") == "4-2-3-1"
 
 
 def test_possession_window_and_xg_timeline(fixture_events: list[Event]) -> None:
@@ -169,8 +169,8 @@ def test_possession_window_and_xg_timeline(fixture_events: list[Event]) -> None:
         PossessionWindowParams(start=0, end=30),
         as_of=13,
     )
-    assert _value(possession, "Home possession") == 50
-    assert _value(possession, "Away possession") == 50
+    assert _value(possession, "Ashbridge Rovers possession") == 50
+    assert _value(possession, "Port Calder FC possession") == 50
 
     timeline = xg_timeline(
         fixture_events,
@@ -190,10 +190,10 @@ def test_shot_summary_uses_on_target_and_best_chance_definitions(
         ShotSummaryParams(team="home", start=0, end=30),
         as_of=13,
     )
-    assert _value(result, "Shots") == 1
-    assert _value(result, "On target") == 1
-    assert _value(result, "xG") == 0.3
-    assert _value(result, "Best chance") == 0.3
+    assert _value(result, "Ashbridge Rovers shots,") == 1
+    assert _value(result, "Ashbridge Rovers shots on target") == 1
+    assert _value(result, "Ashbridge Rovers xG") == 0.3
+    assert _value(result, "Ashbridge Rovers best chance xG") == 0.3
     assert result.facts[-1].event_ids == ["m01-e0009"]
 
 
@@ -205,15 +205,15 @@ def test_pressing_and_pass_network_apply_thresholds_and_success_rules(
         PressingIntensityParams(team="home", start=0, end=30),
         as_of=13,
     )
-    assert _value(pressing, "Defensive actions per minute") == 0.07
-    assert _value(pressing, "High turnovers") == 1
+    assert _value(pressing, "Ashbridge Rovers defensive actions per minute") == 0.07
+    assert _value(pressing, "Ashbridge Rovers high turnovers") == 1
 
     network = pass_network(
         fixture_events,
         PassNetworkParams(team="home", start=0, end=30),
         as_of=13,
     )
-    assert _value(network, "Progressive passes") == 1
+    assert _value(network, "Ashbridge Rovers progressive passes") == 1
     assert network.table == [
         {"passer_id": "home-p01", "receiver_id": "home-p02", "passes": 1}
     ]
@@ -227,7 +227,7 @@ def test_formation_and_key_moments_rank_in_specified_order(
         FormationAtParams(team="home", minute=30),
         as_of=13,
     )
-    assert _value(formation, "Home formation") == "3-4-3"
+    assert _value(formation, "Ashbridge Rovers formation") == "3-4-3"
     assert formation.facts[0].event_ids == ["m01-e0012"]
 
     moments = key_moments(
@@ -323,7 +323,7 @@ def test_tool_evidence_ids_are_capped_and_grounded_in_returned_facts() -> None:
         PossessionWindowParams(start=0, end=10),
         as_of=8,
     )
-    fact = next(item for item in result.facts if item.label == "Home possession")
+    fact = next(item for item in result.facts if "possession" in item.label.casefold())
 
     assert len(fact.event_ids) == 5
     assert fact.event_ids == [event.event_id for event in events[2:7]]
