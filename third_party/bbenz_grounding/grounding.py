@@ -1,4 +1,12 @@
-"""The grounding validator: every number in a narrative must come from a tool result.
+"""Reference copy only; this file is not imported by the application.
+
+Source commit:
+https://github.com/bbenz/football-results-dashboard/commit/d313f3896bd307b1d12b2d7bec034bb359c04e05
+Source file:
+https://github.com/bbenz/football-results-dashboard/blob/d313f3896bd307b1d12b2d7bec034bb359c04e05/demo/src/football_insights/agent/grounding.py
+License: third_party/bbenz_grounding/LICENSE (upstream LICENSE).
+
+The grounding validator: every number in a narrative must come from a tool result.
 
 It extracts each number the model wrote and accepts it only if a tool returned
 the same value at the precision the narrative uses (47% matches 47.2; 1.7

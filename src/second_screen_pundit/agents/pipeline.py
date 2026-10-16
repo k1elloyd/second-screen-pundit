@@ -32,6 +32,7 @@ from second_screen_pundit.agents.cache import (
 from second_screen_pundit.agents.clients import (
     AgentRole,
     AgentTool,
+    _MAX_TOKENS,
     create_foundry_agent,
     create_foundry_chat_client,
     deployment_for_role,
@@ -39,7 +40,9 @@ from second_screen_pundit.agents.clients import (
 from second_screen_pundit.agents.commentator import (
     build_console_insight,
     console_tool_results,
+    live_line_id,
     score_phrase,
+    team_display_name,
     validate_plain_spoken_text,
 )
 from second_screen_pundit.agents.config import AgentSettings
@@ -461,9 +464,12 @@ class PunditPipeline:
 
         must_say = any(is_must_say(event, events) for event in window)
         mandatory = any(signal.mandatory for signal in signals)
+        lane = "fast_path" if must_say else "tactical"
         deadline = self.settings.live_timeout_seconds
         accumulated_results: list[ToolResult] = []
         timings: list[AgentCallTiming] = []
+        invalid_output_roles: set[AgentRole] = set()
+        truncated_output_roles: set[AgentRole] = set()
         feedback = ""
         deterministic_console = None
         deterministic_insight = None
@@ -521,6 +527,162 @@ class PunditPipeline:
         def is_tactical_stale() -> bool:
             return not must_say and is_stale is not None and is_stale()
 
+        def fallback_result(reason: str | None = None) -> LiveWindowResult:
+            score_fact = next(
+                fact
+                for result in accumulated_results
+                for fact in result.facts
+                if fact.label.startswith("Match-level score")
+            )
+            facts_by_id = {
+                fact.fact_id: fact
+                for result in accumulated_results
+                for fact in result.facts
+            }
+            fallback_signal = next((signal for signal in signals if signal.mandatory), None)
+            if deterministic_console is not None:
+                event = next(
+                    event for event in window if is_must_say(event, events)
+                )
+                team = team_display_name(info, event.team) if event.team else "The match"
+                detail = deterministic_console.event_context.get("detail", {})
+                if not isinstance(detail, dict):
+                    raise RuntimeError("Must-say event detail is not a mapping")
+                if event.type == "goal":
+                    text = f"Goal for {team}. {deterministic_score_phrase}."
+                elif event.type == "card":
+                    colour = str(detail.get("colour", "yellow"))
+                    text = f"A {colour} card for {team}. {deterministic_score_phrase}."
+                elif event.type == "substitution":
+                    player_on = detail.get("player_on_name")
+                    player_off = detail.get("player_off_name")
+                    if isinstance(player_on, str) and isinstance(player_off, str):
+                        text = (
+                            f"{player_on} replaces {player_off} for {team}. "
+                            f"{deterministic_score_phrase}."
+                        )
+                    else:
+                        text = f"A substitution for {team}. {deterministic_score_phrase}."
+                elif event.type == "formation_change":
+                    formation = detail.get("formation")
+                    if not isinstance(formation, str) or not formation:
+                        raise RuntimeError("Formation fallback has no formation fact")
+                    text = (
+                        f"{team} have changed to a {formation} shape. "
+                        f"{deterministic_score_phrase}."
+                    )
+                elif event.type == "shot":
+                    descriptor = next(
+                        (
+                            str(fact.value)
+                            for fact in facts_by_id.values()
+                            if "chance description" in fact.label.casefold()
+                        ),
+                        None,
+                    )
+                    phrase = descriptor.capitalize() if descriptor else "A chance"
+                    text = f"{phrase} for {team}. {deterministic_score_phrase}."
+                else:
+                    raise RuntimeError(
+                        f"No deterministic fallback template for must-say {event.type}"
+                    )
+                fact_ids = list(deterministic_console.fact_ids)
+                insight = deterministic_insight
+                if insight is None:
+                    raise RuntimeError("Must-say fallback has no deterministic Insight")
+            elif fallback_signal is not None:
+                team = team_display_name(info, fallback_signal.team)
+                if fallback_signal.kind == "formation_change":
+                    formation_fact = next(
+                        (
+                            fact
+                            for fact in fallback_signal.facts
+                            if fact.fact_id.endswith("_new_formation")
+                        ),
+                        None,
+                    )
+                    if formation_fact is None:
+                        raise RuntimeError("Formation signal has no new-formation fact")
+                    text = (
+                        f"{team} have changed to a {formation_fact.value} shape. "
+                        f"{deterministic_score_phrase}."
+                    )
+                elif fallback_signal.kind == "red_card":
+                    players_fact = next(
+                        (
+                            fact
+                            for fact in fallback_signal.facts
+                            if fact.fact_id.endswith("_players_on_pitch")
+                        ),
+                        None,
+                    )
+                    if players_fact is None:
+                        raise RuntimeError("Red-card signal has no player-count fact")
+                    text = (
+                        f"{team} are down to {players_fact.value} players after a red card. "
+                        f"{deterministic_score_phrase}."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"No deterministic fallback template for {fallback_signal.kind}"
+                    )
+                fact_ids = [
+                    score_fact.fact_id,
+                    *(fact.fact_id for fact in fallback_signal.facts),
+                ]
+                event_ids = list(
+                    dict.fromkeys(
+                        event_id
+                        for fact_id in fact_ids
+                        for event_id in facts_by_id[fact_id].event_ids
+                    )
+                )
+                insight = Insight(
+                    insight_id=f"{info.match_id}-i{as_of:04d}-{lane}",
+                    minute=clock,
+                    headline="Mandatory tactical beat",
+                    importance=1,
+                    fact_ids=fact_ids,
+                    event_ids=event_ids,
+                )
+            else:
+                raise RuntimeError("No guaranteed live beat is available for fallback")
+
+            fact_ids = list(dict.fromkeys(fact_ids))
+            line = CommentaryLine(
+                line_id=live_line_id(info.match_id, as_of, lane),
+                text=text,
+                insight_id=insight.insight_id,
+                fact_ids=fact_ids,
+                event_ids=insight.event_ids,
+                tone="measured",
+                source="fallback",
+            )
+            report = self._check_line(
+                line,
+                insight,
+                info=info,
+                events=events,
+                as_of=as_of,
+                tool_results=accumulated_results,
+                lane=lane,
+                allow_fallback=True,
+            )
+            if not report.passed:
+                raise RuntimeError(
+                    "Deterministic live fallback failed evidence validation: "
+                    + "; ".join(report.failures)
+                )
+            return LiveWindowResult(
+                "commentary",
+                line,
+                insight,
+                tuple(accumulated_results),
+                report,
+                reason or "Agent output failed; deterministic fallback was used.",
+                tuple(timings),
+            )
+
         async def run_agent(
             role: AgentRole,
             agent: Agent,
@@ -533,6 +695,22 @@ class PunditPipeline:
                 response = await agent.run(prompt)
                 return response
             finally:
+                finish_reason = getattr(response, "finish_reason", None)
+                finish_reason = getattr(finish_reason, "value", finish_reason)
+                normalized_finish_reason = (
+                    str(finish_reason).casefold()
+                    if finish_reason is not None
+                    else None
+                )
+                if normalized_finish_reason in {"length", "max_tokens"}:
+                    truncated_output_roles.add(role)
+                    logger.warning(
+                        "agent_output_truncated role=%s as_of=%d attempt=%d max_tokens=%d",
+                        role,
+                        as_of,
+                        attempt,
+                        _MAX_TOKENS[role],
+                    )
                 usage = getattr(response, "usage_details", None) or {}
                 timing = AgentCallTiming(
                     role=role,
@@ -545,7 +723,7 @@ class PunditPipeline:
                 timings.append(timing)
                 logger.info(
                     "agent_call role=%s as_of=%d attempt=%d duration_ms=%d "
-                    "input_tokens=%s output_tokens=%s reasoning_tokens=%s",
+                    "input_tokens=%s output_tokens=%s reasoning_tokens=%s finish_reason=%s",
                     role,
                     as_of,
                     attempt,
@@ -553,6 +731,7 @@ class PunditPipeline:
                     timing.input_tokens,
                     timing.output_tokens,
                     timing.reasoning_tokens,
+                    normalized_finish_reason,
                 )
 
         async def call(
@@ -567,6 +746,7 @@ class PunditPipeline:
             except ChatClientException as exc:
                 if not _is_structured_output_error(exc):
                     raise
+                invalid_output_roles.add(role)
                 return None
 
         async def attempts() -> LiveWindowResult:
@@ -591,7 +771,7 @@ class PunditPipeline:
                     "score_phrase": deterministic_score_phrase,
                     "signals": signal_prompts,
                     "retry_feedback": feedback,
-                    "required_line_id": f"{info.match_id}-l{as_of:03d}",
+                    "required_line_id": live_line_id(info.match_id, as_of, lane),
                 }
                 if not director_passed:
                     director = self._agent(
@@ -609,6 +789,7 @@ class PunditPipeline:
                         return stale_result()
                     director_decision = _parsed(director_response, DirectorDecision)
                     if director_decision is None:
+                        invalid_output_roles.add("director")
                         feedback = _invalid_output("DirectorDecision")
                         continue
                     decision_report = check_evidence(
@@ -617,6 +798,11 @@ class PunditPipeline:
                         as_of=as_of,
                         tool_results=[],
                         info=info,
+                        input_event_ids=[
+                            event_id
+                            for signal in signals
+                            for event_id in signal.event_ids
+                        ],
                     )
                     if not decision_report.passed:
                         feedback = "; ".join(decision_report.failures)
@@ -656,6 +842,7 @@ class PunditPipeline:
                         return stale_result()
                     candidate = _parsed(analyst_response, Insight)
                     if candidate is None:
+                        invalid_output_roles.add("analyst")
                         feedback = _invalid_output("Insight")
                         continue
                     score_fact = next(
@@ -742,6 +929,7 @@ class PunditPipeline:
                     return stale_result()
                 line = _parsed(commentator_response, CommentaryLine)
                 if line is None:
+                    invalid_output_roles.add("commentator")
                     feedback = _invalid_output("CommentaryLine")
                     continue
                 report = self._check_line(
@@ -751,6 +939,7 @@ class PunditPipeline:
                     events=events,
                     as_of=as_of,
                     tool_results=accumulated_results,
+                    lane=lane,
                 )
                 if report.passed:
                     return LiveWindowResult(
@@ -762,19 +951,37 @@ class PunditPipeline:
                         timings=tuple(timings),
                     )
                 feedback = "; ".join(report.failures)
-            return LiveWindowResult(
+            roles = ", ".join(
+                f"{role}{' (finish_reason=length)' if role in truncated_output_roles else ''}"
+                for role in sorted(invalid_output_roles)
+            )
+            result = LiveWindowResult(
                 "rejected",
                 None,
                 None,
                 tuple(accumulated_results),
                 EvidenceReport(False, (feedback,)),
                 (
-                    "Structured output was invalid on both attempts."
-                    if feedback.startswith(_INVALID_OUTPUT_PREFIX)
+                    f"Structured output failed on both attempts for {roles}."
+                    if invalid_output_roles
                     else "Commentary was dropped after two failed evidence checks."
                 ),
                 tuple(timings),
             )
+            if must_say or mandatory:
+                if invalid_output_roles:
+                    failed_roles = ", ".join(
+                        f"{role}{' (finish_reason=length)' if role in truncated_output_roles else ''}"
+                        for role in sorted(invalid_output_roles)
+                    )
+                    return fallback_result(
+                        f"Structured output failed on both attempts for {failed_roles}; "
+                        "deterministic fallback was used."
+                    )
+                return fallback_result(
+                    "Evidence check failed twice; deterministic fallback was used."
+                )
+            return result
 
         async def route_by_must_say(
             fast_path: bool,
@@ -839,6 +1046,12 @@ class PunditPipeline:
                 raise RuntimeError("Live workflow returned no window result")
             return result
         except TimeoutError:
+            if is_tactical_stale():
+                return stale_result()
+            if must_say or mandatory:
+                return fallback_result(
+                    "Live window exceeded its time budget; deterministic fallback was used."
+                )
             return LiveWindowResult(
                 "timed_out",
                 None,
@@ -858,6 +1071,8 @@ class PunditPipeline:
         events: list[Event],
         as_of: int,
         tool_results: list[ToolResult],
+        lane: str,
+        allow_fallback: bool = False,
     ) -> EvidenceReport:
         report = check_evidence(
             insight, events=events, as_of=as_of, tool_results=tool_results, info=info
@@ -868,10 +1083,15 @@ class PunditPipeline:
             validate_plain_spoken_text(line.text)
         except ValueError as exc:
             return EvidenceReport(False, (str(exc),))
-        if line.line_id != f"{info.match_id}-l{as_of:03d}":
+        if line.line_id != live_line_id(info.match_id, as_of, lane):
             return EvidenceReport(
                 False,
                 ("CommentaryLine.line_id does not match the dispatched event sequence",),
+            )
+        if line.source != "agent" and not (allow_fallback and line.source == "fallback"):
+            return EvidenceReport(
+                False,
+                ("CommentaryLine.source must be agent for model output",),
             )
         if line.insight_id != insight.insight_id:
             return EvidenceReport(
@@ -886,7 +1106,12 @@ class PunditPipeline:
         if not line.event_ids:
             return EvidenceReport(False, ("CommentaryLine must cite an event",))
         return check_evidence(
-            line, events=events, as_of=as_of, tool_results=tool_results, info=info
+            line,
+            events=events,
+            as_of=as_of,
+            tool_results=tool_results,
+            info=info,
+            input_event_ids=insight.event_ids,
         )
 
     def _cached_live_window(
@@ -927,6 +1152,7 @@ class PunditPipeline:
             as_of=as_of,
             tool_results=results,
             info=info,
+            input_event_ids=line.event_ids,
         )
         if not report.passed:
             return LiveWindowResult(
@@ -1121,6 +1347,7 @@ class PunditPipeline:
             as_of=as_of,
             tool_results=results,
             info=info,
+            input_event_ids=match.event_ids,
         )
         if not report.passed:
             fallback_results = _deterministic_results(events, as_of)
@@ -1289,6 +1516,14 @@ class PunditPipeline:
             as_of=as_of,
             tool_results=results,
             info=info,
+            input_event_ids=[
+                *recap.event_ids,
+                *(
+                    event_id
+                    for moment in recap.key_moments
+                    for event_id in moment.event_ids
+                ),
+            ],
         )
         if not report.passed:
             deterministic = _deterministic_results(events, as_of)

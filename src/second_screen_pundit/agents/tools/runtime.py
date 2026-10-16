@@ -86,7 +86,7 @@ def build_analytics_tools(
     capture = ToolResultCapture()
 
     def serialize(result: ToolResult) -> str:
-        return result.model_dump_json()
+        return result.model_dump_json(exclude={"table"})
 
     def match_state_tool(minute: int) -> str:
         """Return score, possession, shots, xG, cards, and formations at a minute."""

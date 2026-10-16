@@ -11,6 +11,7 @@ from agent_framework import MiddlewareFailure
 
 from second_screen_pundit.agents.cache import load_cached_match
 from second_screen_pundit.agents.clients import create_foundry_agent
+from second_screen_pundit.agents.commentator import live_line_id
 from second_screen_pundit.agents.evidence import check_evidence
 from second_screen_pundit.agents.models import (
     Claim,
@@ -26,14 +27,16 @@ from second_screen_pundit.agents.pipeline import (
 )
 from second_screen_pundit.agents.tools.analytics import (
     Fact,
+    FormationAtParams,
     MatchStateParams,
     ShotSummaryParams,
     ToolResult,
+    formation_at,
     match_state,
     shot_summary,
 )
 from second_screen_pundit.agents.signals import SignalTracker
-from second_screen_pundit.agents.tools.runtime import ToolResultCapture
+from second_screen_pundit.agents.tools.runtime import ToolResultCapture, build_analytics_tools
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents import speech
 from second_screen_pundit.engine.generate import generate_match, get_match_info
@@ -143,7 +146,7 @@ def test_team_statistics_are_not_grounded_by_a_score_fact() -> None:
         event_ids=[goal.event_id],
     )
     line = CommentaryLine(
-        line_id=f"m01-l{goal.seq:03d}",
+        line_id=live_line_id("m01", goal.seq, "fast_path"),
         text="Ashbridge Rovers have had 2 shots and 1 on target.",
         insight_id="m01-i0001",
         fact_ids=[score.fact_id],
@@ -161,6 +164,173 @@ def test_team_statistics_are_not_grounded_by_a_score_fact() -> None:
 
     assert not report.passed
     assert sum("ungrounded number" in failure for failure in report.failures) == 2
+
+
+def test_xg_decimal_is_rejected_but_chance_descriptor_is_accepted() -> None:
+    events = generate_match("m01")
+    info = get_match_info("m01")
+    shot = next(event for event in events if event.type == "shot")
+    xg = Fact(
+        fact_id="shot_summary:test:xg",
+        label=f"{info.home.name} xG, 0-90'",
+        value=0.31,
+        unit="xG",
+        event_ids=[shot.event_id],
+    )
+    descriptor = Fact(
+        fact_id="shot_summary:test:descriptor",
+        label=f"{info.home.name} best chance description, 0-90'",
+        value="a big chance",
+        event_ids=[shot.event_id],
+    )
+
+    decimal_line = CommentaryLine(
+        line_id="m01-l0001-fast_path",
+        text=f"{info.home.name} have an xG of 0.31.",
+        insight_id="m01-i0001",
+        fact_ids=[xg.fact_id],
+        event_ids=[shot.event_id],
+        tone="measured",
+    )
+    decimal_report = check_evidence(
+        decimal_line,
+        events=events,
+        as_of=shot.seq,
+        tool_results=[ToolResult(tool="shot_summary", facts=[xg])],
+        info=info,
+    )
+    assert not decimal_report.passed
+    assert any("must not state xG" in failure for failure in decimal_report.failures)
+
+    descriptor_line = decimal_line.model_copy(
+        update={
+            "text": f"{info.home.name} have created a big chance.",
+            "fact_ids": [descriptor.fact_id],
+        }
+    )
+    descriptor_report = check_evidence(
+        descriptor_line,
+        events=events,
+        as_of=shot.seq,
+        tool_results=[ToolResult(tool="shot_summary", facts=[descriptor])],
+        info=info,
+    )
+    assert descriptor_report.passed, descriptor_report.failures
+
+
+def test_formation_is_matched_as_one_exact_token() -> None:
+    events = generate_match("m01")
+    info = get_match_info("m01")
+    change = next(
+        event
+        for event in events
+        if event.type == "formation_change" and event.detail.get("formation") == "3-4-3"
+    )
+    result = formation_at(
+        events,
+        FormationAtParams(team="home", minute=change.minute + change.added_minute),
+        as_of=change.seq,
+    )
+    fact = result.facts[0]
+    line = CommentaryLine(
+        line_id="m01-l0001-tactical",
+        text=f"{info.home.name} have switched to a 3-4-3 shape.",
+        insight_id="m01-i0001",
+        fact_ids=[fact.fact_id],
+        event_ids=fact.event_ids,
+        tone="measured",
+    )
+
+    correct = check_evidence(
+        line,
+        events=events,
+        as_of=change.seq,
+        tool_results=[result],
+        info=info,
+    )
+    incorrect = check_evidence(
+        line.model_copy(update={"text": f"{info.home.name} have switched to a 4-2-3-1 shape."}),
+        events=events,
+        as_of=change.seq,
+        tool_results=[result],
+        info=info,
+    )
+
+    assert correct.passed, correct.failures
+    assert not incorrect.passed
+    assert any("formation '4-2-3-1'" in failure for failure in incorrect.failures)
+
+
+def test_event_id_may_come_from_insight_but_must_be_visible() -> None:
+    events = generate_match("m01")
+    event = next(event for event in events if event.type == "pass")
+    line = CommentaryLine(
+        line_id="m01-l0001-tactical",
+        text="The move is developing.",
+        insight_id="m01-i0001",
+        event_ids=[event.event_id],
+        tone="measured",
+    )
+
+    accepted = check_evidence(
+        line,
+        events=events,
+        as_of=event.seq,
+        tool_results=[],
+        input_event_ids=[event.event_id],
+    )
+    absent_input = check_evidence(
+        line,
+        events=events,
+        as_of=event.seq,
+        tool_results=[],
+    )
+    future_input = check_evidence(
+        line,
+        events=events,
+        as_of=event.seq - 1,
+        tool_results=[],
+        input_event_ids=[event.event_id],
+    )
+
+    assert accepted.passed, accepted.failures
+    assert not absent_input.passed
+    assert not future_input.passed
+
+
+def test_zero_added_minute_is_not_implicitly_grounded() -> None:
+    events = generate_match("m01")
+    info = get_match_info("m01")
+    event = next(event for event in events if event.type == "goal")
+    fact = Fact(
+        fact_id="match_state:test:event",
+        label=f"{info.home.name} goal event at {event.minute}'",
+        value="goal",
+        event_ids=[event.event_id],
+    )
+    line = CommentaryLine(
+        line_id="m01-l0001-fast_path",
+        text="The goal came with 0 minutes added.",
+        insight_id="m01-i0001",
+        fact_ids=[fact.fact_id],
+        event_ids=[event.event_id],
+        tone="measured",
+    )
+
+    report = check_evidence(
+        line,
+        events=events,
+        as_of=event.seq,
+        tool_results=[ToolResult(tool="match_state", facts=[fact])],
+        info=info,
+    )
+
+    assert not report.passed
+    assert any("ungrounded number '0'" in failure for failure in report.failures)
+
+
+def test_same_as_of_line_ids_are_distinct_by_lane() -> None:
+    assert live_line_id("m01", 42, "fast_path") != live_line_id("m01", 42, "tactical")
 
 
 def test_team_statistics_pass_when_their_facts_and_team_are_cited() -> None:
@@ -323,7 +493,7 @@ def test_away_lead_score_uses_leading_team_perspective(
         fact_ids=["match_state:score"],
     )
     line = CommentaryLine(
-        line_id=f"m01-l{goal.seq:03d}",
+        line_id=live_line_id("m01", goal.seq, "fast_path"),
         text=text,
         insight_id="m01-i0395",
         fact_ids=["match_state:score"],
@@ -388,6 +558,17 @@ def test_tool_middleware_maps_wrapper_name_to_analytics_tool() -> None:
     assert capture.results == [result]
 
 
+def test_model_visible_tool_result_excludes_duplicate_table_payloads() -> None:
+    events = generate_match("m01")
+    tools, _ = build_analytics_tools(events, as_of=events[-1].seq)
+    pass_network_tool = next(tool for tool in tools if tool.__name__ == "pass_network_tool")
+
+    serialized = json.loads(pass_network_tool("home", 0, 90))
+
+    assert "facts" in serialized
+    assert "table" not in serialized
+
+
 def test_workflow_model_extraction_accepts_executor_and_direct_responses() -> None:
     insight = Insight(
         insight_id="m01-i0001",
@@ -425,7 +606,7 @@ def test_must_say_window_uses_deterministic_insight_and_one_commentator_call(
             insight = payload["insight"]
             return SimpleNamespace(
                 value=CommentaryLine(
-                    line_id=f"m01-l{goal.seq:03d}",
+                    line_id=live_line_id("m01", goal.seq, "fast_path"),
                     text=f"{payload['score_phrase']}.",
                     insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
@@ -465,7 +646,7 @@ def test_goal_fast_path_cites_linked_scoring_shot_and_goal_once(
             insight = payload["insight"]
             return SimpleNamespace(
                 value=CommentaryLine(
-                    line_id=f"m01-l{goal.seq:03d}",
+                    line_id=live_line_id("m01", goal.seq, "fast_path"),
                     text=f"{payload['score_phrase']}.",
                     insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
@@ -493,9 +674,89 @@ def test_goal_fast_path_cites_linked_scoring_shot_and_goal_once(
         fact
         for item in result.tool_results
         for fact in item.facts
-        if "scoring shot xG" in fact.label
+        if "scoring shot at" in fact.label
     )
     assert shot_fact.event_ids == [shot_id]
+
+
+def test_failed_must_say_emits_verified_fallback_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = get_match_info("m01")
+    events = generate_match("m01")
+    goal = next(event for event in events if event.type == "goal" and event.minute == 23)
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+    calls: list[str] = []
+
+    class FailingAgent:
+        async def run(self, _: str) -> SimpleNamespace:
+            return SimpleNamespace(value=None)
+
+    def fake_agent(role: str, *_: object, **__: object) -> FailingAgent:
+        calls.append(role)
+        return FailingAgent()
+
+    monkeypatch.setattr(pipeline, "_agent", fake_agent)
+    result = asyncio.run(
+        pipeline.comment_on_window(info, events, [goal], as_of=goal.seq)
+    )
+
+    assert result.status == "commentary"
+    assert calls == ["commentator", "commentator"]
+    assert result.line is not None
+    assert result.line.source == "fallback"
+    assert result.line.model_dump()["source"] == "fallback"
+    assert "Port Calder lead 1-0" in result.line.text
+    assert result.evidence is not None and result.evidence.passed
+
+
+def test_failed_mandatory_formation_window_emits_verified_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = get_match_info("m01")
+    events = generate_match("m01")
+    change = next(
+        event
+        for event in events
+        if event.type == "formation_change" and event.detail.get("formation") == "3-4-3"
+    )
+    signal = next(
+        signal
+        for signal in SignalTracker(info).evaluate(events, as_of=change.seq)
+        if signal.kind == "formation_change"
+        and any(fact.value == "3-4-3" for fact in signal.facts)
+    )
+    window_event = next(
+        event for event in reversed(events) if event.seq < change.seq and event.type == "pass"
+    )
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+    roles: list[str] = []
+
+    class FailingAgent:
+        async def run(self, _: str) -> SimpleNamespace:
+            return SimpleNamespace(value=None)
+
+    def fake_agent(role: str, *_: object, **__: object) -> FailingAgent:
+        roles.append(role)
+        return FailingAgent()
+
+    monkeypatch.setattr(pipeline, "_agent", fake_agent)
+    result = asyncio.run(
+        pipeline.comment_on_window(
+            info,
+            events,
+            [window_event],
+            as_of=change.seq,
+            signals=[signal],
+        )
+    )
+
+    assert result.status == "commentary"
+    assert roles == ["analyst", "analyst"]
+    assert result.line is not None
+    assert result.line.source == "fallback"
+    assert "3-4-3" in result.line.text
+    assert result.evidence is not None and result.evidence.passed
 
 
 def test_stale_tactical_window_drops_before_commentator(
@@ -518,7 +779,6 @@ def test_stale_tactical_window_drops_before_commentator(
                     should_comment=True,
                     importance=0.9,
                     reason="A tactical window merits commentary.",
-                    event_ids=[event.event_id],
                 )
             else:
                 value = Insight(
@@ -574,6 +834,8 @@ def _tactical_stub_pipeline(
         truncated = exc
 
     class TruncatedResponse:
+        finish_reason = "length"
+
         @property
         def value(self) -> object:
             raise truncated  # type: ignore[misc]
@@ -591,7 +853,6 @@ def _tactical_stub_pipeline(
                         should_comment=True,
                         importance=0.9,
                         reason="A meaningful shift.",
-                        event_ids=[window_event.event_id],
                     )
                 )
             if self.role == "analyst":
@@ -609,7 +870,7 @@ def _tactical_stub_pipeline(
             insight = payload["insight"]
             return SimpleNamespace(
                 value=CommentaryLine(
-                    line_id=f"m01-l{window_event.seq:03d}",
+                    line_id=live_line_id("m01", window_event.seq, "tactical"),
                     text=f"{payload['score_phrase']}.",
                     insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
@@ -651,7 +912,9 @@ def test_two_truncated_replies_are_reported_as_invalid_structured_output(
     )
 
     assert result.status == "rejected"
-    assert result.notice == "Structured output was invalid on both attempts."
+    assert result.notice == (
+        "Structured output failed on both attempts for commentator (finish_reason=length)."
+    )
     assert roles.count("commentator") == 2 and roles.count("analyst") == 1
 
 
@@ -766,7 +1029,7 @@ def test_mandatory_signal_skips_director_and_cites_signal_facts(
     signal = next(
         signal
         for signal in SignalTracker(info).evaluate(events, as_of=change.seq)
-        if signal.kind == "formation_change" and signal.facts[0].value == "3-4-3"
+        if signal.kind == "formation_change" and signal.facts[0].value == "3-4-3" and signal.facts[0].value == "3-4-3"
     )
     window = [next(event for event in reversed(events) if event.seq < change.seq and event.type == "pass")]
     pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
@@ -792,7 +1055,7 @@ def test_mandatory_signal_skips_director_and_cites_signal_facts(
             else:
                 insight = payload["insight"]
                 value = CommentaryLine(
-                    line_id=f"m01-l{change.seq:03d}",
+                    line_id=live_line_id("m01", change.seq, "tactical"),
                     text=f"{payload['score_phrase']}.",
                     insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],

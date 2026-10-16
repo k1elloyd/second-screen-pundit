@@ -31,7 +31,8 @@ COMMENTATOR_INSTRUCTIONS = (
     "score phrase verbatim whenever stating the score. Refer to players by name, never "
     "by shirt number. For statistics, name the team and the metric in the same sentence "
     "as the number, using only the fully qualified supplied facts. Match the "
-    "line_id and insight_id exactly."
+    "line_id and insight_id exactly. Never state xG or expected-goals decimals; use a supplied "
+    "chance description instead."
 )
 
 EXPLAINER_INSTRUCTIONS = (

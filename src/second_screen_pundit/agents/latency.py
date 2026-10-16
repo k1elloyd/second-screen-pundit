@@ -47,7 +47,7 @@ def drop_reason(outcome: WindowOutcome, budget_seconds: float) -> str:
     if result.status == "rejected":
         failures = "; ".join(result.evidence.failures) if result.evidence else "unknown"
         if result.notice and "Structured output" in result.notice:
-            return "structured output truncated or invalid on both attempts"
+            return result.notice
         return f"evidence check failed twice: {failures}"
     return result.status
 
@@ -63,11 +63,26 @@ def summarize_path(
         for outcome in selected
         if outcome.result is not None and outcome.result.status == "commentary"
     ]
+    fallback_lines = [
+        outcome
+        for outcome in lines
+        if outcome.result is not None
+        and outcome.result.line is not None
+        and outcome.result.line.source == "fallback"
+    ]
     dropped = [outcome for outcome in selected if outcome not in lines]
     reasons = Counter(drop_reason(outcome, budget_seconds) for outcome in dropped)
     return {
         "windows": len(selected),
         "lines": len(lines),
+        "fallback_lines": len(fallback_lines),
+        "fallback_reasons": dict(
+            Counter(
+                outcome.result.notice or "unspecified"
+                for outcome in fallback_lines
+                if outcome.result is not None
+            )
+        ),
         "commentator_ms": _stats([_commentator_ms(outcome) for outcome in lines]),
         "run_ms": _stats([outcome.elapsed_ms or 0 for outcome in lines]),
         "dropped": len(dropped),
@@ -159,6 +174,7 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
             "minute": outcome.minute,
             "signals": [signal.kind for signal in outcome.signals],
             "text": outcome.result.line.text,  # type: ignore[union-attr]
+            "source": outcome.result.line.source,  # type: ignore[union-attr]
             "run_ms": outcome.elapsed_ms,
             "calls_ms": {
                 f"{timing.role}#{timing.attempt}": timing.duration_ms
@@ -187,6 +203,20 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
         "replay_elapsed_ms": replay_ms,
         "fast_path": summarize_path(outcomes, "fast_path", budget),
         "tactical": tactical,
+        "fallback_lines": [
+            {
+                "path": outcome.path,
+                "minute": outcome.minute,
+                "line_id": outcome.result.line.line_id,  # type: ignore[union-attr]
+                "text": outcome.result.line.text,  # type: ignore[union-attr]
+                "reason": outcome.result.notice,
+            }
+            for outcome in sorted(outcomes, key=lambda item: item.event.seq)
+            if outcome.result is not None
+            and outcome.result.status == "commentary"
+            and outcome.result.line is not None
+            and outcome.result.line.source == "fallback"
+        ],
         "agent_calls_by_role": summarize_calls(outcomes),
         "viewer_stream": {
             "configured_delay_s": settings.broadcast_delay_seconds,

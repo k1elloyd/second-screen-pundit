@@ -85,6 +85,16 @@ def big_chance_threshold() -> float:
     return _thresholds()["big_chance_xg"]
 
 
+def chance_descriptor(xg: float | None) -> str | None:
+    if xg is None:
+        return None
+    if xg >= 0.3:
+        return "a big chance"
+    if xg >= 0.1:
+        return "a half-chance"
+    return None
+
+
 def analytics_threshold(name: str) -> float:
     return _thresholds()[name]
 
@@ -326,6 +336,17 @@ def shot_summary(
             [best] if best else [],
         ),
     ]
+    descriptor = chance_descriptor(best.xg if best is not None else None)
+    if best is not None and descriptor is not None:
+        facts.append(
+            _fact(
+                "shot_summary",
+                f"{_team_name(visible, params.team)} best chance description, {start}-{end}'",
+                descriptor,
+                None,
+                [best],
+            )
+        )
     return ToolResult(tool="shot_summary", facts=facts, caveats=caveats)
 
 
@@ -394,6 +415,25 @@ def pass_network(
             pairs[pair] += 1
             pair_events.setdefault(pair, []).append(event)
     top_pairs = sorted(pairs, key=lambda pair: (-pairs[pair], pair))[:10]
+    info = get_match_info(visible[0].match_id) if visible else None
+    player_names: dict[str, str] = {}
+    if info is not None:
+        squad = info.home if params.team == "home" else info.away
+        player_names = {
+            player_id: player["name"]
+            for player in squad.players
+            for player_id in (
+                player["id"],
+                f"{params.team}-{player['id'].rsplit('-', maxsplit=1)[-1]}",
+            )
+        }
+
+    def player_name(player_id: str) -> str:
+        try:
+            return player_names[player_id]
+        except KeyError as exc:
+            raise ValueError(f"Unknown synthetic player ID in pass network: {player_id}") from exc
+
     thresholds = _thresholds()
     progressive = [
         event
@@ -411,7 +451,8 @@ def pass_network(
         *[
             _fact(
                 "pass_network",
-                f"{_team_name(visible, params.team)} passing pair {passer} to {receiver}, {start}-{end}'",
+                f"{_team_name(visible, params.team)} passing pair "
+                f"{player_name(passer)} to {player_name(receiver)}, {start}-{end}'",
                 pairs[(passer, receiver)],
                 "passes",
                 pair_events[(passer, receiver)],

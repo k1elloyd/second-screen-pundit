@@ -1,5 +1,8 @@
-"""Evidence validation with number extraction adapted from Brian Benz's MIT-licensed
-grounding.py in bbenz/football-results-dashboard.
+"""Evidence validation adapted from Brian Benz's MIT-licensed grounding.py.
+
+Upstream: https://github.com/bbenz/football-results-dashboard/blob/d313f3896bd307b1d12b2d7bec034bb359c04e05/demo/src/football_insights/agent/grounding.py
+License: https://github.com/bbenz/football-results-dashboard/blob/d313f3896bd307b1d12b2d7bec034bb359c04e05/LICENSE
+Local copy: third_party/bbenz_grounding/LICENSE.
 """
 
 from __future__ import annotations
@@ -7,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -30,6 +34,11 @@ _NUMBER = re.compile(
 _SCORE = re.compile(r"(?<![\w\d-])(?P<home>\d{1,2})\s*[-–—]\s*(?P<away>\d{1,2})(?![-–—\w])")
 _FORMATION = re.compile(r"\b\d{1,2}(?:-\d{1,2}){2,3}\b")
 _BACK_LINE = re.compile(r"\bback\s+(?P<count>zero|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b", re.IGNORECASE)
+_XG_DECIMAL = re.compile(
+    r"\b(?:xg|expected goals)\b[^.!?]{0,32}\b\d+\.\d+"
+    r"|\b\d+\.\d+\b[^.!?]{0,32}\b(?:xg|expected goals)\b",
+    re.IGNORECASE,
+)
 _SHIRT_NUMBER_PREFIX = re.compile(r"(?:\bNo\.\s*|#)\s*$", re.IGNORECASE)
 _SCALES = {"thousand": 1e3, "million": 1e6, "billion": 1e9}
 _NUMBER_WORDS = {
@@ -69,11 +78,10 @@ class EvidenceReport:
 Narrative: TypeAlias = CommentaryLine | DirectorDecision | Insight | Explanation | Recap
 
 
-def extract_numbers(text: str) -> list[NumberMention]:
-    mentions: list[NumberMention] = []
+def _extract_number_spans(text: str) -> list[tuple[NumberMention, int, int]]:
+    mentions: list[tuple[NumberMention, int, int]] = []
     for match in _NUMBER.finditer(text):
-        prefix = text[:match.start()]
-        if _SHIRT_NUMBER_PREFIX.search(prefix):
+        if _SHIRT_NUMBER_PREFIX.search(text[:match.start()]):
             continue
         raw = match.group("num")
         decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
@@ -83,18 +91,32 @@ def extract_numbers(text: str) -> list[NumberMention]:
             value = -value
         suffix = (match.group("suffix") or "").lower()
         mentions.append(
-            NumberMention(
+            (
+                NumberMention(
                 text=match.group(0).strip(),
                 value=value,
                 decimals=decimals,
                 scale=scale,
                 ordinal=suffix in {"st", "nd", "rd", "th"},
+                ),
+                match.start(),
+                match.end(),
             )
         )
     for match in _NUMBER_WORD.finditer(text):
         word = match.group(0).casefold()
-        mentions.append(NumberMention(text=word, value=float(_NUMBER_WORDS[word]), decimals=0))
-    return sorted(mentions, key=lambda mention: text.casefold().find(mention.text.casefold()))
+        mentions.append(
+            (
+                NumberMention(text=word, value=float(_NUMBER_WORDS[word]), decimals=0),
+                match.start(),
+                match.end(),
+            )
+        )
+    return sorted(mentions, key=lambda item: item[1])
+
+
+def extract_numbers(text: str) -> list[NumberMention]:
+    return [mention for mention, _, _ in _extract_number_spans(text)]
 
 
 def _narrative_parts(
@@ -199,13 +221,6 @@ def _number_is_grounded(
     *,
     info: MatchInfo | None,
 ) -> bool:
-    score_mentions = list(_SCORE.finditer(sentence))
-    if any(
-        match.start() <= sentence.casefold().find(number.text.casefold()) < match.end()
-        for match in score_mentions
-    ):
-        return True
-
     metric_is_stated = _has_statistic_term(sentence)
     if _is_score_context(sentence) and not metric_is_stated:
         if any(
@@ -329,6 +344,7 @@ def check_evidence(
     as_of: int,
     tool_results: list[ToolResult],
     info: MatchInfo | None = None,
+    input_event_ids: Sequence[str] = (),
 ) -> EvidenceReport:
     if as_of < 0:
         raise ValueError("as_of must be a non-negative event sequence")
@@ -350,6 +366,12 @@ def check_evidence(
     failures: list[str] = [
         f"duplicate fact_id within run: {fact_id}" for fact_id in duplicate_ids
     ]
+    supplied_event_ids = set(input_event_ids) | {
+        event_id
+        for result in tool_results
+        for fact in result.facts
+        for event_id in fact.event_ids
+    }
 
     for event_id in output.event_ids:
         event = event_by_id.get(event_id)
@@ -357,6 +379,8 @@ def check_evidence(
             failures.append(f"unknown event_id: {event_id}")
         elif event.seq > as_of:
             failures.append(f"future event_id: {event_id} is after as_of {as_of}")
+        elif event_id not in supplied_event_ids:
+            failures.append(f"event_id {event_id} was not present in the Insight or tool results")
 
     for fact_id in output.fact_ids:
         if fact_id not in facts_by_id:
@@ -417,20 +441,24 @@ def check_evidence(
                 failures.append(f"unknown event_id: {event_id}")
             elif event.seq > as_of:
                 failures.append(f"future event_id: {event_id} is after as_of {as_of}")
+            elif event_id not in supplied_event_ids:
+                failures.append(
+                    f"event_id {event_id} was not present in the Insight or tool results"
+                )
+        if isinstance(output, CommentaryLine) and _XG_DECIMAL.search(text):
+            failures.append("CommentaryLine must not state xG or expected-goals decimals")
         cited_facts = [facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id]
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             score_spans = list(_SCORE.finditer(sentence))
             formation_spans = list(_FORMATION.finditer(sentence))
             back_line_spans = list(_BACK_LINE.finditer(sentence))
-            for number in extract_numbers(sentence):
+            for number, number_start, number_end in _extract_number_spans(sentence):
                 if number.ordinal and 1 <= number.value <= 10:
                     continue
-                number_start = sentence.casefold().find(number.text.casefold())
-                if any(match.start() <= number_start < match.end() for match in score_spans):
-                    continue
-                if any(match.start() <= number_start < match.end() for match in formation_spans):
-                    continue
-                if any(match.start() <= number_start < match.end() for match in back_line_spans):
+                if any(
+                    number_start < span.end() and number_end > span.start()
+                    for span in [*score_spans, *formation_spans, *back_line_spans]
+                ):
                     continue
                 if not _number_is_grounded(
                     number,

@@ -92,6 +92,7 @@ async def run_phase2_gate(output_path: Path) -> None:
                 as_of=as_of,
                 tool_results=facts,
                 info=info,
+                input_event_ids=line.event_ids,
             )
             if not report.passed:
                 raise RuntimeError(

@@ -23,6 +23,7 @@ class CommentaryLine(AgentOutput):
     text: str = Field(max_length=200)
     insight_id: str
     tone: Literal["measured", "reflective", "urgent", "analytical"]
+    source: Literal["agent", "fallback"] = "agent"
 
 
 class Insight(AgentOutput):

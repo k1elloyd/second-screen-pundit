@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from second_screen_pundit.agents.tools.analytics import (
     ToolResult,
+    chance_descriptor,
     compare_windows,
     formation_at,
     invoke_tool,
@@ -28,6 +29,7 @@ from second_screen_pundit.agents.tools.parameters import (
     ShotSummaryParams,
     XgTimelineParams,
 )
+from second_screen_pundit.engine.generate import get_match_info
 from second_screen_pundit.engine.schema import Event
 
 
@@ -195,6 +197,16 @@ def test_shot_summary_uses_on_target_and_best_chance_definitions(
     assert _value(result, "Ashbridge Rovers xG") == 0.3
     assert _value(result, "Ashbridge Rovers best chance xG") == 0.3
     assert result.facts[-1].event_ids == ["m01-e0009"]
+    descriptor = next(fact for fact in result.facts if "chance description" in fact.label)
+    assert descriptor.value == "a big chance"
+
+
+@pytest.mark.parametrize(
+    ("xg", "expected"),
+    [(0.3, "a big chance"), (0.1, "a half-chance"), (0.099, None)],
+)
+def test_chance_descriptor_thresholds(xg: float, expected: str | None) -> None:
+    assert chance_descriptor(xg) == expected
 
 
 def test_pressing_and_pass_network_apply_thresholds_and_success_rules(
@@ -217,6 +229,14 @@ def test_pressing_and_pass_network_apply_thresholds_and_success_rules(
     assert network.table == [
         {"passer_id": "home-p01", "receiver_id": "home-p02", "passes": 1}
     ]
+    pair_fact = next(fact for fact in network.facts if "passing pair" in fact.label)
+    players = {
+        f"home-{player['id'].rsplit('-', maxsplit=1)[-1]}": player["name"]
+        for player in get_match_info("m01").home.players
+    }
+    assert players["home-p01"] in pair_fact.label
+    assert players["home-p02"] in pair_fact.label
+    assert "-p" not in pair_fact.label
 
 
 def test_formation_and_key_moments_rank_in_specified_order(

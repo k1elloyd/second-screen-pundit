@@ -13,6 +13,7 @@ from second_screen_pundit.agents.models import CommentaryLine
 from second_screen_pundit.agents.tools.analytics import (
     Fact,
     ToolResult,
+    chance_descriptor,
     formation_at,
     match_state,
     shot_summary,
@@ -22,6 +23,7 @@ from second_screen_pundit.engine.schema import Event, MatchInfo
 
 
 _EVENT_ID_PATTERN = re.compile(r"\bm\d{2}-e\d{4,}\b", re.IGNORECASE)
+_PLAYER_ID_PATTERN = re.compile(r"\b[a-z0-9]+-p\d{2}\b", re.IGNORECASE)
 _FACT_ID_PATTERN = re.compile(
     r"\b(?:match_state|possession_window|xg_timeline|shot_summary|"
     r"pressing_intensity|pass_network|formation_at|key_moments|"
@@ -35,6 +37,7 @@ def validate_plain_spoken_text(text: str) -> None:
         "[" in text
         or "]" in text
         or _EVENT_ID_PATTERN.search(text)
+        or _PLAYER_ID_PATTERN.search(text)
         or _FACT_ID_PATTERN.search(text)
     ):
         raise ValueError(
@@ -67,8 +70,23 @@ def console_tool_results(
         as_of=event.seq,
     )
     score = next(fact for fact in state.facts if fact.label.startswith("Match-level score"))
+    team = event.team
+    event_name = event.type
+    if event.type == "card":
+        event_name = f"{event.detail.get('colour', 'unknown')} card"
+    event_team = (
+        team_display_name(info, team) if team in {"home", "away"} else "Match-level"
+    )
+    event_fact = Fact(
+        fact_id=f"match_state:{event.seq}:event",
+        label=f"{event_team} {event_name} event at {minute}'",
+        value=event_name,
+        unit=None,
+        event_ids=[event.event_id],
+    )
     results = [
         ToolResult(tool=state.tool, facts=[score]),
+        ToolResult(tool=state.tool, facts=[event_fact]),
     ]
     if event.type == "goal":
         scoring_shots = [
@@ -80,18 +98,33 @@ def console_tool_results(
         ]
         if scoring_shots:
             shot = max(scoring_shots, key=lambda candidate: candidate.seq)
+            descriptor = chance_descriptor(shot.xg)
+            shot_facts = [
+                Fact(
+                    fact_id=f"shot_summary:{event.seq}:scoring_shot",
+                    label=f"{team_display_name(info, event.team or 'home')} scoring shot at {minute}'",
+                    value="scoring shot",
+                    unit=None,
+                    event_ids=[shot.event_id],
+                )
+            ]
+            if descriptor is not None:
+                shot_facts.append(
+                    Fact(
+                        fact_id=f"shot_summary:{event.seq}:chance_descriptor",
+                        label=(
+                            f"{team_display_name(info, event.team or 'home')} scoring chance "
+                            f"description at {minute}'"
+                        ),
+                        value=descriptor,
+                        unit=None,
+                        event_ids=[shot.event_id],
+                    )
+                )
             results.append(
                 ToolResult(
                     tool="shot_summary",
-                    facts=[
-                        Fact(
-                            fact_id=f"shot_summary:{event.seq}:scoring_shot_xg",
-                            label=f"{team_display_name(info, event.team or 'home')} scoring shot xG at {minute}'",
-                            value=shot.xg or 0.0,
-                            unit="xG",
-                            event_ids=[shot.event_id],
-                        )
-                    ],
+                    facts=shot_facts,
                 )
             )
         return results
@@ -136,7 +169,7 @@ def console_tool_results(
                 facts=[
                     fact
                     for fact in summary.facts
-                    if " xG" in fact.label or "best chance xG" in fact.label
+                    if "chance description" in fact.label
                 ],
             )
         ])
@@ -156,6 +189,10 @@ def score_phrase(info: MatchInfo, score: str) -> str:
     if away_score > home_score:
         return f"{team_display_name(info, 'away')} lead {away_score}-{home_score}"
     return f"The score is level at {home_score}-{away_score}"
+
+
+def live_line_id(match_id: str, as_of: int, lane: str) -> str:
+    return f"{match_id}-l{as_of:03d}-{lane}"
 
 
 def _player_name(info: MatchInfo, team: str | None, player_id: str | None) -> str | None:
@@ -205,8 +242,11 @@ def build_console_insight(
         "card": f"Card for {team_name}",
         "formation_change": f"{team_name} change shape",
         "substitution": f"{team_name} make a substitution",
-        "shot": f"Big chance for {team_name}",
+        "shot": f"{team_name} chance",
     }.get(event.type, f"{team_name}: {event.type}")
+    if event.type == "shot":
+        descriptor = chance_descriptor(event.xg)
+        headline = f"{team_name} {descriptor}" if descriptor is not None else f"{team_name} chance"
     event_ids = list(
         dict.fromkeys(
             [
@@ -253,7 +293,8 @@ class Commentator:
                 "text. The text must be plain spoken English with no markup. Do not state any "
                 "number unless that value appears in a supplied fact. Use the supplied deterministic "
                 "score phrase verbatim whenever stating the score. Refer to players by name, never "
-                "by shirt number. Match the "
+                "by shirt number. Never state an xG or expected-goals decimal; use a supplied chance "
+                "description instead. Match the "
                 "line_id and insight_id exactly."
             ),
             tools=[],
@@ -263,7 +304,7 @@ class Commentator:
     async def commentate(self, insight: ConsoleInsight, event: Event) -> CommentaryLine:
         prompt = (
             f"Return a CommentaryLine for this one event.\n"
-            f"Required line_id: {event.match_id}-l{event.seq:03d}\n"
+            f"Required line_id: {live_line_id(event.match_id, event.seq, 'fast_path')}\n"
             f"Required insight_id: {insight.insight_id}\n"
             f"Deterministic score phrase: {insight.score_phrase}\n"
             f"Event: {insight.event_context}\n"
@@ -274,10 +315,12 @@ class Commentator:
             raise ValueError("Commentator returned no structured CommentaryLine")
         line = CommentaryLine.model_validate(response.value)
         validate_plain_spoken_text(line.text)
-        if line.line_id != f"{event.match_id}-l{event.seq:03d}":
+        if line.line_id != live_line_id(event.match_id, event.seq, "fast_path"):
             raise ValueError("Commentator returned a line_id that does not match the event")
         if line.insight_id != insight.insight_id:
             raise ValueError("Commentator returned an insight_id that does not match its input")
+        if line.source != "agent":
+            raise ValueError("Commentator model output cannot set a fallback source")
         if not set(line.fact_ids).issubset(insight.fact_ids):
             raise ValueError("Commentator cited a fact that was not supplied")
         if not set(line.event_ids).issubset(insight.event_ids):

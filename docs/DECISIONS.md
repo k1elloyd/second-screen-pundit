@@ -206,6 +206,10 @@ All nine emitted lines completed within the 15,000 ms budget; one tactical run r
 
 Role-level call timings (including retries): Director, 7 calls, median 2,765 ms and slowest 3,582 ms; Analyst, 11 calls, median 2,898 ms and slowest 5,613 ms; Commentator, 21 calls, median 2,708 ms and slowest 5,209 ms. Median Analyst input/output/reasoning tokens were 1,393/131/0; Commentator 765/274/123; Director 651/154/112. The viewer stream released all 1,548 events after 10.000–10.469 seconds; 2 lines were ready after their event release, by at most 1,828 ms. The full suite passed: 73 passed, 2 deselected.
 
+### Phase 2 audio-duration gate clarification
+
+`run_phase2_gate` synthesizes validated cached lines and repeats the first two lines to reach the 120-second duration threshold. This verifies synthesis and artifact duration; it is padded cached narration, not two minutes of unique or live commentary.
+
 ## Microsoft Learn sources
 
 - [Azure OpenAI reasoning models: reasoning effort and API support](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning#reasoning-effort)
@@ -222,3 +226,16 @@ Role-level call timings (including retries): Director, 7 calls, median 2,765 ms 
 - [Remote builds with Azure Container Registry](https://learn.microsoft.com/azure/developer/azure-developer-cli/remote-builds)
 - [Azure Developer CLI templates overview](https://learn.microsoft.com/azure/developer/azure-developer-cli/azd-templates)
 - [Bicep file structure and syntax](https://learn.microsoft.com/azure/azure-resource-manager/bicep/file)
+
+### Coverage recovery gate: m01 at 20x
+
+Rerun after the evidence-check coverage changes, using `.venv\Scripts\python.exe -m second_screen_pundit.agents.gate --live-latency --match m01 --speed 20`. The 15,000 ms live-window budget was unchanged. The shared-client warm-up took 10,404 ms total (2,788 ms for token acquisition and 7,437 ms for the model call), separately from the 297,888 ms replay.
+
+| Path | Windows | Lines | Commentator time per emitted line | Whole-window time per emitted line | Fallback lines | Dropped lines |
+| :--- | ---: | ---: | :--- | :--- | ---: | :--- |
+| Must-say fast path | 8 | 8 | median 2,766 ms; slowest 4,531 ms | median 2,867 ms; slowest 4,672 ms | 0 | 0 |
+| Tactical | 9 dispatched (30 boundaries) | 5 | median 2,664 ms; slowest 3,490 ms | median 8,531 ms; slowest 10,297 ms | 2 | 4 |
+
+Tactical lines: 21' possession swing; 33' xG surge; 69' formation change to 4-2-3-1 (**deterministic fallback**); 75' formation change to 3-4-3 (**deterministic fallback**); 87' xG surge with a high-turnover surge. The 75' line explicitly says Ashbridge Rovers changed to a 3-4-3 shape, with Port Calder leading 2-1. The two formation windows failed the agent evidence check twice and were emitted from their verified deterministic facts with `source: "fallback"`. The other four tactical windows dropped because the Director declined twice and two model lines failed evidence validation twice (`CommentaryLine must cite an event`). No window timed out. All 8 fast-path lines were emitted by the Commentator; no Director or Analyst call was made on that route.
+
+The 32 model calls all reported `finish_reason=stop`; no role truncated, so no token cap was raised. Role timings including retries: Director, 7 calls, median 2,891 ms, slowest 3,388 ms; Analyst, 11 calls, median 2,936 ms, slowest 4,967 ms; Commentator, 14 calls, median 2,813 ms, slowest 4,134 ms. Median input/output/reasoning tokens were Director 653/158/112, Analyst 1,270/133/0, and Commentator 894/225/86.5. The full test suite passed: 86 passed, 2 deselected.

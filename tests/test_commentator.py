@@ -4,6 +4,7 @@ from pydantic import ValidationError
 from second_screen_pundit.agents.commentator import (
     CommentaryLine,
     build_console_insight,
+    live_line_id,
     validate_plain_spoken_text,
 )
 from second_screen_pundit.engine.generate import generate_match, get_match_info
@@ -82,6 +83,7 @@ def test_commentary_line_is_structured_and_bounded() -> None:
         "The score changes at m01-e0395.",
         "The score is supported by match_state:score.",
         "A citation marker is not spoken: [fact id].",
+        "ashbridge-p07 receives the ball.",
     ],
 )
 def test_plain_spoken_text_rejects_inline_citations(text: str) -> None:
@@ -91,3 +93,9 @@ def test_plain_spoken_text_rejects_inline_citations(text: str) -> None:
 
 def test_plain_spoken_text_accepts_uncited_commentary() -> None:
     validate_plain_spoken_text("The home side find their way back into the match.")
+
+
+def test_live_line_ids_are_lane_specific() -> None:
+    assert live_line_id("m01", 42, "fast_path") != live_line_id(
+        "m01", 42, "tactical"
+    )
