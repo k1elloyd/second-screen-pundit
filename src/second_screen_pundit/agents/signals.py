@@ -71,6 +71,11 @@ class TacticalSignal:
         return list(dict.fromkeys(event_id for fact in self.facts for event_id in fact.event_ids))
 
 
+def formation_key(seq: int) -> str:
+    """The signal key for the formation change at this event sequence."""
+    return f"formation_{seq}"
+
+
 def _clock(event: Event) -> int:
     return event.minute + event.added_minute
 
@@ -220,7 +225,7 @@ class SignalTracker:
                     )
                 )
             elif event.type == "formation_change":
-                key = f"formation_{event.seq}"
+                key = formation_key(event.seq)
                 if key in self._seen:
                     continue
                 self._seen.add(key)

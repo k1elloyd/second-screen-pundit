@@ -4,6 +4,8 @@
 
 Every rule here is written to pass `agents/evidence.py` as it stands. Where a rule looks stricter than ordinary broadcasting, the reason is in *Why*. All fallback templates and example lines below were run through the real `check_evidence` against the generated m01–m03 logs. Two examples (big chance missed, routine) have no matching event in today's data and are marked as untested.
 
+**What reaches the model.** After the Phase 2c regression fixes, `COMMENTATOR_INSTRUCTIONS` in `agents/prompts.py` carries only the hard rules, the goal-context guidance, the formation wording and four example lines (1, 5, 8 and 9, with 9's percentage given as 53%). The persona, energy tiers, variety rules and the other examples stay in this file as the design reference; the server applies the tiers itself.
+
 ---
 
 ## Persona
@@ -35,12 +37,10 @@ These rules are compatible with the evidence check. Break one and the line is re
 1. **Plain spoken British English, 1–2 sentences, at most 200 characters.** The score phrase counts as one of the sentences.
 2. **No brackets, IDs or markup.** No `[`, `]` or parentheses. No event IDs (`m01-e0395`), fact IDs, or player IDs (`ashbridge-p07`). Citations go only in `fact_ids` and `event_ids`.
    *Why:* `validate_plain_spoken_text` rejects brackets and every ID pattern.
-3. **Return the structure exactly.**
-   - `line_id` and `insight_id` are copied as given.
+3. **Return only `text`, `fact_ids` and `event_ids`.**
    - `fact_ids` and `event_ids` are a subset of the Insight's.
    - There is **at least one** `event_id`.
-   - `tone` is one of `measured`, `reflective`, `urgent` or `analytical`.
-   - Never set `source`.
+   - The server sets `line_id`, `insight_id`, `tone` (from the energy tier), `source` and `delivery_tier`. Since the Phase 2c regression fixes, the model no longer returns them.
 
    *Why:* the 75' run in DECISIONS lost two tactical lines to "CommentaryLine must cite an event".
 
@@ -167,7 +167,7 @@ Rotate through these shapes, and don't use the same one twice in a row:
 
 More rules:
 
-- Alternate one-sentence and two-sentence lines. Not every line needs the score phrase: always use it on goals, red cards and formation changes; on tactical and routine lines use it at most every other time.
+- Alternate one-sentence and two-sentence lines. Not every line needs the score phrase. The server supplies it only on goals and red cards, or when none of the last 3 lines said it; otherwise `score_phrase` is null and the line must not state the score.
 - After a Tier 1 line, the next line should be Tier 3 or lower in length and energy. Let it breathe.
 - Don't reuse the previous line's main verb. The implementation should pass the last few released lines to make this possible (see the field list at the end).
 

@@ -237,20 +237,22 @@ def _has_statistic_term(text: str) -> bool:
     )
 
 
-def _number_is_grounded(
+def _grounding_facts(
     number: NumberMention,
     sentence: str,
     cited_facts: list[Fact],
     *,
     info: MatchInfo | None,
-) -> bool:
+) -> list[Fact]:
+    """Every cited fact that grounds this number in this sentence; empty when none does."""
     metric_is_stated = _has_statistic_term(sentence)
+    grounding: list[Fact] = []
     if _is_score_context(sentence) and not metric_is_stated:
-        if any(
-            _is_score_fact(fact) and _matches_value(number, _fact_number_values(fact))
+        grounding.extend(
+            fact
             for fact in cited_facts
-        ):
-            return True
+            if _is_score_fact(fact) and _matches_value(number, _fact_number_values(fact))
+        )
 
     for fact in cited_facts:
         if _is_score_fact(fact) or not _metric_mentioned(fact, sentence):
@@ -258,7 +260,7 @@ def _number_is_grounded(
         values = _fact_number_values(fact)
         if _is_clock_fact(fact):
             if _matches_value(number, values):
-                return True
+                grounding.append(fact)
             continue
         if (
             fact.label.casefold().startswith("match-level ")
@@ -272,12 +274,21 @@ def _number_is_grounded(
             and re.search(r"\b(match|overall|total)\b", sentence, re.I)
             and _matches_value(number, values)
         ):
-            return True
+            grounding.append(fact)
+            continue
         if not _label_team_mentioned(fact, sentence, info):
             continue
         if _matches_value(number, values):
-            return True
-    return False
+            grounding.append(fact)
+    return grounding
+
+
+_PERCENT_AFTER = re.compile(r"\s*(?:%|per\s*cent\b|percent\b)", re.IGNORECASE)
+
+
+def mentions_score(text: str) -> bool:
+    """True when the text states a score such as 2-1; formations never match."""
+    return _SCORE.search(text) is not None
 
 
 def _score_matches(
@@ -472,13 +483,15 @@ def check_evidence(
                     for span in [*score_spans, *formation_spans, *back_line_spans]
                 ):
                     continue
-                if not _number_is_grounded(
-                    number,
-                    sentence,
-                    cited_facts,
-                    info=info,
-                ):
+                grounding = _grounding_facts(number, sentence, cited_facts, info=info)
+                if not grounding:
                     failures.append(f"ungrounded number {number.text!r}")
+                elif all(fact.unit == "%" for fact in grounding) and not _PERCENT_AFTER.match(
+                    sentence, number_end
+                ):
+                    failures.append(
+                        f"percentage {number.text!r} must be spoken with % or per cent"
+                    )
         failures.extend(_score_matches(text, cited_facts, info))
         failures.extend(_formation_matches(text, cited_facts, info))
 

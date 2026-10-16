@@ -108,6 +108,9 @@ def summarize_calls(outcomes: list[WindowOutcome]) -> dict[str, dict[str, object
             "median_input_tokens": med([t.input_tokens for t in timings]),  # type: ignore[attr-defined]
             "median_output_tokens": med([t.output_tokens for t in timings]),  # type: ignore[attr-defined]
             "median_reasoning_tokens": med([t.reasoning_tokens for t in timings]),  # type: ignore[attr-defined]
+            "finish_reasons": dict(
+                Counter(str(t.finish_reason) for t in timings)  # type: ignore[attr-defined]
+            ),
         }
         for role, timings in sorted(by_role.items())
     }
@@ -229,6 +232,18 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
             if outcome.result is not None
             and outcome.result.status == "commentary"
             and outcome.result.line is not None
+        ],
+        "agent_share": {
+            "agent_lines": sum(
+                1 for outcome in lines if outcome.result.line.source == "agent"  # type: ignore[union-attr]
+            ),
+            "lines": len(lines),
+        },
+        "output_failures": [
+            {"path": outcome.path, "minute": outcome.minute, "failure": failure}
+            for outcome in sorted(outcomes, key=lambda item: item.event.seq)
+            if outcome.result is not None
+            for failure in outcome.result.output_failures
         ],
         "agent_calls_by_role": summarize_calls(outcomes),
         "viewer_stream": {

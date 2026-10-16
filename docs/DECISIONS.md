@@ -325,3 +325,37 @@ Not fixed at this gate; candidates for the next step:
 Also seen in the emitted lines:
 - **Weak agent lines that still pass the check:** "At 21 minutes, Ashbridge Rovers have 31 possession before and 53 after against Port Calder FC", and an m02 line containing a newline.
 - **Formation changes heard twice:** the fast path announces them and the mandatory tactical signal repeats them (m01 67'/69' and 72'/75', m02 39'/45').
+
+### Phase 2c regression fixes
+
+**Changes:**
+- **Reply schema.** The Commentator returns `CommentaryReply` (`text`, `fact_ids`, `event_ids`) only. The server sets `line_id`, `insight_id`, `tone` (from the delivery tier, `TIER_TONES`), `source` and `delivery_tier`. An over-long reply fails the evidence step with "text is N characters; the limit is 200" rather than failing schema validation.
+- **Validation logging.** Every structured-output failure is logged (`agent_output_invalid`) with the failing fields and a 160-character excerpt of the reply, and listed in the gate report's `output_failures`. `finish_reason` is recorded per call and counted per role.
+- **Cap.** Commentator `max_tokens` is 700.
+- **Instructions.** `COMMENTATOR_INSTRUCTIONS` keeps the hard rules, goal context, formation wording and four persona examples (1, 5, 8 and 9). It went from 3,616 to 2,462 characters. The persona, energy tiers and variety rules stay in `prompts/commentator-persona.md`. One short rule is kept: don't open with the same words as a recent line.
+- **Score rule.** `score_phrase` is supplied on goals and red cards, or when none of the last 3 lines said it, and is otherwise null. A line that states a score when the score was withheld fails the check. Fallbacks drop their closing score sentence in that case.
+- **One line per formation change.** The dispatcher records each formation event the fast path announces, and the tactical lane skips that event's signal. The fast path now gets a previous-formation fact, so it can say "from X to Y". A new must-say fallback variant uses it.
+- **Tidy text and percentages.** Whitespace and newlines are collapsed. A number grounded only by `%` facts must be followed by "%" or "per cent".
+- **Default voice.** `en-GB-RyanNeural`, the only en-GB voice whose delivery changed under the sports styles in the voice trial.
+
+**Gates at 20x** (15,000 ms budget):
+
+| Match | Path | Windows | Lines | Agent | Fallback | Dropped | Run median / slowest |
+| :--- | :--- | ---: | ---: | ---: | ---: | :--- | :--- |
+| m01 | Fast path | 8 | 8 | 8 | 0 | 0 | 3,938 / 6,547 ms |
+| m01 | Tactical | 7 | 5 | 2 | 3 | 2 (Director declined) | 8,672 / 12,656 ms |
+| m02 | Fast path | 5 | 5 | 3 | 2 | 0 | 5,391 / 6,328 ms |
+| m02 | Tactical | 7 | 7 | 5 | 2 | 0 | 8,594 / 11,953 ms |
+
+- **Agent share:** m01 10 of 13 (77%), m02 8 of 12 (67%), 18 of 25 overall (72%).
+- **Structured-output failures:** none. Every call ended with `finish_reason=stop` (m01: Commentator 14, Analyst 8, Director 7; m02: 15, 9, 6). No call was cut off by the token cap.
+- **Commentator tokens (median input / output / reasoning):** m01 1,656.5 / 285 / 113.5, against 1,807 / 368 / 162 before; m02 1,530 / 302 / 163, against 1,849 / 383 / 183 before. Median call time is 3,138 ms (m01) and 2,908 ms (m02).
+- **Every fallback is now "evidence check failed twice".** In m01 all three are tactical windows where the Analyst's insight failed twice, so the Commentator never ran. In m02 two are fast-path goals (27' and 54') and two are tactical windows. Seven other windows passed on the Commentator's second attempt. The evidence-check failure text is not logged yet.
+- **Beats:** all goals, the red card, the substitution and the formation changes produced a line. Each formation change was heard once. The m01 88' go-ahead goal was agent-written.
+- **Viewer stream:** 2 lines per match were ready after their event's release, at most 3,094 ms late (m01) and 2,219 ms late (m02), against 5 per match and 5,250 ms before.
+
+**Targets:**
+- m02 misses two of them: its agent share is 67% (target 70%) and its fast-path median is 5,391 ms (target under 4 s). Its two fallback goals each cost two Commentator calls.
+- m01 meets all of them, but its fast-path median of 3,938 ms is only just under 4 s.
+
+**New in the emitted lines:** with the variety rules out of the prompt, the model states the minute in most lines, as "At N minutes" or "at N minutes" (8 of 10 agent lines in m01, 6 of 8 in m02), and sometimes adds "N minutes left". At 74' in m01 it used the word "consolation" for a goal that pulled one back mid-match.

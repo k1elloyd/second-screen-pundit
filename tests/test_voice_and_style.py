@@ -21,7 +21,7 @@ from second_screen_pundit.agents.delivery import TIER_STYLES, tier_for_event
 from second_screen_pundit.agents.dispatcher import LiveDispatcher
 from second_screen_pundit.agents.evidence import check_evidence
 from second_screen_pundit.agents.fallbacks import FALLBACK_VARIANTS, fallback_lines
-from second_screen_pundit.agents.models import CommentaryLine
+from second_screen_pundit.agents.models import CommentaryLine, CommentaryReply
 from second_screen_pundit.agents.pipeline import PunditPipeline, is_must_say
 from second_screen_pundit.agents.signals import SIGNAL_TOOL, SignalTracker, signals_tool_result
 from second_screen_pundit.agents.speech import build_ssml
@@ -167,23 +167,29 @@ def test_m02_red_card_and_four_four_one_beats_are_produced_even_when_agents_fail
     asyncio.run(dispatcher.run(feed()))
 
     assert not [outcome.error for outcome in dispatcher.outcomes if outcome.error]
-    tactical = {
-        signal.kind: outcome
+    red_card = [
+        outcome
         for outcome in dispatcher.outcomes
         if outcome.path == "tactical"
-        for signal in outcome.signals
-        if signal.mandatory
-    }
-    for kind in ("red_card", "formation_change"):
-        result = tactical[kind].result
-        assert result is not None and result.status == "commentary", kind
+        and any(signal.kind == "red_card" for signal in outcome.signals)
+    ]
+    reshape = [
+        outcome
+        for outcome in dispatcher.outcomes
+        if outcome.event.type == "formation_change"
+        or any(signal.kind == "formation_change" for signal in outcome.signals)
+    ]
+    # One line per formation change: the fast path says it, the tactical lane does not.
+    assert len(reshape) == 1 and reshape[0].path == "fast_path"
+    assert len(red_card) == 1
+    for outcome in (*red_card, *reshape):
+        result = outcome.result
+        assert result is not None and result.status == "commentary"
         assert result.line is not None and result.line.source == "fallback"
         assert result.evidence is not None and result.evidence.passed
-    # Both mandatory beats reach the 42' boundary together, so one line must carry both.
-    assert tactical["red_card"] is tactical["formation_change"]
-    text = tactical["formation_change"].result.line.text  # type: ignore[union-attr]
-    assert "4-4-1" in text and "player" in text, text
-    assert tactical["red_card"].result.line.delivery_tier == "red_card"  # type: ignore[union-attr]
+    assert "4-4-1" in reshape[0].result.line.text  # type: ignore[union-attr]
+    assert "player" in red_card[0].result.line.text  # type: ignore[union-attr]
+    assert red_card[0].result.line.delivery_tier == "red_card"  # type: ignore[union-attr]
 
 
 def test_every_combined_red_card_and_reshape_variant_passes_for_port_calder() -> None:
@@ -360,14 +366,10 @@ def test_commentator_prompt_has_recent_lines_and_tier_and_tier_is_server_set(
             supplied.append(payload)
             insight = payload["insight"]
             return SimpleNamespace(
-                value=CommentaryLine(
-                    line_id=live_line_id("m01", goal.seq, "fast_path"),
+                value=CommentaryReply(
                     text=f"Juno Kestrelane puts them in front late on. {payload['score_phrase']}.",
-                    insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
                     event_ids=insight["event_ids"],
-                    tone="urgent",
-                    delivery_tier="routine",
                 )
             )
 
@@ -378,7 +380,7 @@ def test_commentator_prompt_has_recent_lines_and_tier_and_tier_is_server_set(
     )
 
     assert supplied[0]["recent_lines"] == list(recent[-3:])
-    assert supplied[0]["required_delivery_tier"] == "goal_peak"
+    assert "required_delivery_tier" not in supplied[0]
     assert result.line is not None and result.line.delivery_tier == "goal_peak"
     assert result.evidence is not None and result.evidence.passed
 

@@ -16,6 +16,7 @@ from second_screen_pundit.agents.evidence import check_evidence
 from second_screen_pundit.agents.models import (
     Claim,
     CommentaryLine,
+    CommentaryReply,
     DirectorDecision,
     Explanation,
     Insight,
@@ -605,13 +606,10 @@ def test_must_say_window_uses_deterministic_insight_and_one_commentator_call(
             supplied.append(payload)
             insight = payload["insight"]
             return SimpleNamespace(
-                value=CommentaryLine(
-                    line_id=live_line_id("m01", goal.seq, "fast_path"),
+                value=CommentaryReply(
                     text=f"{payload['score_phrase']}.",
-                    insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
                     event_ids=insight["event_ids"],
-                    tone="measured",
                 )
             )
 
@@ -645,13 +643,10 @@ def test_goal_fast_path_cites_linked_scoring_shot_and_goal_once(
             payload = json.loads(prompt)
             insight = payload["insight"]
             return SimpleNamespace(
-                value=CommentaryLine(
-                    line_id=live_line_id("m01", goal.seq, "fast_path"),
+                value=CommentaryReply(
                     text=f"{payload['score_phrase']}.",
-                    insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
                     event_ids=insight["event_ids"],
-                    tone="measured",
                 )
             )
 
@@ -869,13 +864,10 @@ def _tactical_stub_pipeline(
                 return TruncatedResponse()
             insight = payload["insight"]
             return SimpleNamespace(
-                value=CommentaryLine(
-                    line_id=live_line_id("m01", window_event.seq, "tactical"),
+                value=CommentaryReply(
                     text=f"{payload['score_phrase']}.",
-                    insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
                     event_ids=insight["event_ids"],
-                    tone="measured",
                 )
             )
 
@@ -1054,13 +1046,10 @@ def test_mandatory_signal_skips_director_and_cites_signal_facts(
                 )
             else:
                 insight = payload["insight"]
-                value = CommentaryLine(
-                    line_id=live_line_id("m01", change.seq, "tactical"),
+                value = CommentaryReply(
                     text=f"{payload['score_phrase']}.",
-                    insight_id=insight["insight_id"],
                     fact_ids=insight["fact_ids"],
                     event_ids=insight["event_ids"],
-                    tone="analytical",
                 )
             return SimpleNamespace(value=value)
 
@@ -1140,7 +1129,7 @@ def test_speech_synthesizer_uses_entra_and_emits_mp3(
     assert observed["synthesizer"]["audio_config"] is None  # type: ignore[index]
     assert observed["format"] == "mp3"
     ssml = str(observed["ssml"])
-    assert '<voice name="en-GB-SoniaNeural">' in ssml
+    assert '<voice name="en-GB-RyanNeural">' in ssml
     assert 'style="sports_commentary_excited" styledegree="1.7"' in ssml
     assert "Goal for Ashbridge Rovers &amp; co &lt;now&gt;." in ssml
     assert "<now>" not in ssml

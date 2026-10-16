@@ -32,13 +32,26 @@ DeliveryTier = Literal[
 ]
 
 
+Tone = Literal["measured", "reflective", "urgent", "analytical"]
+
+
 class CommentaryLine(AgentOutput):
     line_id: str
     text: str = Field(max_length=200)
     insight_id: str
-    tone: Literal["measured", "reflective", "urgent", "analytical"]
+    tone: Tone
     source: Literal["agent", "fallback"] = "agent"
     delivery_tier: DeliveryTier = "tactical"
+
+
+class CommentaryReply(AgentOutput):
+    """What the Commentator model returns. The server sets every other CommentaryLine field.
+
+    No length limit here: an over-long line fails the evidence step with feedback the model
+    can act on, instead of failing schema validation with none.
+    """
+
+    text: str
 
 
 class Insight(AgentOutput):

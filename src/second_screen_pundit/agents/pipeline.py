@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -38,20 +38,24 @@ from second_screen_pundit.agents.clients import (
     deployment_for_role,
 )
 from second_screen_pundit.agents.commentator import (
+    MAX_LINE_CHARS,
+    PREVIOUS_FORMATION_SUFFIX,
     build_console_insight,
     console_tool_results,
     live_line_id,
     score_phrase,
     team_display_name,
+    tidy_spoken_text,
     validate_plain_spoken_text,
 )
 from second_screen_pundit.agents.config import AgentSettings
-from second_screen_pundit.agents.delivery import tier_for_event, tier_for_signals
-from second_screen_pundit.agents.evidence import EvidenceReport, check_evidence
+from second_screen_pundit.agents.delivery import TIER_TONES, tier_for_event, tier_for_signals
+from second_screen_pundit.agents.evidence import EvidenceReport, check_evidence, mentions_score
 from second_screen_pundit.agents.fallbacks import fallback_lines
 from second_screen_pundit.agents.models import (
     Claim,
     CommentaryLine,
+    CommentaryReply,
     DirectorDecision,
     Explanation,
     Insight,
@@ -97,6 +101,7 @@ class AgentCallTiming:
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,8 @@ class LiveWindowResult:
     evidence: EvidenceReport | None
     notice: str | None = None
     timings: tuple[AgentCallTiming, ...] = ()
+    # "role: fields | reply excerpt" for each structured-output failure in this window.
+    output_failures: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,24 @@ def is_must_say(event: Event, events: Sequence[Event] = ()) -> bool:
 
 def _event_clock(event: Event) -> int:
     return event.minute + event.added_minute
+
+
+# Goals and red cards always carry the score; the delivery tier already identifies them.
+_SCORE_TIERS = {"goal_peak", "goal_equaliser", "goal", "red_card"}
+RECENT_LINES_FOR_SCORE = 3
+
+
+def score_phrase_allowed(
+    phrase: str,
+    recent_lines: Sequence[str],
+    *,
+    goal_or_red_card: bool,
+) -> bool:
+    """The score is said on goals and red cards, or when none of the last 3 lines said it."""
+    if goal_or_red_card:
+        return True
+    folded = phrase.casefold()
+    return not any(folded in line.casefold() for line in recent_lines[-RECENT_LINES_FOR_SCORE:])
 
 
 _MUST_SAY_FALLBACK_KINDS = {
@@ -176,23 +201,51 @@ def _invalid_output(model_name: str) -> str:
     return f"{_INVALID_OUTPUT_PREFIX} {model_name} matching the schema."
 
 
-def _parsed(response: object | None, model: type[_OutputT]) -> _OutputT | None:
+_EXCERPT_CHARS = 160
+
+
+def describe_validation_error(error: ValidationError, raw: object | None = None) -> str:
+    """Which fields failed and a short excerpt of the reply, for the log and the gate report."""
+    problems = [
+        f"{'.'.join(str(part) for part in item['loc']) or '<root>'}: {item['type']}"
+        for item in error.errors()
+    ]
+    if raw is None:
+        raw = next((item.get("input") for item in error.errors() if "input" in item), None)
+    excerpt = raw if isinstance(raw, str) else json.dumps(raw, default=str)
+    excerpt = " ".join(excerpt.split())
+    if len(excerpt) > _EXCERPT_CHARS:
+        excerpt = excerpt[:_EXCERPT_CHARS] + "..."
+    return f"{'; '.join(problems[:4])} | reply: {excerpt!r}"
+
+
+def _parsed(
+    response: object | None,
+    model: type[_OutputT],
+    on_invalid: Callable[[str], None] | None = None,
+) -> _OutputT | None:
     """Read a structured response; None when it was missing, truncated or off-schema."""
     if response is None:
         return None
     try:
-        return _as_model(getattr(response, "value", None), model)
-    except ValidationError:
+        parsed = _as_model(getattr(response, "value", None), model)
+    except ValidationError as exc:
+        if on_invalid is not None:
+            on_invalid(describe_validation_error(exc, getattr(response, "text", None)))
         return None
+    if parsed is None and on_invalid is not None:
+        text = " ".join(str(getattr(response, "text", "") or "").split())
+        on_invalid(f"<root>: no structured value | reply: {text[:_EXCERPT_CHARS]!r}")
+    return parsed
 
 
-def _is_structured_output_error(error: ChatClientException) -> bool:
+def _structured_output_error(error: ChatClientException) -> ValidationError | None:
     cause = error.__cause__
     while cause is not None:
         if isinstance(cause, ValidationError):
-            return True
+            return cause
         cause = cause.__cause__
-    return False
+    return None
 
 
 def _workflow_models(result: object) -> list[BaseModel]:
@@ -558,6 +611,25 @@ class PunditPipeline:
             )
         else:
             delivery_tier = tier_for_signals([signal.kind for signal in signals])
+        score_allowed = score_phrase_allowed(
+            deterministic_score_phrase,
+            recent_lines,
+            goal_or_red_card=delivery_tier in _SCORE_TIERS,
+        )
+        output_failures: list[str] = []
+
+        def record_invalid(role: AgentRole, attempt: int) -> Callable[[str], None]:
+            def record(detail: str) -> None:
+                output_failures.append(f"{role}: {detail}")
+                logger.warning(
+                    "agent_output_invalid role=%s as_of=%d attempt=%d %s",
+                    role,
+                    as_of,
+                    attempt,
+                    detail,
+                )
+
+            return record
 
         def stale_result() -> LiveWindowResult:
             return LiveWindowResult(
@@ -581,7 +653,9 @@ class PunditPipeline:
             score_fact = next(
                 fact for fact in facts_by_id.values() if fact.label.startswith("Match-level score")
             )
-            values: dict[str, object] = {"score_phrase": deterministic_score_phrase}
+            values: dict[str, object] = {
+                "score_phrase": deterministic_score_phrase if score_allowed else None
+            }
             if deterministic_console is not None and must_say_event is not None:
                 event = must_say_event
                 context = deterministic_console.event_context
@@ -603,6 +677,14 @@ class PunditPipeline:
                     player_on_name=detail.get("player_on_name"),
                     player_off_name=detail.get("player_off_name"),
                     formation=detail.get("formation"),
+                    previous_formation=next(
+                        (
+                            str(fact.value)
+                            for fact_id, fact in facts_by_id.items()
+                            if fact_id.endswith(f":{PREVIOUS_FORMATION_SUFFIX}")
+                        ),
+                        None,
+                    ),
                     chance_descriptor=descriptor,
                     chance_descriptor_title=(
                         descriptor[:1].upper() + descriptor[1:] if descriptor else None
@@ -678,11 +760,11 @@ class PunditPipeline:
             for text in fallback_lines(kind, values, line_id=line_id):
                 line = CommentaryLine(
                     line_id=line_id,
-                    text=text,
+                    text=tidy_spoken_text(text),
                     insight_id=insight.insight_id,
                     fact_ids=list(dict.fromkeys(fact_ids)),
                     event_ids=insight.event_ids,
-                    tone="measured",
+                    tone=TIER_TONES[delivery_tier],
                     source="fallback",
                     delivery_tier=delivery_tier,
                 )
@@ -695,6 +777,7 @@ class PunditPipeline:
                     tool_results=accumulated_results,
                     lane=lane,
                     allow_fallback=True,
+                    score_allowed=score_allowed,
                 )
                 if report.passed:
                     return LiveWindowResult(
@@ -705,6 +788,7 @@ class PunditPipeline:
                         report,
                         reason or "Agent output failed; deterministic fallback was used.",
                         tuple(timings),
+                        tuple(output_failures),
                     )
                 failures = report.failures
             raise RuntimeError(
@@ -747,6 +831,9 @@ class PunditPipeline:
                     input_tokens=usage.get("input_token_count"),
                     output_tokens=usage.get("output_token_count"),
                     reasoning_tokens=usage.get("reasoning_output_token_count"),
+                    finish_reason=(
+                        normalized_finish_reason if response is not None else "no_response"
+                    ),
                 )
                 timings.append(timing)
                 logger.info(
@@ -772,9 +859,11 @@ class PunditPipeline:
             try:
                 return await run_agent(role, agent, prompt, attempt)
             except ChatClientException as exc:
-                if not _is_structured_output_error(exc):
+                validation_error = _structured_output_error(exc)
+                if validation_error is None:
                     raise
                 invalid_output_roles.add(role)
+                record_invalid(role, attempt)(describe_validation_error(validation_error))
                 return None
 
         async def attempts() -> LiveWindowResult:
@@ -796,10 +885,9 @@ class PunditPipeline:
                     },
                     "must_say": must_say,
                     "minute": clock,
-                    "score_phrase": deterministic_score_phrase,
+                    "score_phrase": deterministic_score_phrase if score_allowed else None,
                     "signals": signal_prompts,
                     "retry_feedback": feedback,
-                    "required_line_id": live_line_id(info.match_id, as_of, lane),
                 }
                 if not director_passed:
                     director = self._agent(
@@ -815,7 +903,9 @@ class PunditPipeline:
                     )
                     if is_tactical_stale():
                         return stale_result()
-                    director_decision = _parsed(director_response, DirectorDecision)
+                    director_decision = _parsed(
+                        director_response, DirectorDecision, record_invalid("director", attempt)
+                    )
                     if director_decision is None:
                         invalid_output_roles.add("director")
                         feedback = _invalid_output("DirectorDecision")
@@ -868,7 +958,7 @@ class PunditPipeline:
                         accumulated_results.extend(capture.results)
                     if is_tactical_stale():
                         return stale_result()
-                    candidate = _parsed(analyst_response, Insight)
+                    candidate = _parsed(analyst_response, Insight, record_invalid("analyst", attempt))
                     if candidate is None:
                         invalid_output_roles.add("analyst")
                         feedback = _invalid_output("Insight")
@@ -950,10 +1040,11 @@ class PunditPipeline:
                             if key != "signals"
                         },
                         "events": event_contexts,
-                        "insight": insight.model_dump(mode="json"),
+                        "insight": insight.model_dump(
+                            mode="json", include={"headline", "fact_ids", "event_ids"}
+                        ),
                         "facts": insight_facts,
                         "recent_lines": list(recent_lines)[-3:],
-                        "required_delivery_tier": delivery_tier,
                     }
                 )
                 commentator_response = await call(
@@ -964,12 +1055,31 @@ class PunditPipeline:
                 )
                 if is_tactical_stale():
                     return stale_result()
-                line = _parsed(commentator_response, CommentaryLine)
-                if line is None:
+                reply = _parsed(
+                    commentator_response,
+                    CommentaryReply,
+                    record_invalid("commentator", attempt),
+                )
+                if reply is None:
                     invalid_output_roles.add("commentator")
-                    feedback = _invalid_output("CommentaryLine")
+                    feedback = _invalid_output("CommentaryReply")
                     continue
-                line = line.model_copy(update={"delivery_tier": delivery_tier})
+                text = tidy_spoken_text(reply.text)
+                if len(text) > MAX_LINE_CHARS:
+                    feedback = (
+                        f"text is {len(text)} characters; the limit is {MAX_LINE_CHARS}"
+                    )
+                    continue
+                line = CommentaryLine(
+                    line_id=live_line_id(info.match_id, as_of, lane),
+                    text=text,
+                    insight_id=insight.insight_id,
+                    fact_ids=reply.fact_ids,
+                    event_ids=reply.event_ids,
+                    tone=TIER_TONES[delivery_tier],
+                    source="agent",
+                    delivery_tier=delivery_tier,
+                )
                 report = self._check_line(
                     line,
                     insight,
@@ -978,6 +1088,7 @@ class PunditPipeline:
                     as_of=as_of,
                     tool_results=accumulated_results,
                     lane=lane,
+                    score_allowed=score_allowed,
                 )
                 if report.passed:
                     return LiveWindowResult(
@@ -1082,7 +1193,7 @@ class PunditPipeline:
             )
             if result is None:
                 raise RuntimeError("Live workflow returned no window result")
-            return result
+            return replace(result, output_failures=tuple(output_failures))
         except TimeoutError:
             if is_tactical_stale():
                 return stale_result()
@@ -1098,6 +1209,7 @@ class PunditPipeline:
                 None,
                 "Live commentary was dropped because its time budget expired.",
                 tuple(timings),
+                tuple(output_failures),
             )
 
     def _check_line(
@@ -1111,6 +1223,7 @@ class PunditPipeline:
         tool_results: list[ToolResult],
         lane: str,
         allow_fallback: bool = False,
+        score_allowed: bool = True,
     ) -> EvidenceReport:
         report = check_evidence(
             insight, events=events, as_of=as_of, tool_results=tool_results, info=info
@@ -1121,6 +1234,11 @@ class PunditPipeline:
             validate_plain_spoken_text(line.text)
         except ValueError as exc:
             return EvidenceReport(False, (str(exc),))
+        if not score_allowed and mentions_score(line.text):
+            return EvidenceReport(
+                False,
+                ("score_phrase was null, so this line must not state the score",),
+            )
         if line.line_id != live_line_id(info.match_id, as_of, lane):
             return EvidenceReport(
                 False,

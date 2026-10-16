@@ -168,14 +168,18 @@ def _dispatch(match_id: str, pipeline: _StubPipeline, end: asyncio.Event | None 
 
 def test_storyline_tactical_beats_each_produce_a_tactical_line() -> None:
     m01 = _dispatch("m01", _StubPipeline())
+    # The fast path announces each formation change, so the tactical lane does not repeat it.
     back_three = [
         outcome
         for outcome in m01.outcomes
-        if outcome.path == "tactical"
-        and any(
-            signal.kind == "formation_change" and signal.facts[0].value == "3-4-3"
-            for signal in outcome.signals
-        )
+        if outcome.path == "fast_path"
+        and outcome.event.type == "formation_change"
+        and outcome.event.detail.get("formation") == "3-4-3"
+    ]
+    assert not [
+        outcome
+        for outcome in m01.outcomes
+        if any(signal.kind == "formation_change" for signal in outcome.signals)
     ]
     m02 = _dispatch("m02", _StubPipeline())
     red_card = [
@@ -271,7 +275,8 @@ def test_high_turnover_surge_is_as_of_safe_and_covers_m03_storyline() -> None:
 def test_older_tactical_run_is_dropped_when_a_newer_window_is_dispatched() -> None:
     end = asyncio.Event()
     pipeline = _StubPipeline(hold_until=end)
-    dispatcher = _dispatch("m01", pipeline, end)
+    # m02's mandatory red card is dispatched while an earlier tactical run is still held.
+    dispatcher = _dispatch("m02", pipeline, end)
     tactical = sorted(
         (outcome for outcome in dispatcher.outcomes if outcome.path == "tactical"),
         key=lambda outcome: outcome.event.seq,

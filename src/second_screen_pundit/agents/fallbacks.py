@@ -36,6 +36,7 @@ FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
         "Fresh legs for {team}: {player_on_name} on for {player_off_name}. {score_phrase}.",
     ),
     "formation_change": (
+        "{team} move from a {previous_formation} to a {formation}. {score_phrase}.",
         "{team} have changed to a {formation} shape. {score_phrase}.",
         "{team} reorganise into a {formation}. {score_phrase}.",
         "A change of shape from {team}, now set up in a {formation}. {score_phrase}.",
@@ -85,6 +86,9 @@ FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
 }
 
 
+_SCORE_SENTENCE = " {score_phrase}."
+
+
 def _placeholders(template: str) -> set[str]:
     return {name for _, name, _, _ in string.Formatter().parse(template) if name}
 
@@ -97,12 +101,17 @@ def fallback_lines(
 ) -> Iterator[str]:
     """Yield the usable variants for a kind, in an order seeded by the line ID.
 
-    A variant is usable only when every placeholder it needs has a value.
+    A variant is usable only when every placeholder it needs has a value. With no
+    score_phrase, the line isn't meant to state the score, so the closing score sentence is
+    dropped rather than the variant.
     """
     available = {key: value for key, value in values.items() if value not in (None, "")}
+    templates = FALLBACK_VARIANTS[kind]
+    if "score_phrase" not in available:
+        templates = tuple(template.replace(_SCORE_SENTENCE, "") for template in templates)
     usable = [
         template
-        for template in FALLBACK_VARIANTS[kind]
+        for template in templates
         if _placeholders(template) <= available.keys()
     ]
     random.Random(line_id).shuffle(usable)

@@ -9,7 +9,8 @@ from azure.core.credentials import TokenCredential
 from pydantic import BaseModel, ConfigDict
 
 from second_screen_pundit.agents.clients import create_foundry_agent
-from second_screen_pundit.agents.models import CommentaryLine
+from second_screen_pundit.agents.delivery import TIER_TONES, tier_for_event
+from second_screen_pundit.agents.models import CommentaryLine, CommentaryReply
 from second_screen_pundit.agents.prompts import COMMENTATOR_INSTRUCTIONS
 from second_screen_pundit.agents.tools.analytics import (
     Fact,
@@ -33,6 +34,15 @@ _FACT_ID_PATTERN = re.compile(
     r"compare_windows|tactical_signals|match_context):[a-z0-9_:-]+\b",
     re.IGNORECASE,
 )
+
+
+MAX_LINE_CHARS = 200
+PREVIOUS_FORMATION_SUFFIX = "previous_formation"
+
+
+def tidy_spoken_text(text: str) -> str:
+    """Collapse runs of whitespace, including newlines, into single spaces."""
+    return " ".join(text.split())
 
 
 def validate_plain_spoken_text(text: str) -> None:
@@ -130,12 +140,31 @@ def console_tool_results(
             )
         return results
     if event.type == "formation_change" and event.team is not None:
+        previous = formation_at(
+            events,
+            FormationAtParams(team=event.team, minute=minute),
+            as_of=event.seq - 1,
+        ).facts[0]
         results.extend([
             formation_at(
                 events,
                 FormationAtParams(team=event.team, minute=minute),
                 as_of=event.seq,
-            )
+            ),
+            ToolResult(
+                tool="formation_at",
+                facts=[
+                    previous.model_copy(
+                        update={
+                            "fact_id": f"formation_at:{event.seq}:{PREVIOUS_FORMATION_SUFFIX}",
+                            "label": (
+                                f"{team_name(info, event.team).full} previous formation "
+                                f"before {minute}'"
+                            ),
+                        }
+                    )
+                ],
+            ),
         ])
         return results
     if event.type == "card":
@@ -288,28 +317,32 @@ class Commentator:
 
     async def commentate(self, insight: ConsoleInsight, event: Event) -> CommentaryLine:
         prompt = (
-            f"Return a CommentaryLine for this one event.\n"
-            f"Required line_id: {live_line_id(event.match_id, event.seq, 'fast_path')}\n"
-            f"Required insight_id: {insight.insight_id}\n"
-            f"Deterministic score phrase: {insight.score_phrase}\n"
+            f"Write the commentary line for this one event.\n"
+            f"score_phrase: {insight.score_phrase}\n"
             f"Event: {insight.event_context}\n"
             f"Insight: {insight.model_dump_json()}"
         )
         response = await asyncio.wait_for(self.agent.run(prompt), timeout=15)
         if response.value is None:
-            raise ValueError("Commentator returned no structured CommentaryLine")
-        line = CommentaryLine.model_validate(response.value)
-        validate_plain_spoken_text(line.text)
-        if line.line_id != live_line_id(event.match_id, event.seq, "fast_path"):
-            raise ValueError("Commentator returned a line_id that does not match the event")
-        if line.insight_id != insight.insight_id:
-            raise ValueError("Commentator returned an insight_id that does not match its input")
-        if line.source != "agent":
-            raise ValueError("Commentator model output cannot set a fallback source")
-        if not set(line.fact_ids).issubset(insight.fact_ids):
+            raise ValueError("Commentator returned no structured CommentaryReply")
+        reply = CommentaryReply.model_validate(response.value)
+        text = tidy_spoken_text(reply.text)
+        validate_plain_spoken_text(text)
+        if len(text) > MAX_LINE_CHARS:
+            raise ValueError(f"Commentator text is longer than {MAX_LINE_CHARS} characters")
+        if not set(reply.fact_ids).issubset(insight.fact_ids):
             raise ValueError("Commentator cited a fact that was not supplied")
-        if not set(line.event_ids).issubset(insight.event_ids):
+        if not set(reply.event_ids).issubset(insight.event_ids):
             raise ValueError("Commentator cited an event that was not supplied")
-        if not line.event_ids:
+        if not reply.event_ids:
             raise ValueError("Commentator must cite at least one event")
-        return line
+        tier = tier_for_event(event, goal_context=None, clock=insight.minute)
+        return CommentaryLine(
+            line_id=live_line_id(event.match_id, event.seq, "fast_path"),
+            text=text,
+            insight_id=insight.insight_id,
+            fact_ids=reply.fact_ids,
+            event_ids=reply.event_ids,
+            tone=TIER_TONES[tier],
+            delivery_tier=tier,
+        )

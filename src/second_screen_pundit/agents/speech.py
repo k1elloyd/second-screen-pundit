@@ -11,7 +11,8 @@ from azure.core.credentials import TokenCredential
 from second_screen_pundit.agents.delivery import TIER_STYLES, TierStyle
 from second_screen_pundit.agents.models import DeliveryTier
 
-DEFAULT_VOICE = "en-GB-SoniaNeural"
+# Phase 2c voice trial: the only en-GB voice whose delivery changed under the sports styles.
+DEFAULT_VOICE = "en-GB-RyanNeural"
 SSML_LANGUAGE = "en-GB"
 
 

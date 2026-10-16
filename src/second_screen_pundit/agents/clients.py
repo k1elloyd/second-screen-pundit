@@ -9,7 +9,7 @@ from azure.core.credentials import TokenCredential
 from pydantic import BaseModel
 
 from second_screen_pundit.agents.models import (
-    CommentaryLine,
+    CommentaryReply,
     DirectorDecision,
     Explanation,
     Insight,
@@ -24,7 +24,8 @@ AgentTool = Callable[..., str]
 _MAX_TOKENS: dict[AgentRole, int] = {
     "director": 320,
     "analyst": 384,
-    "commentator": 400,
+    # Includes reasoning tokens; 400 truncated replies once the persona instructions grew.
+    "commentator": 700,
     "explainer": 512,
     "recap": 768,
 }
@@ -40,7 +41,7 @@ _LOW_REASONING_ROLES = {"director", "commentator"}
 _OUTPUT_MODELS: dict[AgentRole, type[BaseModel]] = {
     "director": DirectorDecision,
     "analyst": Insight,
-    "commentator": CommentaryLine,
+    "commentator": CommentaryReply,
     "explainer": Explanation,
     "recap": Recap,
 }

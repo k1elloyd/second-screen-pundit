@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from second_screen_pundit.agents.models import DeliveryTier
+from second_screen_pundit.agents.models import DeliveryTier, Tone
 from second_screen_pundit.engine.schema import Event
 
 LATE_GO_AHEAD_MINUTE = 75
@@ -32,6 +32,20 @@ TIER_STYLES: dict[DeliveryTier, TierStyle] = {
     "substitution": TierStyle("sports_commentary", 0.8),
     "booking": TierStyle("sports_commentary", 0.8),
     "routine": TierStyle("sports_commentary", 0.6),
+}
+
+# The persona's tone column, so the model no longer has to return it.
+TIER_TONES: dict[DeliveryTier, Tone] = {
+    "goal_peak": "urgent",
+    "goal_equaliser": "urgent",
+    "goal": "urgent",
+    "big_chance": "urgent",
+    "red_card": "urgent",
+    "formation": "analytical",
+    "tactical": "analytical",
+    "substitution": "measured",
+    "booking": "measured",
+    "routine": "measured",
 }
 
 

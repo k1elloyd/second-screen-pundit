@@ -8,7 +8,7 @@ from typing import Literal
 
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.pipeline import LiveWindowResult, PunditPipeline, is_must_say
-from second_screen_pundit.agents.signals import SignalTracker, TacticalSignal
+from second_screen_pundit.agents.signals import SignalTracker, TacticalSignal, formation_key
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.schema import Event, MatchInfo
 
@@ -70,6 +70,9 @@ class LiveDispatcher:
         self._generation = 0
         self._in_flight = 0
         self._recent_lines: list[str] = []
+        # Formation changes the fast path has announced; the tactical lane skips their signal,
+        # so each change is heard once.
+        self._announced_formations: set[str] = set()
 
     async def run(
         self,
@@ -102,13 +105,16 @@ class LiveDispatcher:
     def _on_event(self, event: Event) -> None:
         if self.delay is not None:
             self.delay.stamp(event)
+        must_say = is_must_say(event, self.events)
+        if must_say and event.type == "formation_change":
+            self._announced_formations.add(formation_key(event.seq))
         clock = self._clock(event)
         if clock >= self._next_boundary:
             self._tactical_boundary(event, min(90, clock))
             while clock >= self._next_boundary:
                 self._next_boundary += WINDOW_MATCH_MINUTES
             self._last_boundary_seq = event.seq
-        if is_must_say(event, self.events):
+        if must_say:
             self._tasks.append(asyncio.create_task(self._run_fast(event, min(90, clock))))
 
     @staticmethod
@@ -118,6 +124,8 @@ class LiveDispatcher:
     def _tactical_boundary(self, event: Event, now: int) -> None:
         current: list[TacticalSignal] = []
         for signal in self._tracker.evaluate(self.events, as_of=event.seq):
+            if signal.kind == "formation_change" and signal.key in self._announced_formations:
+                continue
             if signal.one_shot:
                 self._pending[signal.key] = signal
             else:
