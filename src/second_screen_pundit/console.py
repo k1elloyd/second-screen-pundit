@@ -74,7 +74,7 @@ async def run_console(match_id: str, speed: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a synthetic match and its console commentary.")
     parser.add_argument("match_id", choices=("m01", "m02", "m03"))
-    parser.add_argument("--speed", type=int, default=60)
+    parser.add_argument("--speed", type=int, default=20)
     args = parser.parse_args()
     asyncio.run(run_console(args.match_id, args.speed))
 

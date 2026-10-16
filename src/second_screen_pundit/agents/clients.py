@@ -21,7 +21,7 @@ AgentRole = Literal["director", "analyst", "commentator", "explainer", "recap"]
 AgentTool = Callable[..., str]
 
 _MAX_TOKENS: dict[AgentRole, int] = {
-    "director": 128,
+    "director": 256,
     "analyst": 384,
     "commentator": 256,
     "explainer": 512,

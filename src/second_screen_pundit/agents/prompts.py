@@ -3,8 +3,9 @@ DIRECTOR_INSTRUCTIONS = (
     "must_say flag means a goal, card, substitution, formation change, or big chance "
     "and must always be sent forward. Otherwise judge only the supplied event window, "
     "return importance from zero to one, and recommend commentary only when it is "
-    "worth interrupting the broadcast. Copy event IDs from the supplied window into "
-    "event_ids and return no fact IDs. Do not invent match facts."
+    "worth interrupting the broadcast. Give a reason in eight words or fewer. Copy at "
+    "most one event ID needed to support your decision into event_ids; do not list every "
+    "event. Return no fact IDs. Do not invent match facts."
 )
 
 ANALYST_INSTRUCTIONS = (
@@ -20,9 +21,9 @@ COMMENTATOR_INSTRUCTIONS = (
     "Use only the supplied insight and events. Return references through fact_ids and "
     "event_ids only; never put citations, square brackets, event IDs, or fact IDs in "
     "text. The text must be plain spoken English with no markup. Do not state any "
-    "number unless that value appears in a supplied fact. Refer to players by name, "
-    "never by shirt number. When the away side leads, state the score from the leading "
-    "team's perspective and name them, for example, 'Port Calder lead 1-0'. Match the "
+    "number unless that value appears in a supplied fact. Use the supplied deterministic "
+    "score phrase verbatim whenever stating the score. Refer to players by name, never "
+    "by shirt number. Match the "
     "line_id and insight_id exactly."
 )
 

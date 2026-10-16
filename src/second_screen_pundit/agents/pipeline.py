@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeVar
 
 from agent_framework import Agent, AgentExecutor, FunctionMiddleware, Message, WorkflowBuilder
+from agent_framework.exceptions import ChatClientException
 from azure.core.credentials import TokenCredential
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from second_screen_pundit.agents.cache import (
     CachedMatchOutput,
@@ -17,7 +19,12 @@ from second_screen_pundit.agents.cache import (
     load_cached_match,
 )
 from second_screen_pundit.agents.clients import AgentRole, AgentTool, create_foundry_agent
-from second_screen_pundit.agents.commentator import validate_plain_spoken_text
+from second_screen_pundit.agents.commentator import (
+    build_console_insight,
+    console_tool_results,
+    score_phrase,
+    validate_plain_spoken_text,
+)
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.evidence import EvidenceReport, check_evidence
 from second_screen_pundit.agents.models import (
@@ -53,6 +60,14 @@ class LiveWindowResult:
     tool_results: tuple[ToolResult, ...]
     evidence: EvidenceReport | None
     notice: str | None = None
+    timings: tuple[AgentCallTiming, ...] = ()
+
+
+@dataclass(frozen=True)
+class AgentCallTiming:
+    role: AgentRole
+    attempt: int
+    duration_ms: int
 
 
 @dataclass(frozen=True)
@@ -92,6 +107,15 @@ def _as_model(value: object, model: type[_OutputT]) -> _OutputT | None:
     if isinstance(value, dict):
         return model.model_validate(value)
     return None
+
+
+def _is_structured_output_error(error: ChatClientException) -> bool:
+    cause = error.__cause__
+    while cause is not None:
+        if isinstance(cause, ValidationError):
+            return True
+        cause = cause.__cause__
+    return False
 
 
 def _workflow_models(result: object) -> list[BaseModel]:
@@ -294,6 +318,7 @@ class PunditPipeline:
         window: Sequence[Event],
         *,
         as_of: int,
+        is_stale: Callable[[], bool] | None = None,
     ) -> LiveWindowResult:
         if not window:
             raise ValueError("A live window must contain at least one event")
@@ -305,26 +330,76 @@ class PunditPipeline:
         must_say = any(is_must_say(event) for event in window)
         deadline = self.settings.live_timeout_seconds
         accumulated_results: list[ToolResult] = []
+        timings: list[AgentCallTiming] = []
         feedback = ""
+        deterministic_console = None
+        deterministic_insight = None
+        deterministic_score_phrase = ""
+        if must_say:
+            event = next(event for event in window if is_must_say(event))
+            deterministic_console = build_console_insight(event, info, events)
+            accumulated_results.extend(console_tool_results(event, info, events))
+            deterministic_insight = Insight(
+                insight_id=deterministic_console.insight_id,
+                minute=deterministic_console.minute,
+                headline=deterministic_console.headline,
+                importance=1,
+                fact_ids=deterministic_console.fact_ids,
+                event_ids=deterministic_console.event_ids,
+            )
+            deterministic_score_phrase = deterministic_console.score_phrase
+        else:
+            visible = [event for event in events if event.seq <= as_of]
+            score_result = match_state(
+                events,
+                MatchStateParams(
+                    minute=max(_event_clock(event) for event in visible),
+                ),
+                as_of=as_of,
+            )
+            score_fact = next(
+                fact for fact in score_result.facts if fact.label == "Score"
+            )
+            accumulated_results.append(
+                ToolResult(tool=score_result.tool, facts=[score_fact])
+            )
+            deterministic_score_phrase = score_phrase(info, str(score_fact.value))
+
+        def stale_result() -> LiveWindowResult:
+            return LiveWindowResult(
+                "skipped",
+                None,
+                None,
+                tuple(accumulated_results),
+                None,
+                "The tactical window became stale before commentary completed.",
+                tuple(timings),
+            )
+
+        def is_tactical_stale() -> bool:
+            return not must_say and is_stale is not None and is_stale()
+
+        async def run_agent(
+            role: AgentRole,
+            agent: Agent,
+            prompt: str,
+            attempt: int,
+        ) -> object:
+            started = time.perf_counter()
+            try:
+                return await agent.run(prompt)
+            finally:
+                timings.append(
+                    AgentCallTiming(
+                        role=role,
+                        attempt=attempt,
+                        duration_ms=round((time.perf_counter() - started) * 1000),
+                    )
+                )
 
         async def attempts() -> LiveWindowResult:
             nonlocal feedback
-            for _ in range(2):
-                tools, capture = build_analytics_tools(events, as_of=as_of)
-                analyst = self._agent(
-                    "analyst",
-                    ANALYST_INSTRUCTIONS,
-                    tools=tools,
-                    middleware=[capture],
-                    time_budget=deadline,
-                )
-                commentator = self._agent(
-                    "commentator",
-                    COMMENTATOR_INSTRUCTIONS,
-                    time_budget=deadline,
-                )
-                analyst_executor = AgentExecutor(analyst)
-                commentator_executor = AgentExecutor(commentator)
+            for attempt in range(1, 3):
                 prompt_data = {
                     "match": {
                         "id": info.match_id,
@@ -336,44 +411,37 @@ class PunditPipeline:
                     "retry_feedback": feedback,
                     "required_line_id": f"{info.match_id}-l{as_of:03d}",
                 }
-                if must_say:
-                    workflow = (
-                        WorkflowBuilder(start_executor=analyst_executor)
-                        .add_edge(analyst_executor, commentator_executor)
-                        .build()
-                    )
-                else:
+                capture = None
+                if not must_say:
+                    tools, capture = build_analytics_tools(events, as_of=as_of)
                     director = self._agent(
                         "director",
                         DIRECTOR_INSTRUCTIONS,
                         time_budget=deadline,
                     )
-                    director_executor = AgentExecutor(director)
-                    workflow = (
-                        WorkflowBuilder(start_executor=director_executor)
-                        .add_edge(
-                            director_executor,
-                            analyst_executor,
-                            condition=lambda payload: self._director_forwards(payload),
+                    try:
+                        director_response = await run_agent(
+                            "director",
+                            director,
+                            json.dumps(prompt_data),
+                            attempt,
                         )
-                        .add_edge(analyst_executor, commentator_executor)
-                        .build()
+                    except ChatClientException as exc:
+                        if not _is_structured_output_error(exc):
+                            raise
+                        feedback = "Return a complete, concise DirectorDecision matching the schema."
+                        continue
+                    if is_tactical_stale():
+                        return stale_result()
+                    director_decision = _as_model(
+                        getattr(director_response, "value", None),
+                        DirectorDecision,
                     )
-                try:
-                    run_result = await workflow.run(
-                        Message(role="user", contents=json.dumps(prompt_data))
-                    )
-                finally:
-                    accumulated_results.extend(capture.results)
-
-                models = _workflow_models(run_result)
-                decision = next(
-                    (model for model in models if isinstance(model, DirectorDecision)),
-                    None,
-                )
-                if decision is not None:
+                    if director_decision is None:
+                        feedback = "The workflow did not return a structured DirectorDecision."
+                        continue
                     decision_report = check_evidence(
-                        decision,
+                        director_decision,
                         events=events,
                         as_of=as_of,
                         tool_results=[],
@@ -383,8 +451,8 @@ class PunditPipeline:
                         feedback = "; ".join(decision_report.failures)
                         continue
                     if not (
-                        decision.should_comment
-                        and decision.importance >= self.settings.importance_threshold
+                        director_decision.should_comment
+                        and director_decision.importance >= self.settings.importance_threshold
                     ):
                         return LiveWindowResult(
                             "skipped",
@@ -392,12 +460,104 @@ class PunditPipeline:
                             None,
                             tuple(accumulated_results),
                             decision_report,
+                            timings=tuple(timings),
                         )
+                    analyst = self._agent(
+                        "analyst",
+                        ANALYST_INSTRUCTIONS,
+                        tools=tools,
+                        middleware=[capture],
+                        time_budget=deadline,
+                    )
+                    try:
+                        analyst_response = await run_agent(
+                            "analyst",
+                            analyst,
+                            json.dumps(prompt_data),
+                            attempt,
+                        )
+                    except ChatClientException as exc:
+                        if not _is_structured_output_error(exc):
+                            raise
+                        feedback = "Return a complete, concise Insight matching the schema."
+                        continue
+                    finally:
+                        accumulated_results.extend(capture.results)
+                    if is_tactical_stale():
+                        return stale_result()
+                    insight = _as_model(
+                        getattr(analyst_response, "value", None),
+                        Insight,
+                    )
+                    if insight is None:
+                        feedback = "The workflow did not return a structured Insight."
+                        continue
+                    score_fact = next(
+                        fact
+                        for result in accumulated_results
+                        for fact in result.facts
+                        if fact.label == "Score"
+                    )
+                    insight = insight.model_copy(
+                        update={
+                            "fact_ids": list(
+                                dict.fromkeys([*insight.fact_ids, score_fact.fact_id])
+                            ),
+                            "event_ids": list(
+                                dict.fromkeys([*insight.event_ids, *score_fact.event_ids])
+                            ),
+                        }
+                    )
+                    insight_facts = [
+                        fact.model_dump(mode="json")
+                        for result in accumulated_results
+                        for fact in result.facts
+                    ]
+                    event_contexts = [
+                        event.model_dump(mode="json")
+                        for event in window
+                    ]
+                else:
+                    insight = deterministic_insight
+                    insight_facts = deterministic_console.facts
+                    event_contexts = [deterministic_console.event_context]
 
-                insight = next((model for model in models if isinstance(model, Insight)), None)
-                line = next((model for model in models if isinstance(model, CommentaryLine)), None)
-                if insight is None or line is None:
-                    feedback = "The workflow did not return both a structured Insight and CommentaryLine."
+                if insight is None:
+                    raise RuntimeError("Live window did not produce a deterministic or model insight")
+                commentator = self._agent(
+                    "commentator",
+                    COMMENTATOR_INSTRUCTIONS,
+                    time_budget=deadline,
+                )
+                commentator_prompt = json.dumps(
+                    {
+                        **prompt_data,
+                        "events": event_contexts,
+                        "insight": insight.model_dump(mode="json"),
+                        "facts": insight_facts,
+                        "score_phrase": deterministic_score_phrase,
+                    }
+                )
+                try:
+                    commentator_response = await run_agent(
+                        "commentator",
+                        commentator,
+                        commentator_prompt,
+                        attempt,
+                    )
+                except ChatClientException as exc:
+                    if not _is_structured_output_error(exc):
+                        raise
+                    feedback = "Return a complete, concise CommentaryLine matching the schema."
+                    continue
+                if is_tactical_stale():
+                    return stale_result()
+                line = _as_model(
+                    getattr(commentator_response, "value", None),
+                    CommentaryLine,
+                )
+                if line is None:
+                    feedback = "The workflow did not return a structured CommentaryLine."
                     continue
                 report = check_evidence(
                     insight,
@@ -407,16 +567,17 @@ class PunditPipeline:
                     info=info,
                 )
                 if report.passed:
-                    tool_event_ids = set(_all_event_ids(accumulated_results))
-                    unsupported = set(insight.event_ids) - tool_event_ids
-                    if unsupported:
-                        report = EvidenceReport(
-                            False,
-                            tuple(
-                                f"event_id {event_id} was not returned by an analytics tool"
-                                for event_id in sorted(unsupported)
-                            ),
-                        )
+                    if not must_say:
+                        tool_event_ids = set(_all_event_ids(accumulated_results))
+                        unsupported = set(insight.event_ids) - tool_event_ids
+                        if unsupported:
+                            report = EvidenceReport(
+                                False,
+                                tuple(
+                                    f"event_id {event_id} was not returned by an analytics tool"
+                                    for event_id in sorted(unsupported)
+                                ),
+                            )
                 if report.passed:
                     try:
                         validate_plain_spoken_text(line.text)
@@ -460,6 +621,7 @@ class PunditPipeline:
                         insight,
                         tuple(accumulated_results),
                         report,
+                        timings=tuple(timings),
                     )
                 feedback = "; ".join(report.failures)
             return LiveWindowResult(
@@ -469,6 +631,7 @@ class PunditPipeline:
                 tuple(accumulated_results),
                 EvidenceReport(False, (feedback,)),
                 "Commentary was dropped after two failed evidence checks.",
+                tuple(timings),
             )
 
         try:
@@ -481,6 +644,7 @@ class PunditPipeline:
                 tuple(accumulated_results),
                 None,
                 "Live commentary was dropped because its time budget expired.",
+                tuple(timings),
             )
 
     def _director_forwards(self, payload: object) -> bool:

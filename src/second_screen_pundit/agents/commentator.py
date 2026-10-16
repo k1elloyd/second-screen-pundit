@@ -46,53 +46,59 @@ class ConsoleInsight(BaseModel):
     insight_id: str
     minute: int
     headline: str
+    score_phrase: str
     event_context: dict[str, object]
     facts: list[dict[str, object]]
     fact_ids: list[str]
     event_ids: list[str]
 
 
-def _facts_for_event(
+def console_tool_results(
     event: Event,
     info: MatchInfo,
     events: list[Event],
 ) -> list[ToolResult]:
+    minute = event.minute + event.added_minute
+    state = match_state(
+        events,
+        MatchStateParams(minute=minute),
+        as_of=event.seq,
+    )
+    score = next(fact for fact in state.facts if fact.label == "Score")
+    results = [
+        ToolResult(tool=state.tool, facts=[score]),
+    ]
     if event.type == "goal":
-        state = match_state(
-            events,
-            MatchStateParams(minute=event.minute),
-            as_of=event.seq,
-        )
-        return [
-            ToolResult(tool=state.tool, facts=[fact for fact in state.facts if fact.label == "Score"])
-        ]
+        return results
     if event.type == "formation_change" and event.team is not None:
-        return [
+        results.extend([
             formation_at(
                 events,
-                FormationAtParams(team=event.team, minute=event.minute),
+                FormationAtParams(team=event.team, minute=minute),
                 as_of=event.seq,
             )
-        ]
+        ])
+        return results
     if event.type == "card":
-        state = match_state(
-            events,
-            MatchStateParams(minute=event.minute),
-            as_of=event.seq,
-        )
         label = "Home cards" if event.team == "home" else "Away cards"
-        return [ToolResult(tool=state.tool, facts=[fact for fact in state.facts if fact.label == label])]
+        results.append(
+            ToolResult(
+                tool=state.tool,
+                facts=[fact for fact in state.facts if fact.label == label],
+            )
+        )
+        return results
     if event.type == "shot" and event.team is not None:
         summary = shot_summary(
             events,
             ShotSummaryParams(
                 team=event.team,
-                start=event.minute,
-                end=min(91, event.minute + 1),
+                start=minute,
+                end=min(91, minute + 1),
             ),
             as_of=event.seq,
         )
-        return [
+        results.extend([
             ToolResult(
                 tool=summary.tool,
                 facts=[
@@ -101,9 +107,20 @@ def _facts_for_event(
                     if fact.label in {"xG", "Best chance"}
                 ],
             )
-        ]
+        ])
     del info
-    return []
+    return results
+
+
+def score_phrase(info: MatchInfo, score: str) -> str:
+    home_score, away_score = (int(value) for value in score.split("-", maxsplit=1))
+    home_name = re.sub(r"\s+FC$", "", info.home.name, flags=re.IGNORECASE)
+    away_name = re.sub(r"\s+FC$", "", info.away.name, flags=re.IGNORECASE)
+    if home_score > away_score:
+        return f"{home_name} lead {home_score}-{away_score}"
+    if away_score > home_score:
+        return f"{away_name} lead {away_score}-{home_score}"
+    return f"The score is level at {home_score}-{away_score}"
 
 
 def _player_name(info: MatchInfo, team: str | None, player_id: str | None) -> str | None:
@@ -137,7 +154,7 @@ def build_console_insight(
     info: MatchInfo,
     events: list[Event],
 ) -> ConsoleInsight:
-    results = _facts_for_event(event, info, events)
+    results = console_tool_results(event, info, events)
     facts = [fact for result in results for fact in result.facts]
     team_name = (
         info.home.name if event.team == "home" else info.away.name if event.team == "away" else "The match"
@@ -161,6 +178,10 @@ def build_console_insight(
         insight_id=f"{event.match_id}-i{event.seq:04d}",
         minute=event.minute + event.added_minute,
         headline=headline,
+        score_phrase=score_phrase(
+            info,
+            str(next(fact.value for fact in facts if fact.label == "Score")),
+        ),
         event_context=_event_context(event, info),
         facts=[fact.model_dump(mode="json") for fact in facts],
         fact_ids=[fact.fact_id for fact in facts],
@@ -189,9 +210,9 @@ class Commentator:
                 "Use only the supplied facts and events. Return references through fact_ids and "
                 "event_ids only; never put citations, square brackets, event IDs, or fact IDs in "
                 "text. The text must be plain spoken English with no markup. Do not state any "
-                "number unless that value appears in a supplied fact. Refer to players by name, "
-                "never by shirt number. When the away side leads, state the score from the leading "
-                "team's perspective and name them, for example, 'Port Calder lead 1-0'. Match the "
+                "number unless that value appears in a supplied fact. Use the supplied deterministic "
+                "score phrase verbatim whenever stating the score. Refer to players by name, never "
+                "by shirt number. Match the "
                 "line_id and insight_id exactly."
             ),
             tools=[],
@@ -203,6 +224,7 @@ class Commentator:
             f"Return a CommentaryLine for this one event.\n"
             f"Required line_id: {event.match_id}-l{event.seq:03d}\n"
             f"Required insight_id: {insight.insight_id}\n"
+            f"Deterministic score phrase: {insight.score_phrase}\n"
             f"Event: {insight.event_context}\n"
             f"Insight: {insight.model_dump_json()}"
         )

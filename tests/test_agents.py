@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from second_screen_pundit.agents.evidence import check_evidence
 from second_screen_pundit.agents.models import (
     Claim,
     CommentaryLine,
+    DirectorDecision,
     Explanation,
     Insight,
 )
@@ -224,6 +226,106 @@ def test_workflow_model_extraction_accepts_executor_and_direct_responses() -> No
     )
 
     assert _workflow_models(run_result) == [insight, insight]
+
+
+def test_must_say_window_uses_deterministic_insight_and_one_commentator_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = get_match_info("m01")
+    events = generate_match("m01")
+    goal = next(event for event in events if event.type == "goal" and event.minute == 23)
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+    roles: list[str] = []
+    supplied: list[dict[str, object]] = []
+
+    class StubAgent:
+        async def run(self, prompt: str) -> SimpleNamespace:
+            payload = json.loads(prompt)
+            supplied.append(payload)
+            insight = payload["insight"]
+            return SimpleNamespace(
+                value=CommentaryLine(
+                    line_id=f"m01-l{goal.seq:03d}",
+                    text=f"{payload['score_phrase']}.",
+                    insight_id=insight["insight_id"],
+                    fact_ids=insight["fact_ids"],
+                    event_ids=insight["event_ids"],
+                    tone="measured",
+                )
+            )
+
+    def fake_agent(role: str, *_: object, **__: object) -> StubAgent:
+        roles.append(role)
+        return StubAgent()
+
+    monkeypatch.setattr(pipeline, "_agent", fake_agent)
+    result = asyncio.run(
+        pipeline.comment_on_window(info, events, [goal], as_of=goal.seq)
+    )
+
+    assert result.status == "commentary"
+    assert roles == ["commentator"]
+    assert supplied[0]["score_phrase"] == "Port Calder lead 1-0"
+    assert [timing.role for timing in result.timings] == ["commentator"]
+    assert result.evidence is not None and result.evidence.passed
+
+
+def test_stale_tactical_window_drops_before_commentator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = get_match_info("m01")
+    events = generate_match("m01")
+    event = next(event for event in events if event.type == "pass")
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+    roles: list[str] = []
+    stale_checks = 0
+
+    class StubAgent:
+        def __init__(self, role: str) -> None:
+            self.role = role
+
+        async def run(self, _: str) -> SimpleNamespace:
+            if self.role == "director":
+                value = DirectorDecision(
+                    should_comment=True,
+                    importance=0.9,
+                    reason="A tactical window merits commentary.",
+                    event_ids=[event.event_id],
+                )
+            else:
+                value = Insight(
+                    insight_id="m01-i0001",
+                    minute=event.minute,
+                    headline="A tactical change",
+                    importance=0.9,
+                    event_ids=[event.event_id],
+                )
+            return SimpleNamespace(value=value)
+
+    def fake_agent(role: str, *_: object, **__: object) -> StubAgent:
+        roles.append(role)
+        return StubAgent(role)
+
+    def is_stale() -> bool:
+        nonlocal stale_checks
+        stale_checks += 1
+        return stale_checks == 2
+
+    monkeypatch.setattr(pipeline, "_agent", fake_agent)
+    result = asyncio.run(
+        pipeline.comment_on_window(
+            info,
+            events,
+            [event],
+            as_of=event.seq,
+            is_stale=is_stale,
+        )
+    )
+
+    assert result.status == "skipped"
+    assert "became stale" in (result.notice or "")
+    assert roles == ["director", "analyst"]
+    assert [timing.role for timing in result.timings] == ["director", "analyst"]
 
 
 def test_cached_outputs_pass_evidence_checks_for_all_storylines() -> None:
