@@ -14,6 +14,8 @@ from second_screen_pundit.agents.tools.analytics import (
     shot_summary,
     xg_timeline,
 )
+from second_screen_pundit.agents.evidence import check_evidence
+from second_screen_pundit.agents.models import Insight
 from second_screen_pundit.agents.tools.parameters import (
     CompareWindowsParams,
     FormationAtParams,
@@ -298,3 +300,47 @@ def test_tools_reject_unknown_parameters_and_invalid_choices(
         as_of=13,
     )
     assert isinstance(result, ToolResult)
+
+
+def test_tool_evidence_ids_are_capped_and_grounded_in_returned_facts() -> None:
+    events = [
+        _event(
+            seq,
+            seq,
+            "pass",
+            "home" if seq % 2 else "away",
+            x=10,
+            y=20,
+            end_x=30,
+            end_y=25,
+            outcome="success",
+            detail={"receiver_id": f"player-{seq}"},
+        )
+        for seq in range(1, 9)
+    ]
+    result = possession_window(
+        events,
+        PossessionWindowParams(start=0, end=10),
+        as_of=8,
+    )
+    fact = next(item for item in result.facts if item.label == "Home possession")
+
+    assert len(fact.event_ids) == 5
+    assert fact.event_ids == [event.event_id for event in events[2:7]]
+    assert len({event_id for item in result.facts for event_id in item.event_ids}) <= 5
+    insight = Insight(
+        insight_id="m01-i0008",
+        minute=8,
+        headline="Possession is shared",
+        importance=0.7,
+        fact_ids=[fact.fact_id],
+        event_ids=fact.event_ids,
+    )
+    report = check_evidence(
+        insight,
+        events=events,
+        as_of=8,
+        tool_results=[result],
+    )
+
+    assert report.passed, report.failures

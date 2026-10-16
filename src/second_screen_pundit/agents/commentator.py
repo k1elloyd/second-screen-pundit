@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from second_screen_pundit.agents.clients import create_foundry_agent
 from second_screen_pundit.agents.models import CommentaryLine
 from second_screen_pundit.agents.tools.analytics import (
+    Fact,
     ToolResult,
     formation_at,
     match_state,
@@ -23,7 +24,7 @@ _EVENT_ID_PATTERN = re.compile(r"\bm\d{2}-e\d{4,}\b", re.IGNORECASE)
 _FACT_ID_PATTERN = re.compile(
     r"\b(?:match_state|possession_window|xg_timeline|shot_summary|"
     r"pressing_intensity|pass_network|formation_at|key_moments|"
-    r"compare_windows):[a-z0-9_]+\b",
+    r"compare_windows|tactical_signals):[a-z0-9_]+\b",
     re.IGNORECASE,
 )
 
@@ -58,7 +59,7 @@ def console_tool_results(
     info: MatchInfo,
     events: list[Event],
 ) -> list[ToolResult]:
-    minute = event.minute + event.added_minute
+    minute = min(90, event.minute + event.added_minute)
     state = match_state(
         events,
         MatchStateParams(minute=minute),
@@ -69,6 +70,29 @@ def console_tool_results(
         ToolResult(tool=state.tool, facts=[score]),
     ]
     if event.type == "goal":
+        scoring_shots = [
+            candidate
+            for candidate in events
+            if candidate.type == "shot"
+            and candidate.event_id in event.related_event_ids
+            and candidate.seq <= event.seq
+        ]
+        if scoring_shots:
+            shot = max(scoring_shots, key=lambda candidate: candidate.seq)
+            results.append(
+                ToolResult(
+                    tool="shot_summary",
+                    facts=[
+                        Fact(
+                            fact_id=f"shot_summary:scoring_shot_xg_{event.seq}",
+                            label="Scoring shot xG",
+                            value=shot.xg or 0.0,
+                            unit="xG",
+                            event_ids=[shot.event_id],
+                        )
+                    ],
+                )
+            )
         return results
     if event.type == "formation_change" and event.team is not None:
         results.extend([
@@ -112,14 +136,17 @@ def console_tool_results(
     return results
 
 
+def team_display_name(info: MatchInfo, team: str) -> str:
+    name = info.home.name if team == "home" else info.away.name
+    return re.sub(r"\s+FC$", "", name, flags=re.IGNORECASE)
+
+
 def score_phrase(info: MatchInfo, score: str) -> str:
     home_score, away_score = (int(value) for value in score.split("-", maxsplit=1))
-    home_name = re.sub(r"\s+FC$", "", info.home.name, flags=re.IGNORECASE)
-    away_name = re.sub(r"\s+FC$", "", info.away.name, flags=re.IGNORECASE)
     if home_score > away_score:
-        return f"{home_name} lead {home_score}-{away_score}"
+        return f"{team_display_name(info, 'home')} lead {home_score}-{away_score}"
     if away_score > home_score:
-        return f"{away_name} lead {away_score}-{home_score}"
+        return f"{team_display_name(info, 'away')} lead {away_score}-{home_score}"
     return f"The score is level at {home_score}-{away_score}"
 
 

@@ -34,6 +34,7 @@
 - **Existing Foundry account (B7):** Bicep takes `existingFoundryAccountName` and `existingFoundryResourceGroup`. When they are set, it references the existing account and its `gpt-5.4-mini` deployment, creates no Foundry account or deployments, and assigns the app identity Foundry User on that account by role GUID. This is the default path in `.env.example`.
 - **Replay controls:** speed is set only at `/start`. Added `POST /api/replays/{replay_id}/control` with `pause` and `resume`. Seek removed from the spec.
 - **Housekeeping:** deleted the stale "copy this file into the new repo" sentence and the `[[…]]` link. Deleted `prompts/build-prompt-v1.md`.
+- **Phase 3 viewer cut-off:** typed and spoken viewer questions and answers use only events through the viewer's released position, never a newer agent `as_of`.
 
 ---
 
@@ -155,6 +156,8 @@ ToolResult {
 }
 ```
 
+Each analytics tool returns its complete summary facts and no more than five distinct evidence event IDs in total. Keep evidence checks grounded in those IDs actually returned.
+
 **No future data:** every tool is bound to the current replay's match and an `as_of` cut-off (the `seq` of the last published event, with its minute for display). The server injects `as_of` when the pipeline run is dispatched. The model never chooses it and it is not a model-visible parameter. Tools only read events with `seq <= as_of`. Any minute parameter later than `as_of` is clamped to it, and the clamp is noted in `caveats`.
 
 The tools to provide are:
@@ -213,6 +216,7 @@ The three routes are:
    - **Backpressure:** if a window's pipeline run is still in progress when the next window arrives, drop the older window. Never queue windows. A must-say event replaces a pending ordinary window.
    - Each pipeline run captures `as_of` when it is dispatched, and all its tools and checks use that value.
    - **Viewer questions** go to the Tactics Explainer. **Full time** triggers the Recap Producer.
+   - For typed or spoken viewer questions, the server's evidence cut-off is the viewer's released event position. It must never use the agents' newer `as_of`.
 2. **Match Analyst** (`MODEL_FAST`). It calls the tools and returns an `Insight { insight_id, minute, headline, fact_ids, event_ids, importance }`.
 3. **Commentator** (`MODEL_FAST`). It calls **no tools**. It turns an insight into a `CommentaryLine { line_id, text (≤ 200 chars, 1–2 sentences), insight_id, fact_ids, event_ids, tone }`, where `line_id` is `{match_id}-l{seq:03d}`. It has a broadcast persona, British English, no hype words, and is never allowed to state a number that isn't in the insight's facts. It refers to players by name, not shirt number.
 4. **Tactics Explainer** (`MODEL_DEEP`). It answers a viewer's question with `Explanation { answer (≤ 80 words), claims: [{ text, fact_ids, event_ids }], cannot_tell }`. It calls tools as needed. If the data can't answer the question, it says so in `cannot_tell` and doesn't guess.
@@ -261,8 +265,8 @@ STT and TTS time doesn't count against the model budgets. `/api/ask-audio` has a
 | `POST /api/matches/{id}/start?speed=` | Start a replay for this tab and return its `replay_id`. If 3 replays are already running, return 503 with `Retry-After` |
 | `POST /api/replays/{replay_id}/control` | `{ "action": "pause" \| "resume" }`. Returns the replay's state. Pausing a paused replay or resuming a running one is a no-op |
 | `GET /api/replays/{replay_id}/stream` | SSE: events, commentary lines (with `audio_id`), insights, recap. A heartbeat comment every 15 s. Disconnecting stops the replay |
-| `POST /api/ask` | `{ replay_id, question }` → `Explanation`. The cut-off is the replay's current `as_of` on the server; the client sends no minute |
-| `POST /api/ask-audio` | Multipart `replay_id` + WAV audio → `{ transcript, explanation, audio_id }`. Server-side STT, then the same path as `/api/ask`, then TTS of the answer |
+| `POST /api/ask` | `{ replay_id, question }` → `Explanation`. The cut-off is the viewer's released event position on the server, never the agents' newer `as_of`; the client sends no minute |
+| `POST /api/ask-audio` | Multipart `replay_id` + WAV audio → `{ transcript, explanation, audio_id }`. Server-side STT, then the same viewer-released-position cut-off as `/api/ask`, then TTS of the answer |
 | `GET /api/lines/{line_id}/evidence` | The events and facts behind a commentary line |
 | `GET /api/audio/{audio_id}` | A short MP3: a commentary line, a spoken answer or the audio recap. Held in memory or a temp directory and deleted when its replay stops |
 | `GET /healthz` | Health probe |

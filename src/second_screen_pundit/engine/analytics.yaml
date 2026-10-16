@@ -2,3 +2,11 @@ pressing_x: 50
 high_turnover_x: 60
 progressive_pass_delta_x: 25
 big_chance_xg: 0.25
+possession_swing_pp: 15
+possession_swing_window_minutes: 10
+xg_surge: 0.4
+xg_surge_window_minutes: 10
+substitution_effect_window_minutes: 5
+substitution_pressing_change_per_minute: 0.5
+substitution_high_turnover_change: 3
+high_turnover_surge_window_minutes: 10

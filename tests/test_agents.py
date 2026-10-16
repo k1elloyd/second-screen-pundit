@@ -24,6 +24,7 @@ from second_screen_pundit.agents.pipeline import (
     _workflow_models,
 )
 from second_screen_pundit.agents.tools.analytics import MatchStateParams, match_state
+from second_screen_pundit.agents.signals import SignalTracker
 from second_screen_pundit.agents.tools.runtime import ToolResultCapture
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents import speech
@@ -270,6 +271,50 @@ def test_must_say_window_uses_deterministic_insight_and_one_commentator_call(
     assert result.evidence is not None and result.evidence.passed
 
 
+def test_goal_fast_path_cites_linked_scoring_shot_and_goal_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = get_match_info("m01")
+    events = generate_match("m01")
+    goal = next(event for event in events if event.type == "goal" and event.minute == 23)
+    shot_id = next(iter(goal.related_event_ids))
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+
+    class StubAgent:
+        async def run(self, prompt: str) -> SimpleNamespace:
+            payload = json.loads(prompt)
+            insight = payload["insight"]
+            return SimpleNamespace(
+                value=CommentaryLine(
+                    line_id=f"m01-l{goal.seq:03d}",
+                    text=f"{payload['score_phrase']}.",
+                    insight_id=insight["insight_id"],
+                    fact_ids=insight["fact_ids"],
+                    event_ids=insight["event_ids"],
+                    tone="measured",
+                )
+            )
+
+    roles: list[str] = []
+
+    def fake_agent(role: str, *_: object, **__: object) -> StubAgent:
+        roles.append(role)
+        return StubAgent()
+
+    monkeypatch.setattr(pipeline, "_agent", fake_agent)
+    result = asyncio.run(
+        pipeline.comment_on_window(info, events, [goal], as_of=goal.seq)
+    )
+
+    assert result.status == "commentary"
+    assert roles == ["commentator"]
+    assert shot_id in result.line.event_ids  # type: ignore[union-attr]
+    assert goal.event_id in result.line.event_ids  # type: ignore[union-attr]
+    shot_fact = next(fact for item in result.tool_results for fact in item.facts
+                     if fact.label == "Scoring shot xG")
+    assert shot_fact.event_ids == [shot_id]
+
+
 def test_stale_tactical_window_drops_before_commentator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -326,6 +371,105 @@ def test_stale_tactical_window_drops_before_commentator(
     assert "became stale" in (result.notice or "")
     assert roles == ["director", "analyst"]
     assert [timing.role for timing in result.timings] == ["director", "analyst"]
+
+
+def _tactical_stub_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    commentator_failures: int,
+) -> tuple[PunditPipeline, list[str], list[Event], list[Event], int]:
+    info_events = generate_match("m01")
+    window_event = next(
+        event for event in info_events if event.minute == 30 and event.type == "pass"
+    )
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+    roles: list[str] = []
+    commentator_calls = 0
+    truncated = None
+    try:
+        CommentaryLine.model_validate_json('{"fact_ids":["match_state:score"')
+    except Exception as exc:  # noqa: BLE001 - captures the ValidationError a truncated reply raises
+        truncated = exc
+
+    class TruncatedResponse:
+        @property
+        def value(self) -> object:
+            raise truncated  # type: ignore[misc]
+
+    class StubAgent:
+        def __init__(self, role: str) -> None:
+            self.role = role
+
+        async def run(self, prompt: str) -> object:
+            nonlocal commentator_calls
+            payload = json.loads(prompt)
+            if self.role == "director":
+                return SimpleNamespace(
+                    value=DirectorDecision(
+                        should_comment=True,
+                        importance=0.9,
+                        reason="A meaningful shift.",
+                        event_ids=[window_event.event_id],
+                    )
+                )
+            if self.role == "analyst":
+                return SimpleNamespace(
+                    value=Insight(
+                        insight_id="m01-i0001",
+                        minute=30,
+                        headline="Port Calder remain ahead",
+                        importance=0.7,
+                    )
+                )
+            commentator_calls += 1
+            if commentator_calls <= commentator_failures:
+                return TruncatedResponse()
+            insight = payload["insight"]
+            return SimpleNamespace(
+                value=CommentaryLine(
+                    line_id=f"m01-l{window_event.seq:03d}",
+                    text=f"{payload['score_phrase']}.",
+                    insight_id=insight["insight_id"],
+                    fact_ids=insight["fact_ids"],
+                    event_ids=insight["event_ids"],
+                    tone="measured",
+                )
+            )
+
+    def fake_agent(role: str, *_: object, **__: object) -> StubAgent:
+        roles.append(role)
+        return StubAgent(role)
+
+    monkeypatch.setattr(pipeline, "_agent", fake_agent)
+    return pipeline, roles, info_events, [window_event], window_event.seq
+
+
+def test_truncated_commentator_reply_retries_only_the_commentator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, roles, events, window, as_of = _tactical_stub_pipeline(monkeypatch, 1)
+
+    result = asyncio.run(
+        pipeline.comment_on_window(get_match_info("m01"), events, window, as_of=as_of)
+    )
+
+    assert result.status == "commentary", (result.notice, result.evidence)
+    assert roles == ["director", "analyst", "commentator", "commentator"]
+    assert [t.attempt for t in result.timings if t.role == "commentator"] == [1, 2]
+    assert [t.role for t in result.timings].count("director") == 1
+
+
+def test_two_truncated_replies_are_reported_as_invalid_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, roles, events, window, as_of = _tactical_stub_pipeline(monkeypatch, 2)
+
+    result = asyncio.run(
+        pipeline.comment_on_window(get_match_info("m01"), events, window, as_of=as_of)
+    )
+
+    assert result.status == "rejected"
+    assert result.notice == "Structured output was invalid on both attempts."
+    assert roles.count("commentator") == 2 and roles.count("analyst") == 1
 
 
 def test_cached_outputs_pass_evidence_checks_for_all_storylines() -> None:
@@ -394,6 +538,104 @@ def test_shared_factory_sets_required_options_for_each_role(monkeypatch: pytest.
             assert options["reasoning"] == {"effort": "low"}
         else:
             assert "reasoning" not in options
+
+
+def test_factory_honours_reasoning_override_and_shared_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    def fail_client(**_: object) -> None:
+        raise AssertionError("a supplied client must be reused, not rebuilt")
+
+    shared = object()
+    monkeypatch.setattr("second_screen_pundit.agents.clients.Agent", FakeAgent)
+    monkeypatch.setattr("second_screen_pundit.agents.clients.FoundryChatClient", fail_client)
+    create_foundry_agent(
+        "commentator",
+        endpoint="https://example.invalid/project",
+        model_fast="fast",
+        model_deep="deep",
+        credential=object(),  # type: ignore[arg-type]
+        instructions="instructions",
+        reasoning_effort="none",
+        client=shared,  # type: ignore[arg-type]
+    )
+
+    assert captured["client"] is shared
+    assert captured["default_options"]["reasoning"] == {"effort": "none"}  # type: ignore[index]
+
+
+def test_mandatory_signal_skips_director_and_cites_signal_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = get_match_info("m01")
+    events = generate_match("m01")
+    change = next(
+        event
+        for event in events
+        if event.type == "formation_change" and event.detail.get("formation") == "3-4-3"
+    )
+    signal = next(
+        signal
+        for signal in SignalTracker(info).evaluate(events, as_of=change.seq)
+        if signal.kind == "formation_change" and signal.facts[0].value == "3-4-3"
+    )
+    window = [next(event for event in reversed(events) if event.seq < change.seq and event.type == "pass")]
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+    roles: list[str] = []
+    prompts: dict[str, dict[str, object]] = {}
+
+    class StubAgent:
+        def __init__(self, role: str) -> None:
+            self.role = role
+
+        async def run(self, prompt: str) -> SimpleNamespace:
+            payload = json.loads(prompt)
+            prompts[self.role] = payload
+            if self.role == "analyst":
+                value: object = Insight(
+                    insight_id=f"m01-i{change.seq:04d}",
+                    minute=72,
+                    headline="A shape change",
+                    importance=0.8,
+                    fact_ids=[fact.fact_id for fact in signal.facts],
+                    event_ids=signal.event_ids,
+                )
+            else:
+                insight = payload["insight"]
+                value = CommentaryLine(
+                    line_id=f"m01-l{change.seq:03d}",
+                    text=f"{payload['score_phrase']}.",
+                    insight_id=insight["insight_id"],
+                    fact_ids=insight["fact_ids"],
+                    event_ids=insight["event_ids"],
+                    tone="analytical",
+                )
+            return SimpleNamespace(value=value)
+
+    def fake_agent(role: str, *_: object, **__: object) -> StubAgent:
+        roles.append(role)
+        return StubAgent(role)
+
+    monkeypatch.setattr(pipeline, "_agent", fake_agent)
+    result = asyncio.run(
+        pipeline.comment_on_window(
+            info, events, window, as_of=change.seq, signals=[signal]
+        )
+    )
+
+    assert result.status == "commentary", result.evidence
+    assert roles == ["analyst", "commentator"]
+    assert "events" in prompts["commentator"] and prompts["commentator"]["events"] == []
+    assert {fact["fact_id"] for fact in prompts["commentator"]["facts"]} >= {  # type: ignore[union-attr]
+        fact.fact_id for fact in signal.facts
+    }
+    assert prompts["analyst"]["signals"][0]["kind"] == "formation_change"  # type: ignore[index]
 
 
 def test_speech_synthesizer_uses_entra_and_emits_mp3(

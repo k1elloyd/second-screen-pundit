@@ -85,8 +85,108 @@ The warmed m01 replay completed at 20x in 356,478 ms. Each live window retained 
 
 The 30 tactical windows had 27 Director decisions not to comment and 3 windows dropped as stale before commentary completed. The full-match gate prints each agent call's role, attempt, and wall-clock duration alongside these summaries.
 
+### Tactical candidates, broadcast delay and token breakdown
+
+These measurements supersede the table above. Replay: m01 at 20x, 15,000 ms budget unchanged, `python -m second_screen_pundit.agents.gate --live-latency`. The gate logs every call's duration, input, output and reasoning tokens.
+
+**What the measurements changed**
+
+- **A new client costs seconds.** The pipeline built a new `FoundryChatClient` for every call, and the earlier warm-up warmed a different client from the one the live calls used. Isolated probe, same Commentator prompt: median 4,376 ms with a fresh client per call, 1,777 ms with one reused client; after a tiny unstructured call on the shared client, the first structured call took 1,762 ms. The pipeline now keeps one client per deployment and budget, and `PunditPipeline.warm_up()` fetches the `https://ai.azure.com/.default` token and makes one 16-token call on that client. Warm-up in the three runs: 9.4-12.2 s (token 2.6-3.8 s, model call 6.6-8.2 s), logged separately from per-window timings.
+- **`max_tokens` counts reasoning tokens.** A Commentator reply at `low` effort is about 50-200 reasoning tokens plus about 100 JSON tokens; the 256 cap truncated some replies, and `response.value` then raised a raw `ValidationError` that escaped the retry logic. Caps are now Director 320, Commentator 400 (the m01 substitution line used 297 output tokens, 197 of them reasoning, so it would have exceeded 256), Analyst 384. Truncated or off-schema output is now retried like any other failure.
+- **The retry replayed the whole chain.** One bad reply re-ran Director, Analyst and Commentator, which cannot fit in 15 s. In the first rerun's log the expired windows I traced (21' and 81') had each started a second Director and Analyst pass before the deadline. A window still gets one retry inside the same 15 s deadline, but it resumes at the step that failed and keeps the validated Director decision and Insight. A window that fails twice with malformed output is now reported as such, not as an evidence failure.
+- **Raw events were the Director and Analyst input.** The old prompts carried every event in a 3-minute window. They now carry the deterministic signals, and the Commentator receives only the facts the Insight cites.
+
+**Tactical lane** (`agents/signals.py`, `agents/dispatcher.py`; thresholds in `engine/analytics.yaml`)
+
+Every 3 match minutes the dispatcher evaluates deterministic signals at that boundary's `as_of`. Each signal's numbers come from the existing metric functions and are exposed as `tactical_signals:*` facts with unique IDs (the existing tools reuse IDs such as `compare_windows:before`, which collide when two calls occur in one run) and at most 5 evidence event IDs.
+
+| Signal | Rule | Mandatory |
+| :--- | :--- | :---: |
+| `possession_swing` | A team's possession share in the last 10 minutes exceeds the previous 10 by more than 15 percentage points | no |
+| `xg_surge` | A team's xG in the last 10 minutes exceeds 0.4 **and** exceeds the opponent's in the same window | no |
+| `substitution_effect` | Once per substitution, 5 minutes after it: pressing changed by at least 0.5 defensive actions/min or high turnovers by at least 3, compared with the 5 minutes before | no |
+| `red_card` | A red card is seen (facts: players left on the pitch) | yes |
+| `formation_change` | A formation change is seen (facts: new and previous formation) | yes |
+
+- **Literal 0.4 xG fires too often here.** On m01 and m02 a team exceeds 0.4 xG in 10 minutes at 46-48% of boundaries (median per team 0.35), so the opponent condition is my addition to keep "surge" meaning one team on top. The 15-point swing fires at 17-29% of boundaries (median absolute swing about 9 points).
+- **Mandatory signals skip the Director model.** The code forwards them deterministically, because the requirement is that these beats produce a tactical line and a model call that cannot change the outcome only spends budget. They still run Analyst and Commentator. Other signals go to the Director with a threshold of 0.45.
+- **Cooldowns, in match minutes.** Any tactical dispatch needs `COMMENTARY_COOLDOWN_MINUTES` (4) since the last tactical dispatch. Non-mandatory signals also need `TACTICAL_COOLDOWN_MINUTES` (10, new) since the last tactical *line*, and no tactical run in flight. Pending one-shot signals wait up to 10 minutes. Must-say events are exempt, as the prompt specifies.
+- **Stale.** A tactical run is dropped if a newer tactical window has been dispatched before it finishes. Must-say events run in their own lane and do not make a tactical run stale. This is my reading of the prompt's backpressure rule ("a must-say event replaces a *pending* ordinary window"); under the earlier harness, any must-say event staled an in-flight tactical run, which is why 3 of the 30 windows were dropped as stale.
+- **Dry run, no model calls, over the three matches:** m01 dispatches 7 windows including the 69' formation change (4-2-3-1) and the 75' back-three switch; m02 dispatches 7 including the 39' red card and the 45' formation change (4-4-1); m03 dispatches 5. m03's pressing storyline has no red card or substitution, so none of the specified signals covers it.
+
+**Broadcast delay** (`engine/broadcast.py`, `BROADCAST_DELAY_SECONDS`, default 10)
+
+Agents read events as they are published and stamp each event's arrival. The viewer-facing stream releases each event once it is `BROADCAST_DELAY_SECONDS` old, and a line waits for the release time of its own `as_of` event. Agents' `as_of` is unchanged. A line that is ready after its event's release time is released immediately and its lateness is recorded; it is not dropped, because the budget stays 15 s. Phase 3 must answer viewer questions with the viewer's released `seq`, not the agents' newer one, or an answer can reveal an event the viewer has not seen. `asyncio.sleep` can wake early on Windows, so the wait loops until the release time has actually passed.
+
+**Results, m01 at 20x, Commentator effort `low` (the default)**
+
+| Path | Windows | Lines | Commentator per line (median / slowest) | Whole run (median / slowest) | Dropped |
+| :--- | ---: | ---: | :--- | :--- | :--- |
+| Must-say fast path | 13 | 13 | 2,785 / 3,933 ms | 2,796 / 3,937 ms | 0 |
+| Tactical | 30 boundaries: 7 no signal, 15 held by cooldown, 8 dispatched | 6 | 2,274 / 2,714 ms | 7,977 / 10,250 ms | 2 (Director declined) |
+
+Before (previous section): fast path median 6,807 ms, slowest 13,118 ms; tactical 0 lines from 30 windows.
+
+Tactical lines produced: 21' possession swing, 33' xG surge, 57' xG surge, 69' formation change to 4-2-3-1, **75' formation change to 3-4-3** ("Ashbridge Rovers have gone more aggressive, moving from a 4-2-3-1 to a 3-4-3. Port Calder lead 2-1."), 87' xG surge. That is one line per 15 minutes. The Director declined the windows at 45' and 51'; a decline does not start the 10-minute cooldown, which is why a second window was dispatched six minutes after the first (the dry run, which has no declines, dispatches 7 windows, not 8). Evidence checks passed on every line shown.
+
+| Role | Calls | Median duration | Median input / output / reasoning tokens |
+| :--- | ---: | ---: | :--- |
+| Director | 6 | 2,980 ms | 551 / 147 / 101 |
+| Analyst | 6 | 2,888 ms (slowest 5,242 ms) | 1,099 / 111 / 0 |
+| Commentator | 19 | 2,606 ms | 636 / 196 / 93 |
+
+The Analyst's slow calls are the ones that call a tool: `match_state` returns every successful pass as evidence, so the follow-up request carries about 7,300 input tokens instead of about 1,100.
+
+Viewer stream: 1,548 events released, observed delay 10.000-10.032 s. Of 19 lines, 18 were ready before their event's release and 1 was ready 250 ms after it (the 87' tactical line, whose Analyst call took 5.2 s).
+
+**Reasoning effort below `low`.** Microsoft Learn's reasoning-model page lists `none` for `gpt-5.4` but does not list `gpt-5.4-mini` in that footnote, and says `minimal` works only with the original GPT-5 models, so Learn does not confirm a level below `low` for this model. The deployment accepted `none` (0 reasoning tokens), so I measured it for the Commentator only (`COMMENTATOR_REASONING_EFFORT`, default `low`):
+
+| Commentator effort | Commentator call median | Output tokens median | Fast path median / slowest | Tactical lines | Tactical windows needing a Commentator retry |
+| :--- | ---: | ---: | :--- | ---: | ---: |
+| `low` | 2,606 ms (19 calls) | 196 (93 reasoning) | 2,785 / 3,933 ms | 6 | 0 |
+| `none` | 2,061 ms (22 calls) | 105 (0 reasoning) | 2,643 / 3,249 ms | 5 | 3 |
+
+`none` saves about 0.5 s per call (21%), but in this sample 3 tactical windows needed a Commentator retry (two recovered; the 87' window was lost to an ungrounded number word, "ten"), and `low` needed none. Isolated probe, 4 calls each on one reused client: 1,777 ms median at `low`, 1,463 ms at `none`. Each configuration is a single replay, so the retry difference is suggestive, not established. I did not adopt `none`: it is undocumented for this model and the fast path already has about 11 s of headroom.
+
+### Phase 2b follow-up: goal consolidation, evidence size and pressing signal
+
+**Design changes**
+
+- A shot linked to a later goal is held out of the fast path. The goal produces the single line, with deterministic facts for both the score and the linked shot's xG, so both event IDs remain available to the evidence check.
+- Analytics tools retain all computed summary facts but return no more than five distinct evidence event IDs per tool result. The evidence check and Analyst pipeline use the captured, compact results; an Insight cannot cite an event ID absent from those results.
+- `high_turnover_surge` compares each team's successful tackles/interceptions at `x >= 60` in the last 10 match minutes with its match-to-date average per 10 elapsed match minutes, using only events through the boundary's `as_of`. It fires at or above twice that average and is a non-mandatory Director candidate.
+- The Phase 3 requirements now explicitly bind typed and spoken viewer Q&A to the viewer's released event position, not the agents' newer `as_of`.
+
+**Dry run: dispatched tactical windows, no model calls**
+
+| Match | Windows and signals |
+| :--- | :--- |
+| m01 | 21' possession swing; 33' xG surge; 45' xG surge; 57' xG surge + high-turnover surge; 69' formation change; 75' formation change; 87' xG surge + high-turnover surge |
+| m02 | 18' xG surge; 30' possession swing + xG surge; 39' red card; 45' formation change; 57' xG surge; 69' xG surge; 81' possession swing + xG surge + high-turnover surge |
+| m03 | 21' high-turnover surge; 39' possession swing; 54' xG surge; 66' high-turnover surge; 81' xG surge |
+
+The m01 back-three switch and m02 red-card reshape remain mandatory signal windows. The new m03 signal identifies the scripted pressing storyline at 21' and 66'.
+
+**Analyst input-token comparison**
+
+The previous full-match run had a median of 1,099 Analyst input tokens; tool-expanded match-state calls reached about 7,300 tokens. In the latest run the median was 1,326 tokens (7 calls), with the largest logged Analyst input at 2,346 tokens. The median is not directly comparable because the run's signal mix and tool calls differ, but the largest tool-expanded prompt fell by about 68%. Each tool result now carries at most five distinct evidence event IDs, while all deterministic summary facts remain intact.
+
+**Live gate: m01 at 20x**
+
+Command: `.venv\Scripts\python.exe -m second_screen_pundit.agents.gate --live-latency --match m01 --speed 20`. The 15,000 ms budget is unchanged. Warm-up was 17,223 ms total (5,818 ms token acquisition, 10,983 ms model call), reported separately from replay timings.
+
+| Path | Windows | Lines | Commentator time per emitted line | Whole run per emitted line | Dropped lines |
+| :--- | ---: | ---: | :--- | :--- | :--- |
+| Must-say fast path | 8 | 8 | 8 samples; median 2,591.5 ms; slowest 5,297 ms | median 2,602 ms; slowest 5,297 ms | 0 |
+| Tactical | 8 dispatched (30 boundaries) | 6 | 6 samples; median 2,537.5 ms; slowest 5,036 ms | median 8,273.5 ms; slowest 10,656 ms | 2 (Director declined) |
+
+Fast-path line count is lower than the previous 13 because each scoring shot and its linked goal now produce one line. Tactical lines produced at 21', 33', 57', 69', 75' and 87'; the 75' line covers Ashbridge Rovers' change to a 3-4-3. No run exceeded the unchanged 15-second budget. The two late viewer-facing lines followed event release by at most 656 ms; all 1,548 events were released after 10.000–10.047 seconds.
+
+Role-level Analyst timing was median 2,989 ms (slowest 5,927 ms), with median input/output/reasoning tokens of 1,326/123/0. The full gate reported 15 Commentator calls, including retries, and all 14 produced lines passed evidence checks.
+
 ## Microsoft Learn sources
 
+- [Azure OpenAI reasoning models: reasoning effort and API support](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning#reasoning-effort)
 - [Authentication and authorization in Microsoft Foundry](https://learn.microsoft.com/azure/foundry/concepts/authentication-authorization-foundry)
 - [Microsoft Foundry model provider for Python](https://learn.microsoft.com/agent-framework/integrations/by-component/model-providers/microsoft-foundry)
 - [Producing structured outputs with agents](https://learn.microsoft.com/en-us/agent-framework/agents/structured-outputs)

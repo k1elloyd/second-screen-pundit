@@ -6,6 +6,7 @@ from typing import Literal
 
 
 NarrativeMode = Literal["live", "cached", "off"]
+CommentatorEffort = Literal["none", "low"]
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -15,6 +16,16 @@ def _positive_float(name: str, default: float) -> float:
     value = float(raw)
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
+def _non_negative_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = float(raw)
+    if value < 0:
+        raise ValueError(f"{name} must not be negative")
     return value
 
 
@@ -31,6 +42,9 @@ class AgentSettings:
     recap_timeout_seconds: float
     importance_threshold: float
     cooldown_match_minutes: int
+    broadcast_delay_seconds: float = 10
+    tactical_cooldown_match_minutes: int = 10
+    commentator_reasoning_effort: CommentatorEffort = "low"
 
     @classmethod
     def from_environment(cls) -> AgentSettings:
@@ -43,6 +57,12 @@ class AgentSettings:
         cooldown = int(os.getenv("COMMENTARY_COOLDOWN_MINUTES", "4"))
         if cooldown < 0:
             raise ValueError("COMMENTARY_COOLDOWN_MINUTES must not be negative")
+        tactical_cooldown = int(os.getenv("TACTICAL_COOLDOWN_MINUTES", "10"))
+        if tactical_cooldown < 0:
+            raise ValueError("TACTICAL_COOLDOWN_MINUTES must not be negative")
+        effort = os.getenv("COMMENTATOR_REASONING_EFFORT", "low")
+        if effort not in {"none", "low"}:
+            raise ValueError("COMMENTATOR_REASONING_EFFORT must be none or low")
         return cls(
             mode=raw_mode,  # type: ignore[arg-type]
             endpoint=os.getenv("FOUNDRY_PROJECT_ENDPOINT"),
@@ -55,6 +75,9 @@ class AgentSettings:
             recap_timeout_seconds=_positive_float("RECAP_TIMEOUT_SECONDS", 45),
             importance_threshold=threshold,
             cooldown_match_minutes=cooldown,
+            broadcast_delay_seconds=_non_negative_float("BROADCAST_DELAY_SECONDS", 10),
+            tactical_cooldown_match_minutes=tactical_cooldown,
+            commentator_reasoning_effort=effort,  # type: ignore[arg-type]
         )
 
     def require_foundry(self) -> tuple[str, str, str]:

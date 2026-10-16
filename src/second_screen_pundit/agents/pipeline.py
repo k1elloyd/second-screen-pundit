@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Literal, TypeVar
 
 from agent_framework import Agent, AgentExecutor, FunctionMiddleware, Message, WorkflowBuilder
 from agent_framework.exceptions import ChatClientException
+from agent_framework.foundry import FoundryChatClient
 from azure.core.credentials import TokenCredential
 from pydantic import BaseModel, ValidationError
 
@@ -18,7 +20,13 @@ from second_screen_pundit.agents.cache import (
     closest_cached_question,
     load_cached_match,
 )
-from second_screen_pundit.agents.clients import AgentRole, AgentTool, create_foundry_agent
+from second_screen_pundit.agents.clients import (
+    AgentRole,
+    AgentTool,
+    create_foundry_agent,
+    create_foundry_chat_client,
+    deployment_for_role,
+)
 from second_screen_pundit.agents.commentator import (
     build_console_insight,
     console_tool_results,
@@ -43,13 +51,30 @@ from second_screen_pundit.agents.prompts import (
     EXPLAINER_INSTRUCTIONS,
     RECAP_INSTRUCTIONS,
 )
+from second_screen_pundit.agents.signals import (
+    TacticalSignal,
+    signal_prompt,
+    signals_tool_result,
+)
 from second_screen_pundit.agents.tools.analytics import Fact, ToolResult, key_moments, match_state
 from second_screen_pundit.agents.tools.parameters import KeyMomentsParams, MatchStateParams
 from second_screen_pundit.agents.tools.runtime import build_analytics_tools
 from second_screen_pundit.engine.schema import Event, MatchInfo
 
 
+logger = logging.getLogger(__name__)
 _OutputT = TypeVar("_OutputT", bound=BaseModel)
+_FOUNDRY_TOKEN_SCOPE = "https://ai.azure.com/.default"
+
+
+@dataclass(frozen=True)
+class AgentCallTiming:
+    role: AgentRole
+    attempt: int
+    duration_ms: int
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -61,13 +86,6 @@ class LiveWindowResult:
     evidence: EvidenceReport | None
     notice: str | None = None
     timings: tuple[AgentCallTiming, ...] = ()
-
-
-@dataclass(frozen=True)
-class AgentCallTiming:
-    role: AgentRole
-    attempt: int
-    duration_ms: int
 
 
 @dataclass(frozen=True)
@@ -86,7 +104,12 @@ class RecapResult:
     attempts: int
 
 
-def is_must_say(event: Event) -> bool:
+def is_must_say(event: Event, events: Sequence[Event] = ()) -> bool:
+    if event.type == "shot" and any(
+        candidate.type == "goal" and event.event_id in candidate.related_event_ids
+        for candidate in events
+    ):
+        return False
     return event.type in {"goal", "card", "substitution", "formation_change"} or (
         event.type == "shot" and event.xg is not None and event.xg > 0.25
     )
@@ -107,6 +130,23 @@ def _as_model(value: object, model: type[_OutputT]) -> _OutputT | None:
     if isinstance(value, dict):
         return model.model_validate(value)
     return None
+
+
+_INVALID_OUTPUT_PREFIX = "Return a complete, concise"
+
+
+def _invalid_output(model_name: str) -> str:
+    return f"{_INVALID_OUTPUT_PREFIX} {model_name} matching the schema."
+
+
+def _parsed(response: object | None, model: type[_OutputT]) -> _OutputT | None:
+    """Read a structured response; None when it was missing, truncated or off-schema."""
+    if response is None:
+        return None
+    try:
+        return _as_model(getattr(response, "value", None), model)
+    except ValidationError:
+        return None
 
 
 def _is_structured_output_error(error: ChatClientException) -> bool:
@@ -286,6 +326,24 @@ class PunditPipeline:
         self.settings = settings
         self.credential = credential
         self.cache_dir = cache_dir
+        self._clients: dict[tuple[str, float], FoundryChatClient] = {}
+
+    def _client(self, role: AgentRole, time_budget: float) -> FoundryChatClient:
+        """One client per deployment and budget: a new client costs seconds on its first call."""
+        if self.credential is None:
+            raise RuntimeError("A TokenCredential is required for live model calls")
+        endpoint, model_fast, model_deep = self.settings.require_foundry()
+        deployment = deployment_for_role(role, model_fast, model_deep)
+        client = self._clients.get((deployment, time_budget))
+        if client is None:
+            client = create_foundry_chat_client(
+                endpoint=endpoint,
+                deployment=deployment,
+                credential=self.credential,
+                time_budget_seconds=time_budget,
+            )
+            self._clients[(deployment, time_budget)] = client
+        return client
 
     def _agent(
         self,
@@ -309,7 +367,42 @@ class PunditPipeline:
             tools=tools,
             middleware=middleware,
             time_budget_seconds=time_budget,
+            reasoning_effort=(
+                self.settings.commentator_reasoning_effort if role == "commentator" else None
+            ),
+            client=self._client(role, time_budget),
         )
+
+    async def warm_up(self) -> dict[str, int]:
+        """Fetch the Foundry token once and make one tiny call on the live fast-model client."""
+        if self.credential is None:
+            raise RuntimeError("A TokenCredential is required for live model calls")
+        budget = self.settings.live_timeout_seconds
+        started = time.perf_counter()
+        await asyncio.to_thread(self.credential.get_token, _FOUNDRY_TOKEN_SCOPE)
+        token_ms = round((time.perf_counter() - started) * 1000)
+        agent = Agent(
+            client=self._client("commentator", budget),
+            instructions="Reply with the single word PONG.",
+            default_options={"max_tokens": 16, "store": False},
+        )
+        call_started = time.perf_counter()
+        response = await asyncio.wait_for(agent.run("Reply with the single word PONG."), timeout=budget)
+        model_ms = round((time.perf_counter() - call_started) * 1000)
+        if "PONG" not in response.text.upper():
+            raise RuntimeError("Foundry warm-up did not return the expected PONG response")
+        timing = {
+            "token_ms": token_ms,
+            "model_call_ms": model_ms,
+            "total_ms": round((time.perf_counter() - started) * 1000),
+        }
+        logger.info(
+            "warm_up token_ms=%d model_call_ms=%d total_ms=%d",
+            timing["token_ms"],
+            timing["model_call_ms"],
+            timing["total_ms"],
+        )
+        return timing
 
     async def comment_on_window(
         self,
@@ -318,6 +411,7 @@ class PunditPipeline:
         window: Sequence[Event],
         *,
         as_of: int,
+        signals: Sequence[TacticalSignal] = (),
         is_stale: Callable[[], bool] | None = None,
     ) -> LiveWindowResult:
         if not window:
@@ -327,7 +421,8 @@ class PunditPipeline:
         if self.settings.mode == "cached":
             return self._cached_live_window(info, events, window, as_of)
 
-        must_say = any(is_must_say(event) for event in window)
+        must_say = any(is_must_say(event, events) for event in window)
+        mandatory = any(signal.mandatory for signal in signals)
         deadline = self.settings.live_timeout_seconds
         accumulated_results: list[ToolResult] = []
         timings: list[AgentCallTiming] = []
@@ -335,8 +430,11 @@ class PunditPipeline:
         deterministic_console = None
         deterministic_insight = None
         deterministic_score_phrase = ""
+        signal_prompts = [signal_prompt(signal) for signal in signals]
+        visible = [event for event in events if event.seq <= as_of]
+        clock = min(90, max(_event_clock(event) for event in visible))
         if must_say:
-            event = next(event for event in window if is_must_say(event))
+            event = next(event for event in window if is_must_say(event, events))
             deterministic_console = build_console_insight(event, info, events)
             accumulated_results.extend(console_tool_results(event, info, events))
             deterministic_insight = Insight(
@@ -349,12 +447,9 @@ class PunditPipeline:
             )
             deterministic_score_phrase = deterministic_console.score_phrase
         else:
-            visible = [event for event in events if event.seq <= as_of]
             score_result = match_state(
                 events,
-                MatchStateParams(
-                    minute=max(_event_clock(event) for event in visible),
-                ),
+                MatchStateParams(minute=clock),
                 as_of=as_of,
             )
             score_fact = next(
@@ -363,6 +458,8 @@ class PunditPipeline:
             accumulated_results.append(
                 ToolResult(tool=score_result.tool, facts=[score_fact])
             )
+            if signals:
+                accumulated_results.append(signals_tool_result(list(signals)))
             deterministic_score_phrase = score_phrase(info, str(score_fact.value))
 
         def stale_result() -> LiveWindowResult:
@@ -386,20 +483,58 @@ class PunditPipeline:
             attempt: int,
         ) -> object:
             started = time.perf_counter()
+            response: object | None = None
             try:
-                return await agent.run(prompt)
+                response = await agent.run(prompt)
+                return response
             finally:
-                timings.append(
-                    AgentCallTiming(
-                        role=role,
-                        attempt=attempt,
-                        duration_ms=round((time.perf_counter() - started) * 1000),
-                    )
+                usage = getattr(response, "usage_details", None) or {}
+                timing = AgentCallTiming(
+                    role=role,
+                    attempt=attempt,
+                    duration_ms=round((time.perf_counter() - started) * 1000),
+                    input_tokens=usage.get("input_token_count"),
+                    output_tokens=usage.get("output_token_count"),
+                    reasoning_tokens=usage.get("reasoning_output_token_count"),
                 )
+                timings.append(timing)
+                logger.info(
+                    "agent_call role=%s as_of=%d attempt=%d duration_ms=%d "
+                    "input_tokens=%s output_tokens=%s reasoning_tokens=%s",
+                    role,
+                    as_of,
+                    attempt,
+                    timing.duration_ms,
+                    timing.input_tokens,
+                    timing.output_tokens,
+                    timing.reasoning_tokens,
+                )
+
+        async def call(
+            role: AgentRole,
+            agent: Agent,
+            prompt: str,
+            attempt: int,
+        ) -> object | None:
+            """Run one agent; None means its structured output was truncated or invalid."""
+            try:
+                return await run_agent(role, agent, prompt, attempt)
+            except ChatClientException as exc:
+                if not _is_structured_output_error(exc):
+                    raise
+                return None
 
         async def attempts() -> LiveWindowResult:
             nonlocal feedback
-            for attempt in range(1, 3):
+            director_passed = must_say or mandatory
+            insight = deterministic_insight
+            insight_facts: list[dict[str, object]] = (
+                deterministic_console.facts if deterministic_console is not None else []
+            )
+            event_contexts: list[dict[str, object]] = (
+                [deterministic_console.event_context] if deterministic_console is not None else []
+            )
+            for attempt in (1, 2):
                 prompt_data = {
                     "match": {
                         "id": info.match_id,
@@ -407,38 +542,29 @@ class PunditPipeline:
                         "away": info.away.name,
                     },
                     "must_say": must_say,
-                    "window": [event.model_dump(mode="json") for event in window],
+                    "minute": clock,
+                    "score_phrase": deterministic_score_phrase,
+                    "signals": signal_prompts,
                     "retry_feedback": feedback,
                     "required_line_id": f"{info.match_id}-l{as_of:03d}",
                 }
-                capture = None
-                if not must_say:
-                    tools, capture = build_analytics_tools(events, as_of=as_of)
+                if not director_passed:
                     director = self._agent(
                         "director",
                         DIRECTOR_INSTRUCTIONS,
                         time_budget=deadline,
                     )
-                    try:
-                        director_response = await run_agent(
-                            "director",
-                            director,
-                            json.dumps(prompt_data),
-                            attempt,
-                        )
-                    except ChatClientException as exc:
-                        if not _is_structured_output_error(exc):
-                            raise
-                        feedback = "Return a complete, concise DirectorDecision matching the schema."
-                        continue
+                    director_response = await call(
+                        "director",
+                        director,
+                        json.dumps(prompt_data),
+                        attempt,
+                    )
                     if is_tactical_stale():
                         return stale_result()
-                    director_decision = _as_model(
-                        getattr(director_response, "value", None),
-                        DirectorDecision,
-                    )
+                    director_decision = _parsed(director_response, DirectorDecision)
                     if director_decision is None:
-                        feedback = "The workflow did not return a structured DirectorDecision."
+                        feedback = _invalid_output("DirectorDecision")
                         continue
                     decision_report = check_evidence(
                         director_decision,
@@ -462,6 +588,9 @@ class PunditPipeline:
                             decision_report,
                             timings=tuple(timings),
                         )
+                    director_passed = True
+                if insight is None:
+                    tools, capture = build_analytics_tools(events, as_of=as_of)
                     analyst = self._agent(
                         "analyst",
                         ANALYST_INSTRUCTIONS,
@@ -470,27 +599,19 @@ class PunditPipeline:
                         time_budget=deadline,
                     )
                     try:
-                        analyst_response = await run_agent(
+                        analyst_response = await call(
                             "analyst",
                             analyst,
                             json.dumps(prompt_data),
                             attempt,
                         )
-                    except ChatClientException as exc:
-                        if not _is_structured_output_error(exc):
-                            raise
-                        feedback = "Return a complete, concise Insight matching the schema."
-                        continue
                     finally:
                         accumulated_results.extend(capture.results)
                     if is_tactical_stale():
                         return stale_result()
-                    insight = _as_model(
-                        getattr(analyst_response, "value", None),
-                        Insight,
-                    )
-                    if insight is None:
-                        feedback = "The workflow did not return a structured Insight."
+                    candidate = _parsed(analyst_response, Insight)
+                    if candidate is None:
+                        feedback = _invalid_output("Insight")
                         continue
                     score_fact = next(
                         fact
@@ -498,29 +619,54 @@ class PunditPipeline:
                         for fact in result.facts
                         if fact.label == "Score"
                     )
-                    insight = insight.model_copy(
+                    candidate = candidate.model_copy(
                         update={
                             "fact_ids": list(
-                                dict.fromkeys([*insight.fact_ids, score_fact.fact_id])
+                                dict.fromkeys([*candidate.fact_ids, score_fact.fact_id])
                             ),
                             "event_ids": list(
-                                dict.fromkeys([*insight.event_ids, *score_fact.event_ids])
+                                dict.fromkeys([*candidate.event_ids, *score_fact.event_ids])
                             ),
                         }
                     )
-                    insight_facts = [
-                        fact.model_dump(mode="json")
+                    insight_report = check_evidence(
+                        candidate,
+                        events=events,
+                        as_of=as_of,
+                        tool_results=accumulated_results,
+                        info=info,
+                    )
+                    unsupported = set(candidate.event_ids) - set(
+                        _all_event_ids(accumulated_results)
+                    )
+                    if insight_report.passed and unsupported:
+                        insight_report = EvidenceReport(
+                            False,
+                            tuple(
+                                f"event_id {event_id} was not returned by an analytics tool"
+                                for event_id in sorted(unsupported)
+                            ),
+                        )
+                    if not insight_report.passed:
+                        feedback = "; ".join(insight_report.failures)
+                        continue
+                    insight = candidate
+                    cited_facts = {
+                        fact.fact_id: fact
                         for result in accumulated_results
                         for fact in result.facts
+                    }
+                    insight_facts = [
+                        {
+                            "fact_id": fact.fact_id,
+                            "label": fact.label,
+                            "value": fact.value,
+                            "unit": fact.unit,
+                        }
+                        for fact_id in insight.fact_ids
+                        if (fact := cited_facts.get(fact_id)) is not None
                     ]
-                    event_contexts = [
-                        event.model_dump(mode="json")
-                        for event in window
-                    ]
-                else:
-                    insight = deterministic_insight
-                    insight_facts = deterministic_console.facts
-                    event_contexts = [deterministic_console.event_context]
+                    event_contexts = []
 
                 if insight is None:
                     raise RuntimeError("Live window did not produce a deterministic or model insight")
@@ -531,89 +677,36 @@ class PunditPipeline:
                 )
                 commentator_prompt = json.dumps(
                     {
-                        **prompt_data,
+                        **{
+                            key: value
+                            for key, value in prompt_data.items()
+                            if key != "signals"
+                        },
                         "events": event_contexts,
                         "insight": insight.model_dump(mode="json"),
                         "facts": insight_facts,
-                        "score_phrase": deterministic_score_phrase,
                     }
                 )
-                try:
-                    commentator_response = await run_agent(
-                        "commentator",
-                        commentator,
-                        commentator_prompt,
-                        attempt,
-                    )
-                except ChatClientException as exc:
-                    if not _is_structured_output_error(exc):
-                        raise
-                    feedback = "Return a complete, concise CommentaryLine matching the schema."
-                    continue
+                commentator_response = await call(
+                    "commentator",
+                    commentator,
+                    commentator_prompt,
+                    attempt,
+                )
                 if is_tactical_stale():
                     return stale_result()
-                line = _as_model(
-                    getattr(commentator_response, "value", None),
-                    CommentaryLine,
-                )
+                line = _parsed(commentator_response, CommentaryLine)
                 if line is None:
-                    feedback = "The workflow did not return a structured CommentaryLine."
+                    feedback = _invalid_output("CommentaryLine")
                     continue
-                report = check_evidence(
+                report = self._check_line(
+                    line,
                     insight,
+                    info=info,
                     events=events,
                     as_of=as_of,
                     tool_results=accumulated_results,
-                    info=info,
                 )
-                if report.passed:
-                    if not must_say:
-                        tool_event_ids = set(_all_event_ids(accumulated_results))
-                        unsupported = set(insight.event_ids) - tool_event_ids
-                        if unsupported:
-                            report = EvidenceReport(
-                                False,
-                                tuple(
-                                    f"event_id {event_id} was not returned by an analytics tool"
-                                    for event_id in sorted(unsupported)
-                                ),
-                            )
-                if report.passed:
-                    try:
-                        validate_plain_spoken_text(line.text)
-                    except ValueError as exc:
-                        report = EvidenceReport(False, (str(exc),))
-                if report.passed:
-                    if line.line_id != f"{info.match_id}-l{as_of:03d}":
-                        report = EvidenceReport(
-                            False,
-                            ("CommentaryLine.line_id does not match the dispatched event sequence",),
-                        )
-                    elif line.insight_id != insight.insight_id:
-                        report = EvidenceReport(
-                            False,
-                            ("CommentaryLine.insight_id does not match the supplied Insight",),
-                        )
-                    elif not set(line.fact_ids).issubset(insight.fact_ids):
-                        report = EvidenceReport(
-                            False,
-                            ("CommentaryLine cites a fact that was not in the Insight",),
-                        )
-                    elif not set(line.event_ids).issubset(insight.event_ids):
-                        report = EvidenceReport(
-                            False,
-                            ("CommentaryLine cites an event that was not in the Insight",),
-                        )
-                    elif not line.event_ids:
-                        report = EvidenceReport(False, ("CommentaryLine must cite an event",))
-                    else:
-                        report = check_evidence(
-                            line,
-                            events=events,
-                            as_of=as_of,
-                            tool_results=accumulated_results,
-                            info=info,
-                        )
                 if report.passed:
                     return LiveWindowResult(
                         "commentary",
@@ -630,7 +723,11 @@ class PunditPipeline:
                 None,
                 tuple(accumulated_results),
                 EvidenceReport(False, (feedback,)),
-                "Commentary was dropped after two failed evidence checks.",
+                (
+                    "Structured output was invalid on both attempts."
+                    if feedback.startswith(_INVALID_OUTPUT_PREFIX)
+                    else "Commentary was dropped after two failed evidence checks."
+                ),
                 tuple(timings),
             )
 
@@ -647,13 +744,44 @@ class PunditPipeline:
                 tuple(timings),
             )
 
-    def _director_forwards(self, payload: object) -> bool:
-        raw_value = _response_value(payload)
-        decision = _as_model(raw_value, DirectorDecision)
-        return bool(
-            decision
-            and decision.should_comment
-            and decision.importance >= self.settings.importance_threshold
+    def _check_line(
+        self,
+        line: CommentaryLine,
+        insight: Insight,
+        *,
+        info: MatchInfo,
+        events: list[Event],
+        as_of: int,
+        tool_results: list[ToolResult],
+    ) -> EvidenceReport:
+        report = check_evidence(
+            insight, events=events, as_of=as_of, tool_results=tool_results, info=info
+        )
+        if not report.passed:
+            return report
+        try:
+            validate_plain_spoken_text(line.text)
+        except ValueError as exc:
+            return EvidenceReport(False, (str(exc),))
+        if line.line_id != f"{info.match_id}-l{as_of:03d}":
+            return EvidenceReport(
+                False,
+                ("CommentaryLine.line_id does not match the dispatched event sequence",),
+            )
+        if line.insight_id != insight.insight_id:
+            return EvidenceReport(
+                False, ("CommentaryLine.insight_id does not match the supplied Insight",)
+            )
+        if not set(line.fact_ids).issubset(insight.fact_ids):
+            return EvidenceReport(False, ("CommentaryLine cites a fact that was not in the Insight",))
+        if not set(line.event_ids).issubset(insight.event_ids):
+            return EvidenceReport(
+                False, ("CommentaryLine cites an event that was not in the Insight",)
+            )
+        if not line.event_ids:
+            return EvidenceReport(False, ("CommentaryLine must cite an event",))
+        return check_evidence(
+            line, events=events, as_of=as_of, tool_results=tool_results, info=info
         )
 
     def _cached_live_window(

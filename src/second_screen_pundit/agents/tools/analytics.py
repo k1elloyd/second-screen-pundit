@@ -7,7 +7,7 @@ from importlib.resources import files
 from typing import Any, TypeVar
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from second_screen_pundit.agents.tools.parameters import (
     CompareWindowsParams,
@@ -44,8 +44,31 @@ class ToolResult(BaseModel):
     caveats: list[str] = Field(default_factory=list)
     cannot_tell: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def cap_evidence_events(self) -> ToolResult:
+        selected = list(
+            dict.fromkeys(event_id for fact in self.facts for event_id in fact.event_ids)
+        )[:_MAX_EVIDENCE_EVENT_IDS]
+        allowed = set(selected)
+        object.__setattr__(
+            self,
+            "facts",
+            [
+                fact.model_copy(
+                    update={
+                        "event_ids": [
+                            event_id for event_id in fact.event_ids if event_id in allowed
+                        ]
+                    }
+                )
+                for fact in self.facts
+            ],
+        )
+        return self
+
 
 Params = TypeVar("Params", bound=BaseModel)
+_MAX_EVIDENCE_EVENT_IDS = 5
 
 
 @lru_cache(maxsize=1)
@@ -59,6 +82,10 @@ def _thresholds() -> dict[str, float]:
 
 def big_chance_threshold() -> float:
     return _thresholds()["big_chance_xg"]
+
+
+def analytics_threshold(name: str) -> float:
+    return _thresholds()[name]
 
 
 def _visible(events: list[Event], as_of: int) -> list[Event]:
@@ -115,7 +142,9 @@ def _fact(
         label=label,
         value=value,
         unit=unit,
-        event_ids=list(dict.fromkeys(event.event_id for event in events)),
+        event_ids=list(dict.fromkeys(event.event_id for event in events))[
+            -_MAX_EVIDENCE_EVENT_IDS:
+        ],
     )
 
 
