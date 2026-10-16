@@ -59,7 +59,7 @@ def test_formation_change_signal_carries_new_and_previous_formation_and_fires_on
     )
 
     assert signal.mandatory and signal.team == "home"
-    assert [fact.value for fact in signal.facts] == ["3-4-3", "4-2-3-1"]
+    assert [fact.value for fact in signal.facts] == ["3-4-3", "4-2-3-1", "Port Calder FC"]
     assert change.event_id in signal.facts[0].event_ids
     assert not [
         again
@@ -122,6 +122,7 @@ class _StubPipeline:
     def __init__(self, hold_until: asyncio.Event | None = None) -> None:
         self.hold_until = hold_until
         self.calls: list[tuple[int, tuple[TacticalSignal, ...]]] = []
+        self.recent_lines: list[tuple[str, ...]] = []
 
     async def comment_on_window(
         self,
@@ -132,15 +133,17 @@ class _StubPipeline:
         as_of: int,
         signals: Sequence[TacticalSignal] = (),
         is_stale: Callable[[], bool] | None = None,
+        recent_lines: Sequence[str] = (),
     ) -> LiveWindowResult:
         self.calls.append((as_of, tuple(signals)))
+        self.recent_lines.append(tuple(recent_lines))
         if self.hold_until is not None and signals:
             await self.hold_until.wait()
         if is_stale is not None and is_stale():
             return LiveWindowResult("skipped", None, None, (), None, "stale window")
         line = CommentaryLine(
             line_id=f"x-l{as_of}",
-            text="A line.",
+            text=f"Line for seq {as_of}.",
             insight_id="i",
             tone="measured",
             event_ids=[window[-1].event_id],

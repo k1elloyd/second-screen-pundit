@@ -217,6 +217,19 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
             and outcome.result.line is not None
             and outcome.result.line.source == "fallback"
         ],
+        "lines_emitted": [
+            {
+                "path": outcome.path,
+                "minute": outcome.minute,
+                "source": outcome.result.line.source,  # type: ignore[union-attr]
+                "delivery_tier": outcome.result.line.delivery_tier,  # type: ignore[union-attr]
+                "text": outcome.result.line.text,  # type: ignore[union-attr]
+            }
+            for outcome in sorted(outcomes, key=lambda item: item.event.seq)
+            if outcome.result is not None
+            and outcome.result.status == "commentary"
+            and outcome.result.line is not None
+        ],
         "agent_calls_by_role": summarize_calls(outcomes),
         "viewer_stream": {
             "configured_delay_s": settings.broadcast_delay_seconds,

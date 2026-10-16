@@ -1101,8 +1101,8 @@ def test_speech_synthesizer_uses_entra_and_emits_mp3(
         def __init__(self, **kwargs: object) -> None:
             observed["synthesizer"] = kwargs
 
-        def speak_text_async(self, text: str) -> SimpleNamespace:
-            observed["text"] = text
+        def speak_ssml_async(self, ssml: str) -> SimpleNamespace:
+            observed["ssml"] = ssml
             return SimpleNamespace(
                 get=lambda: SimpleNamespace(
                     reason="completed",
@@ -1128,14 +1128,22 @@ def test_speech_synthesizer_uses_entra_and_emits_mp3(
         endpoint="https://speech.example.invalid/",
         region="australiaeast",
         credential=object(),  # type: ignore[arg-type]
-    ).synthesize_mp3("A synthetic commentary line.", tmp_path / "commentary.mp3")
+    ).synthesize_mp3(
+        "Goal for Ashbridge Rovers & co <now>.",
+        tmp_path / "commentary.mp3",
+        tier="goal_peak",
+    )
 
     assert observed["config"]["token_credential"] is not None  # type: ignore[index]
     assert observed["config"]["endpoint"] == "https://speech.example.invalid/"  # type: ignore[index]
     assert "region" not in observed["config"]  # type: ignore[operator]
     assert observed["synthesizer"]["audio_config"] is None  # type: ignore[index]
     assert observed["format"] == "mp3"
-    assert observed["text"] == "A synthetic commentary line."
+    ssml = str(observed["ssml"])
+    assert '<voice name="en-GB-SoniaNeural">' in ssml
+    assert 'style="sports_commentary_excited" styledegree="1.7"' in ssml
+    assert "Goal for Ashbridge Rovers &amp; co &lt;now&gt;." in ssml
+    assert "<now>" not in ssml
     assert artifact.duration_seconds == 121
     assert artifact.path.read_bytes() == b"fake-mp3"
     assert not (tmp_path / "commentary.partial.mp3").exists()

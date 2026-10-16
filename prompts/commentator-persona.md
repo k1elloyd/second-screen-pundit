@@ -232,7 +232,8 @@ Conventions:
 - Each variant uses only the listed placeholders. Pick a variant by `seq % len(variants)`, so the choice is deterministic and replays are reproducible.
 - Every variant ends with `{score_phrase}.` as its own sentence where shown. A tactical variant without it may have the score phrase appended.
 - Cite every fact the variant's placeholders come from, plus the score fact.
-- **Tested:** every variant below passed `check_evidence` on the real m01–m03 facts, for every team **except** where marked ⚠. Those variants contain a number or formation from a tactical-signal fact, and fail for **Port Calder FC** because of a label mismatch; see *Formation lines: diagnosis*, point 6. Until that's fixed, use a number-free variant for Port Calder.
+- **Tested:** every variant below passes `check_evidence` on the real m01–m03 facts for every team. Variants once marked ⚠ failed for Port Calder FC because of a label mismatch; Phase 2c fixed it, and `tests/test_voice_and_style.py` now checks every signal variant for every team.
+- **Implemented in** `agents/fallbacks.py` (Phase 2c). A variant is chosen at random, seeded by the line ID. Numeric placeholders use the fact's `spoken_value` when it has one. The code adds two kinds not listed here: `booking` (yellow card) and `signal_red_card_formation`, used when a red card and its reshape reach the same tactical window. xG-surge variant 1 now uses the team-level `{chance_descriptor}` fact.
 
 ### Placeholder sources
 
@@ -263,7 +264,7 @@ Conventions:
 3. `Off goes {player_name}. {team} will have to manage a player light. {score_phrase}.`
 
 ### Red card (mandatory tactical signal)
-1. ⚠ `{team} are down to {players_on_pitch} players after a red card. {score_phrase}.` *(this is the current fallback)*
+1. `{team} are down to {players_on_pitch} players after a red card. {score_phrase}.` *(this is the current fallback)*
 2. `{team} must reorganise a player short. {score_phrase}.`
 3. `A player light now, {team} must find a new balance. {score_phrase}.`
 
@@ -279,21 +280,21 @@ Conventions:
 3. `A change of shape from {team}, now set up in a {formation}. {score_phrase}.`
 
 ### Formation change (mandatory tactical signal)
-1. ⚠ `{team} move from a {previous_formation} to a {new_formation}. {score_phrase}.`
-2. ⚠ `{team} abandon the {previous_formation} and settle into a {new_formation}. {score_phrase}.`
-3. ⚠ `{team} have changed to a {new_formation} shape. {score_phrase}.` *(this is the current fallback)*
+1. `{team} move from a {previous_formation} to a {new_formation}. {score_phrase}.`
+2. `{team} abandon the {previous_formation} and settle into a {new_formation}. {score_phrase}.`
+3. `{team} have changed to a {new_formation} shape. {score_phrase}.` *(this is the current fallback)*
 
 There's no number-free variant here, because the formation is the content. For Port Calder, all three fail until the label mismatch is fixed.
 
 ### Possession swing (tactical signal)
-1. ⚠ `{team} have had {after}% of the possession over the last {window} minutes. {score_phrase}.`
-2. ⚠ `{team} are seeing far more of the ball now: {after}% possession, up from {before}%.`
-3. ⚠ `The ball belongs to {team} at the moment, their possession up by {change} points.`
+1. `{team} have had {after}% of the possession over the last {window} minutes. {score_phrase}.`
+2. `{team} are seeing far more of the ball now: {after}% possession, up from {before}%.`
+3. `The ball belongs to {team} at the moment, their possession up by {change} points.`
 4. `{team} have taken control of the ball in this spell. {score_phrase}.`
 
 ### Pressing surge (tactical signal `high_turnover_surge`)
-1. ⚠ `{team} are winning the ball high up the pitch: {recent} high turnovers in this spell.`
-2. ⚠ `{team} are pressing and it is working, with {recent} high turnovers recently.`
+1. `{team} are winning the ball high up the pitch: {recent} high turnovers in this spell.`
+2. `{team} are pressing and it is working, with {recent} high turnovers recently.`
 3. `{team} keep winning it back in their opponents' half. {score_phrase}.`
 4. `Another turnover high up for {team}, and the press is biting. {score_phrase}.`
 
@@ -302,7 +303,7 @@ Don't speak the window length ("in the last 10 minutes") for this signal. Its wi
 ### xG surge (tactical signal)
 1. `{team} are creating the better chances in this spell. {score_phrase}.`
 2. `The openings are falling to {team} at the moment. {score_phrase}.`
-3. ⚠ `{team} have had the better of the expected goals over the last {window} minutes.`
+3. `{team} have had the better of the expected goals over the last {window} minutes.`
 4. `{team} have the momentum, and the chances to go with it. {score_phrase}.`
 
 Never use the `_xg` or `_opponent_xg` values; they're decimals. Variant 3 is the only safe way to bring in a number.
@@ -336,7 +337,7 @@ Never use the `_xg` or `_opponent_xg` values; they're decimals. Variant 3 is the
 3. **The previous formation isn't always available.** The Commentator only sees the facts the Insight cites. The Analyst may cite at most four, and it's told that "formation changes have already been announced separately, so explain the tactical meaning … rather than announcing them again". That instruction pushes it toward an abstract headline that cites neither formation fact. The Commentator then naturally writes "from a 4-2-3-1 to a 3-4-3" and fails on the uncited formation, or writes around it with number words and fails on those.
 4. **The obvious context is all numbers.** A late formation change invites "with 18 minutes left" or "in the 72nd minute", and neither can be grounded.
 5. **Event citation.** Two other tactical windows in the same run failed "CommentaryLine must cite an event". The formation windows face the same risk.
-6. **A separate bug that will hit m02.** Signal fact labels use the short team name ("Port Calder new formation at 42'"). The check expects labels to start with the full name ("Port Calder FC"). For Port Calder, every signal formation and number fails, **including the deterministic fallbacks**: "Port Calder have changed to a 4-4-1 shape" fails with "formation '4-4-1' does not match", and "Port Calder are down to 10 players…" fails with "ungrounded number '10'". `fallback_result` raises when its own line fails, so m02's mandatory red-card and 4-4-1 beats are lost entirely. Ashbridge Rovers and Merehaven Athletic are unaffected, because their names have no "FC".
+6. **A separate bug that would hit m02 (fixed in Phase 2c).** Signal fact labels use the short team name ("Port Calder new formation at 42'"). The check expects labels to start with the full name ("Port Calder FC"). For Port Calder, every signal formation and number fails, **including the deterministic fallbacks**: "Port Calder have changed to a 4-4-1 shape" fails with "formation '4-4-1' does not match", and "Port Calder are down to 10 players…" fails with "ungrounded number '10'". `fallback_result` raises when its own line fails, so m02's mandatory red-card and 4-4-1 beats are lost entirely. Ashbridge Rovers and Merehaven Athletic are unaffected, because their names have no "FC".
 
 **Suggested instruction wording** (no code changes here; these are for `ANALYST_INSTRUCTIONS` and `COMMENTATOR_INSTRUCTIONS`):
 
@@ -371,21 +372,23 @@ Also recommended for the implementation: keep the last evidence-failure strings 
 
 ---
 
-## Fields this persona needs that the code doesn't have yet
+## Fields this persona needs
 
-For the Copilot implementation; also listed in the hand-over message.
+Phase 2c status of the list from the first draft:
 
-1. **A citable match-clock fact**, for example a `match_state` fact whose value is the minute, plus minutes remaining. Without it, no line can say "in the 88th minute" or "ten minutes left".
-2. **Goal context**, for example `goal_context` ∈ {opener, equaliser, go_ahead, extends_lead, consolation}, or a score-before fact. Today only the post-goal score is supplied, so "turnaround" and "comeback" can't be grounded.
-3. **A delivery tier or SSML style per line.** `CommentaryLine` has only `tone`. `speech.py` sends plain text through `speak_text_async`, so styles need `speak_ssml_async`.
-4. **Shot outcome detail** (saved, wide, blocked, woodwork). Only `outcome: success|fail` exists, and the generator emits no `save` events.
-5. **Shot description:** body part, location or assist provider. None exist, so lines must not mention them.
-6. **Opponent name in signal data.** It appears only inside the signal `summary` and fact labels. Templates would have to derive it from `match.home`/`match.away`.
-7. **A team-level chance descriptor for xG surges.** Only the per-shot `chance_descriptor` exists.
-8. **Recent lines in the Commentator prompt**, for example `recent_lines`. The variety rules need the last few released lines, and none are passed today.
-9. **A routine lane.** Only the must-say and tactical lanes exist, so Tier 5 has no producer.
-10. **Speakable rounded values**, for example a possession value to whole numbers. The exact-match rule forces "52.7%".
-11. **Label consistency (bug).** Signal labels use `team_display_name` ("Port Calder"), while `_number_is_grounded` and `_formation_matches` expect labels to start with the full name ("Port Calder FC"). Use one convention. Until then, Port Calder signal numbers and formations fail, including the deterministic fallbacks.
-12. **Recognisable window labels.** The `high_turnover_surge` and `substitution_effect` window facts ("high-turnover comparison window", "pressing and high-turnover comparison window") match no metric term, so their windows can never be spoken.
-13. **Threshold alignment.** A must-say "big chance" fires at xG > 0.25, but the descriptor says "a big chance" only from 0.3. A must-say shot at 0.26–0.29 is therefore described as "a half-chance".
-14. **Signal fallbacks.** `fallback_result` has templates only for the red-card and formation signals. Possession-swing, xG-surge and pressing-surge windows have no fallback, so they drop when the model fails.
+| # | Field | Status |
+| :--- | :--- | :--- |
+| 1 | Match clock and minutes remaining | Done: `match_context` facts "Match-level clock" and "Match-level minutes remaining"; grounded when the sentence says *minute* or *minutes left* |
+| 2 | Goal context | Done: opener, equaliser, go-ahead goal, goal that extends the lead, consolation. "Consolation" means still behind after the goal; live, say "pull a goal back" |
+| 3 | Delivery tier and SSML | Done: `CommentaryLine.delivery_tier`, set by the server; SSML built in `speech.py` and sent with `speak_ssml_async` |
+| 4 | Shot outcome detail | Open |
+| 5 | Body part, location, assist | Open |
+| 6 | Opponent in signal data | Done: an `_opponent` fact on every signal |
+| 7 | Team-level xG-surge descriptor | Done: an `_chance_descriptor` fact on xG surges |
+| 8 | Recent lines | Done: the last 3 emitted lines, as `recent_lines` |
+| 9 | Routine lane | Open |
+| 10 | Spoken rounded values | Done: `Fact.spoken_value`, accepted by the evidence check |
+| 11 | Team-name consistency | Done: full name in every label, full or short form accepted in text |
+| 12 | Window labels with metric terms | Done |
+| 13 | One big-chance threshold | Done: xG ≥ 0.3 everywhere |
+| 14 | Signal fallbacks | Done, except `substitution_effect`, which has no variants yet |

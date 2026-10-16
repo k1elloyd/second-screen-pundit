@@ -46,7 +46,9 @@ from second_screen_pundit.agents.commentator import (
     validate_plain_spoken_text,
 )
 from second_screen_pundit.agents.config import AgentSettings
+from second_screen_pundit.agents.delivery import tier_for_event, tier_for_signals
 from second_screen_pundit.agents.evidence import EvidenceReport, check_evidence
+from second_screen_pundit.agents.fallbacks import fallback_lines
 from second_screen_pundit.agents.models import (
     Claim,
     CommentaryLine,
@@ -64,11 +66,19 @@ from second_screen_pundit.agents.prompts import (
     RECAP_INSTRUCTIONS,
 )
 from second_screen_pundit.agents.signals import (
+    SIGNAL_TOOL,
     TacticalSignal,
     signal_prompt,
     signals_tool_result,
 )
-from second_screen_pundit.agents.tools.analytics import Fact, ToolResult, key_moments, match_state
+from second_screen_pundit.agents.tools.analytics import (
+    Fact,
+    ToolResult,
+    is_big_chance,
+    key_moments,
+    match_context,
+    match_state,
+)
 from second_screen_pundit.agents.tools.parameters import KeyMomentsParams, MatchStateParams
 from second_screen_pundit.agents.tools.runtime import build_analytics_tools
 from second_screen_pundit.engine.schema import Event, MatchInfo
@@ -123,12 +133,27 @@ def is_must_say(event: Event, events: Sequence[Event] = ()) -> bool:
     ):
         return False
     return event.type in {"goal", "card", "substitution", "formation_change"} or (
-        event.type == "shot" and event.xg is not None and event.xg > 0.25
+        event.type == "shot" and is_big_chance(event.xg)
     )
 
 
 def _event_clock(event: Event) -> int:
     return event.minute + event.added_minute
+
+
+_MUST_SAY_FALLBACK_KINDS = {
+    "goal": "goal",
+    "substitution": "substitution",
+    "formation_change": "formation_change",
+    "shot": "big_chance",
+}
+_SIGNAL_FALLBACK_KINDS = {
+    "red_card": "signal_red_card",
+    "formation_change": "signal_formation_change",
+    "possession_swing": "possession_swing",
+    "high_turnover_surge": "high_turnover_surge",
+    "xg_surge": "xg_surge",
+}
 
 
 def _response_value(payload: object) -> object | None:
@@ -454,6 +479,7 @@ class PunditPipeline:
         as_of: int,
         signals: Sequence[TacticalSignal] = (),
         is_stale: Callable[[], bool] | None = None,
+        recent_lines: Sequence[str] = (),
     ) -> LiveWindowResult:
         if not window:
             raise ValueError("A live window must contain at least one event")
@@ -509,9 +535,29 @@ class PunditPipeline:
             accumulated_results.append(
                 ToolResult(tool=score_result.tool, facts=[score_fact])
             )
+            accumulated_results.append(match_context(events, as_of=as_of))
             if signals:
                 accumulated_results.append(signals_tool_result(list(signals)))
             deterministic_score_phrase = score_phrase(info, str(score_fact.value))
+        context_facts = [
+            fact
+            for result in accumulated_results
+            if result.tool == "match_context"
+            for fact in result.facts
+        ]
+        must_say_event = (
+            next(event for event in window if is_must_say(event, events)) if must_say else None
+        )
+        if must_say_event is not None:
+            goal_context_value = next(
+                (str(fact.value) for fact in context_facts if "goal context" in fact.label),
+                None,
+            )
+            delivery_tier = tier_for_event(
+                must_say_event, goal_context=goal_context_value, clock=clock
+            )
+        else:
+            delivery_tier = tier_for_signals([signal.kind for signal in signals])
 
         def stale_result() -> LiveWindowResult:
             return LiveWindowResult(
@@ -527,160 +573,142 @@ class PunditPipeline:
         def is_tactical_stale() -> bool:
             return not must_say and is_stale is not None and is_stale()
 
-        def fallback_result(reason: str | None = None) -> LiveWindowResult:
-            score_fact = next(
-                fact
-                for result in accumulated_results
-                for fact in result.facts
-                if fact.label.startswith("Match-level score")
-            )
+        def fallback_plan() -> tuple[str, dict[str, object], list[str], Insight] | None:
+            """The fallback kind, its placeholder values, cited facts and Insight, if any."""
             facts_by_id = {
-                fact.fact_id: fact
-                for result in accumulated_results
-                for fact in result.facts
+                fact.fact_id: fact for result in accumulated_results for fact in result.facts
             }
-            fallback_signal = next((signal for signal in signals if signal.mandatory), None)
-            if deterministic_console is not None:
-                event = next(
-                    event for event in window if is_must_say(event, events)
-                )
-                team = team_display_name(info, event.team) if event.team else "The match"
-                detail = deterministic_console.event_context.get("detail", {})
+            score_fact = next(
+                fact for fact in facts_by_id.values() if fact.label.startswith("Match-level score")
+            )
+            values: dict[str, object] = {"score_phrase": deterministic_score_phrase}
+            if deterministic_console is not None and must_say_event is not None:
+                event = must_say_event
+                context = deterministic_console.event_context
+                detail = context.get("detail", {})
                 if not isinstance(detail, dict):
                     raise RuntimeError("Must-say event detail is not a mapping")
-                if event.type == "goal":
-                    text = f"Goal for {team}. {deterministic_score_phrase}."
-                elif event.type == "card":
-                    colour = str(detail.get("colour", "yellow"))
-                    text = f"A {colour} card for {team}. {deterministic_score_phrase}."
-                elif event.type == "substitution":
-                    player_on = detail.get("player_on_name")
-                    player_off = detail.get("player_off_name")
-                    if isinstance(player_on, str) and isinstance(player_off, str):
-                        text = (
-                            f"{player_on} replaces {player_off} for {team}. "
-                            f"{deterministic_score_phrase}."
-                        )
-                    else:
-                        text = f"A substitution for {team}. {deterministic_score_phrase}."
-                elif event.type == "formation_change":
-                    formation = detail.get("formation")
-                    if not isinstance(formation, str) or not formation:
-                        raise RuntimeError("Formation fallback has no formation fact")
-                    text = (
-                        f"{team} have changed to a {formation} shape. "
-                        f"{deterministic_score_phrase}."
-                    )
-                elif event.type == "shot":
-                    descriptor = next(
-                        (
-                            str(fact.value)
-                            for fact in facts_by_id.values()
-                            if "chance description" in fact.label.casefold()
-                        ),
-                        None,
-                    )
-                    phrase = descriptor.capitalize() if descriptor else "A chance"
-                    text = f"{phrase} for {team}. {deterministic_score_phrase}."
-                else:
-                    raise RuntimeError(
-                        f"No deterministic fallback template for must-say {event.type}"
-                    )
-                fact_ids = list(deterministic_console.fact_ids)
-                insight = deterministic_insight
-                if insight is None:
-                    raise RuntimeError("Must-say fallback has no deterministic Insight")
-            elif fallback_signal is not None:
-                team = team_display_name(info, fallback_signal.team)
-                if fallback_signal.kind == "formation_change":
-                    formation_fact = next(
-                        (
-                            fact
-                            for fact in fallback_signal.facts
-                            if fact.fact_id.endswith("_new_formation")
-                        ),
-                        None,
-                    )
-                    if formation_fact is None:
-                        raise RuntimeError("Formation signal has no new-formation fact")
-                    text = (
-                        f"{team} have changed to a {formation_fact.value} shape. "
-                        f"{deterministic_score_phrase}."
-                    )
-                elif fallback_signal.kind == "red_card":
-                    players_fact = next(
-                        (
-                            fact
-                            for fact in fallback_signal.facts
-                            if fact.fact_id.endswith("_players_on_pitch")
-                        ),
-                        None,
-                    )
-                    if players_fact is None:
-                        raise RuntimeError("Red-card signal has no player-count fact")
-                    text = (
-                        f"{team} are down to {players_fact.value} players after a red card. "
-                        f"{deterministic_score_phrase}."
-                    )
-                else:
-                    raise RuntimeError(
-                        f"No deterministic fallback template for {fallback_signal.kind}"
-                    )
-                fact_ids = [
-                    score_fact.fact_id,
-                    *(fact.fact_id for fact in fallback_signal.facts),
-                ]
-                event_ids = list(
-                    dict.fromkeys(
-                        event_id
-                        for fact_id in fact_ids
-                        for event_id in facts_by_id[fact_id].event_ids
-                    )
+                descriptor = next(
+                    (
+                        str(fact.value)
+                        for fact in facts_by_id.values()
+                        if "chance description" in fact.label.casefold()
+                    ),
+                    None,
                 )
-                insight = Insight(
-                    insight_id=f"{info.match_id}-i{as_of:04d}-{lane}",
-                    minute=clock,
-                    headline="Mandatory tactical beat",
-                    importance=1,
-                    fact_ids=fact_ids,
-                    event_ids=event_ids,
+                values.update(
+                    team=team_display_name(info, event.team) if event.team else None,
+                    player_name=context.get("player_name"),
+                    colour=detail.get("colour"),
+                    player_on_name=detail.get("player_on_name"),
+                    player_off_name=detail.get("player_off_name"),
+                    formation=detail.get("formation"),
+                    chance_descriptor=descriptor,
+                    chance_descriptor_title=(
+                        descriptor[:1].upper() + descriptor[1:] if descriptor else None
+                    ),
                 )
-            else:
-                raise RuntimeError("No guaranteed live beat is available for fallback")
+                if event.type == "card":
+                    kind = "red_card" if detail.get("colour") == "red" else "booking"
+                else:
+                    kind = _MUST_SAY_FALLBACK_KINDS.get(event.type)
+                if kind is None or deterministic_insight is None:
+                    return None
+                return kind, values, list(deterministic_console.fact_ids), deterministic_insight
 
-            fact_ids = list(dict.fromkeys(fact_ids))
-            line = CommentaryLine(
-                line_id=live_line_id(info.match_id, as_of, lane),
-                text=text,
-                insight_id=insight.insight_id,
-                fact_ids=fact_ids,
-                event_ids=insight.event_ids,
-                tone="measured",
-                source="fallback",
+            signal = next((signal for signal in signals if signal.mandatory), None) or next(
+                (signal for signal in signals if signal.kind in _SIGNAL_FALLBACK_KINDS), None
             )
-            report = self._check_line(
-                line,
-                insight,
-                info=info,
-                events=events,
-                as_of=as_of,
-                tool_results=accumulated_results,
-                lane=lane,
-                allow_fallback=True,
+            if signal is None or signal.kind not in _SIGNAL_FALLBACK_KINDS:
+                return None
+            kind = _SIGNAL_FALLBACK_KINDS[signal.kind]
+            chosen = [signal]
+            reshape = next(
+                (
+                    other
+                    for other in signals
+                    if other.kind == "formation_change" and other.team == signal.team
+                ),
+                None,
             )
-            if not report.passed:
-                raise RuntimeError(
-                    "Deterministic live fallback failed evidence validation: "
-                    + "; ".join(report.failures)
+            if signal.kind == "red_card" and reshape is not None:
+                kind, chosen = "signal_red_card_formation", [signal, reshape]
+            values["team"] = team_display_name(info, signal.team)
+            for chosen_signal in chosen:
+                prefix = f"{SIGNAL_TOOL}:{chosen_signal.key}_"
+                for fact in chosen_signal.facts:
+                    if fact.fact_id.startswith(prefix):
+                        name = fact.fact_id[len(prefix):].split("_", 1)[1]
+                        values[name] = (
+                            fact.spoken_value if fact.spoken_value is not None else fact.value
+                        )
+            fact_ids = list(
+                dict.fromkeys(
+                    [
+                        score_fact.fact_id,
+                        *(fact.fact_id for fact in context_facts),
+                        *(fact.fact_id for item in chosen for fact in item.facts),
+                    ]
                 )
-            return LiveWindowResult(
-                "commentary",
-                line,
-                insight,
-                tuple(accumulated_results),
-                report,
-                reason or "Agent output failed; deterministic fallback was used.",
-                tuple(timings),
+            )
+            event_ids = list(
+                dict.fromkeys(
+                    event_id
+                    for fact_id in fact_ids
+                    for event_id in facts_by_id[fact_id].event_ids
+                )
+            )
+            insight = Insight(
+                insight_id=f"{info.match_id}-i{as_of:04d}-{lane}",
+                minute=clock,
+                headline=f"Tactical beat: {signal.kind.replace('_', ' ')}",
+                importance=1,
+                fact_ids=fact_ids,
+                event_ids=event_ids,
+            )
+            return kind, values, fact_ids, insight
+
+        def fallback_result(reason: str | None = None) -> LiveWindowResult:
+            plan = fallback_plan()
+            if plan is None:
+                raise RuntimeError("No guaranteed live beat is available for fallback")
+            kind, values, fact_ids, insight = plan
+            line_id = live_line_id(info.match_id, as_of, lane)
+            failures: tuple[str, ...] = ()
+            for text in fallback_lines(kind, values, line_id=line_id):
+                line = CommentaryLine(
+                    line_id=line_id,
+                    text=text,
+                    insight_id=insight.insight_id,
+                    fact_ids=list(dict.fromkeys(fact_ids)),
+                    event_ids=insight.event_ids,
+                    tone="measured",
+                    source="fallback",
+                    delivery_tier=delivery_tier,
+                )
+                report = self._check_line(
+                    line,
+                    insight,
+                    info=info,
+                    events=events,
+                    as_of=as_of,
+                    tool_results=accumulated_results,
+                    lane=lane,
+                    allow_fallback=True,
+                )
+                if report.passed:
+                    return LiveWindowResult(
+                        "commentary",
+                        line,
+                        insight,
+                        tuple(accumulated_results),
+                        report,
+                        reason or "Agent output failed; deterministic fallback was used.",
+                        tuple(timings),
+                    )
+                failures = report.failures
+            raise RuntimeError(
+                "Deterministic live fallback failed evidence validation: " + "; ".join(failures)
             )
 
         async def run_agent(
@@ -854,7 +882,13 @@ class PunditPipeline:
                     candidate = candidate.model_copy(
                         update={
                             "fact_ids": list(
-                                dict.fromkeys([*candidate.fact_ids, score_fact.fact_id])
+                                dict.fromkeys(
+                                    [
+                                        *candidate.fact_ids,
+                                        score_fact.fact_id,
+                                        *(fact.fact_id for fact in context_facts),
+                                    ]
+                                )
                             ),
                             "event_ids": list(
                                 dict.fromkeys([*candidate.event_ids, *score_fact.event_ids])
@@ -894,6 +928,7 @@ class PunditPipeline:
                             "label": fact.label,
                             "value": fact.value,
                             "unit": fact.unit,
+                            "spoken_value": fact.spoken_value,
                         }
                         for fact_id in insight.fact_ids
                         if (fact := cited_facts.get(fact_id)) is not None
@@ -917,6 +952,8 @@ class PunditPipeline:
                         "events": event_contexts,
                         "insight": insight.model_dump(mode="json"),
                         "facts": insight_facts,
+                        "recent_lines": list(recent_lines)[-3:],
+                        "required_delivery_tier": delivery_tier,
                     }
                 )
                 commentator_response = await call(
@@ -932,6 +969,7 @@ class PunditPipeline:
                     invalid_output_roles.add("commentator")
                     feedback = _invalid_output("CommentaryLine")
                     continue
+                line = line.model_copy(update={"delivery_tier": delivery_tier})
                 report = self._check_line(
                     line,
                     insight,
@@ -968,7 +1006,7 @@ class PunditPipeline:
                 ),
                 tuple(timings),
             )
-            if must_say or mandatory:
+            if (must_say or mandatory or director_passed) and fallback_plan() is not None:
                 if invalid_output_roles:
                     failed_roles = ", ".join(
                         f"{role}{' (finish_reason=length)' if role in truncated_output_roles else ''}"

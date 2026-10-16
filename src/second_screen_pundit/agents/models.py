@@ -18,12 +18,27 @@ class DirectorDecision(AgentOutput):
     reason: str = Field(max_length=200)
 
 
+DeliveryTier = Literal[
+    "goal_peak",
+    "goal_equaliser",
+    "goal",
+    "big_chance",
+    "red_card",
+    "formation",
+    "tactical",
+    "substitution",
+    "booking",
+    "routine",
+]
+
+
 class CommentaryLine(AgentOutput):
     line_id: str
     text: str = Field(max_length=200)
     insight_id: str
     tone: Literal["measured", "reflective", "urgent", "analytical"]
     source: Literal["agent", "fallback"] = "agent"
+    delivery_tier: DeliveryTier = "tactical"
 
 
 class Insight(AgentOutput):

@@ -12,7 +12,7 @@ from second_screen_pundit.agents.commentator import (
     Commentator,
     build_console_insight,
 )
-from second_screen_pundit.agents.tools.analytics import big_chance_threshold
+from second_screen_pundit.agents.tools.analytics import is_big_chance
 from second_screen_pundit.engine.generate import load_or_generate_match
 from second_screen_pundit.engine.replay import Replay
 from second_screen_pundit.engine.schema import Event
@@ -31,8 +31,7 @@ def _commentary_events(events: list[Event]) -> list[Event]:
         if event.type in {"goal", "card", "substitution", "formation_change"}
         or (
             event.type == "shot"
-            and event.xg is not None
-            and event.xg > big_chance_threshold()
+            and is_big_chance(event.xg)
             and event.event_id not in goal_shots
         )
     ]

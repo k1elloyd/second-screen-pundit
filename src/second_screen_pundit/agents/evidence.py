@@ -23,6 +23,7 @@ from second_screen_pundit.agents.models import (
 )
 from second_screen_pundit.agents.tools.analytics import Fact, ToolResult
 from second_screen_pundit.engine.schema import Event, MatchInfo
+from second_screen_pundit.engine.teams import label_side, name_mentioned, team_name
 
 
 _NUMBER = re.compile(
@@ -153,14 +154,26 @@ def _narrative_parts(
 
 
 def _fact_number_values(fact: Fact) -> set[float]:
+    """The exact value, plus the deterministic spoken rounding when the fact has one."""
     value = fact.value
+    values: set[float] = set()
     if isinstance(value, bool):
-        return set()
+        return values
     if isinstance(value, int | float):
-        return {abs(float(value))} if math.isfinite(float(value)) else set()
-    if isinstance(value, str):
-        return {abs(number.value) for number in extract_numbers(value)}
-    return set()
+        if math.isfinite(float(value)):
+            values.add(abs(float(value)))
+    elif isinstance(value, str):
+        values.update(abs(number.value) for number in extract_numbers(value))
+    if fact.spoken_value is not None and math.isfinite(float(fact.spoken_value)):
+        values.add(abs(float(fact.spoken_value)))
+    return values
+
+
+_CLOCK_LABELS = ("match-level clock", "match-level minutes remaining")
+
+
+def _is_clock_fact(fact: Fact) -> bool:
+    return fact.label.casefold().startswith(_CLOCK_LABELS)
 
 
 def _is_score_fact(fact: Fact) -> bool:
@@ -173,6 +186,14 @@ def _team_name_mentioned(name: str, text: str) -> bool:
     return any(variant and variant.casefold() in folded for variant in variants)
 
 
+def _label_team_mentioned(fact: Fact, text: str, info: MatchInfo | None) -> bool:
+    """True when the fact's label names a team and that team is named in the text."""
+    if info is None:
+        return False
+    side = label_side(fact.label, info)
+    return side is not None and name_mentioned(team_name(info, side), text)
+
+
 def _matches_value(number: NumberMention, allowed: set[float]) -> bool:
     return abs(number.value) in allowed
 
@@ -181,6 +202,8 @@ def _metric_mentioned(fact: Fact, text: str) -> bool:
     label = fact.label.casefold()
     sentence = text.casefold()
     metrics = (
+        (("minutes remaining",), ("minutes left", "minutes remaining", "minutes to go", "minutes to play")),
+        (("match-level clock",), ("minute",)),
         (("shots on target", "on target"), ("on target",)),
         (("best chance",), ("best chance",)),
         (("progressive passes", "progressive pass"), ("progressive pass", "progressive passes")),
@@ -233,6 +256,10 @@ def _number_is_grounded(
         if _is_score_fact(fact) or not _metric_mentioned(fact, sentence):
             continue
         values = _fact_number_values(fact)
+        if _is_clock_fact(fact):
+            if _matches_value(number, values):
+                return True
+            continue
         if (
             fact.label.casefold().startswith("match-level ")
             and not (
@@ -246,17 +273,7 @@ def _number_is_grounded(
             and _matches_value(number, values)
         ):
             return True
-        if info is None:
-            continue
-        team_name = next(
-            (
-                name
-                for name in (info.home.name, info.away.name)
-                if fact.label.casefold().startswith(name.casefold())
-            ),
-            None,
-        )
-        if team_name is None or not _team_name_mentioned(team_name, sentence):
+        if not _label_team_mentioned(fact, sentence, info):
             continue
         if _matches_value(number, values):
             return True
@@ -316,12 +333,7 @@ def _formation_matches(
         for fact in cited_facts
         if "formation" in fact.label.casefold()
         and isinstance(fact.value, str)
-        and info is not None
-        and any(
-            fact.label.casefold().startswith(name.casefold())
-            and _team_name_mentioned(name, text)
-            for name in (info.home.name, info.away.name)
-        )
+        and _label_team_mentioned(fact, text, info)
     ]
     failures: list[str] = []
     for match in _FORMATION.finditer(text):

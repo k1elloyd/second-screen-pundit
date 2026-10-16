@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from second_screen_pundit.agents.commentator import team_display_name
 from second_screen_pundit.agents.tools.analytics import (
     Fact,
     ToolResult,
@@ -18,6 +17,8 @@ from second_screen_pundit.agents.tools.analytics import (
     possession_window,
     pressing_intensity,
     shot_summary,
+    spoken_value,
+    window_chance_descriptor,
 )
 from second_screen_pundit.agents.tools.parameters import (
     FormationAtParams,
@@ -27,6 +28,7 @@ from second_screen_pundit.agents.tools.parameters import (
     Team,
 )
 from second_screen_pundit.engine.schema import Event, MatchInfo
+from second_screen_pundit.engine.teams import opponent, team_name
 
 
 SIGNAL_TOOL = "tactical_signals"
@@ -61,6 +63,10 @@ class TacticalSignal:
         return self.kind in _ONE_SHOT_KINDS
 
     @property
+    def opponent(self) -> Team:
+        return opponent(self.team)
+
+    @property
     def event_ids(self) -> list[str]:
         return list(dict.fromkeys(event_id for fact in self.facts for event_id in fact.event_ids))
 
@@ -84,6 +90,7 @@ def _fact(
         label=f"{label} at {clock}'",
         value=value,
         unit=unit,
+        spoken_value=spoken_value(value, unit),
         event_ids=list(dict.fromkeys(event_ids))[-_MAX_EVIDENCE_EVENTS:],
     )
 
@@ -99,6 +106,7 @@ def signal_prompt(signal: TacticalSignal) -> dict[str, object]:
     return {
         "kind": signal.kind,
         "team": signal.team,
+        "opponent": signal.opponent,
         "mandatory": signal.mandatory,
         "summary": signal.summary,
         "facts": [
@@ -107,6 +115,7 @@ def signal_prompt(signal: TacticalSignal) -> dict[str, object]:
                 "label": fact.label,
                 "value": fact.value,
                 "unit": fact.unit,
+                "spoken_value": fact.spoken_value,
             }
             for fact in signal.facts
         ],
@@ -130,10 +139,39 @@ class SignalTracker:
         signals.extend(self._possession_swing(events, now, as_of))
         signals.extend(self._xg_surge(events, now, as_of))
         signals.extend(self._high_turnover_surge(visible, now))
+        signals = [self._with_opponent(signal) for signal in signals]
         return sorted(signals, key=lambda signal: not signal.mandatory)
 
     def _name(self, team: Team) -> str:
-        return team_display_name(self.info, team)
+        """Short form, for prose summaries."""
+        return team_name(self.info, team).short
+
+    def _label(self, team: Team) -> str:
+        """Canonical full name, which every signal fact label starts with."""
+        return team_name(self.info, team).full
+
+    def _with_opponent(self, signal: TacticalSignal) -> TacticalSignal:
+        """Every signal carries its opponent's name as a fact."""
+        facts = (
+            *signal.facts,
+            _fact(
+                signal.key,
+                "opponent",
+                f"{self._label(signal.team)} opponent",
+                self._label(signal.opponent),
+                None,
+                [],
+                clock=signal.clock,
+            ),
+        )
+        return TacticalSignal(
+            key=signal.key,
+            kind=signal.kind,
+            team=signal.team,
+            clock=signal.clock,
+            summary=signal.summary,
+            facts=facts,
+        )
 
     def _one_shot_signals(
         self,
@@ -172,7 +210,7 @@ class SignalTracker:
                             _fact(
                                 key,
                                 "players_on_pitch",
-                                f"{self._name(event.team)} players on the pitch",
+                                f"{self._label(event.team)} players on the pitch",
                                 11 - reds,
                                 "players",
                                 [event.event_id],
@@ -206,7 +244,7 @@ class SignalTracker:
                             _fact(
                                 key,
                                 "new_formation",
-                                f"{self._name(event.team)} new formation",
+                                f"{self._label(event.team)} new formation",
                                 new_formation,
                                 None,
                                 [event.event_id],
@@ -215,7 +253,7 @@ class SignalTracker:
                             _fact(
                                 key,
                                 "previous_formation",
-                                f"{self._name(event.team)} previous formation before {_clock(event)}'",
+                                f"{self._label(event.team)} previous formation before {_clock(event)}'",
                                 str(previous.value),
                                 None,
                                 previous.event_ids,
@@ -259,7 +297,7 @@ class SignalTracker:
             and abs(turnover_change) < analytics_threshold("substitution_high_turnover_change")
         ):
             return None
-        name = self._name(team)
+        name, label = self._name(team), self._label(team)
         return TacticalSignal(
             key=key,
             kind="substitution_effect",
@@ -274,29 +312,29 @@ class SignalTracker:
             facts=(
                 _fact(
                     key, "pressing_before",
-                    f"{name} defensive actions per minute before substitution, "
+                    f"{label} defensive actions per minute before substitution, "
                     f"{at - window}-{at}'",
                     rate_before.value, "actions/min", rate_before.event_ids, clock=at,
                 ),
                 _fact(
                     key, "pressing_after",
-                    f"{name} defensive actions per minute after substitution, "
+                    f"{label} defensive actions per minute after substitution, "
                     f"{at}-{at + window}'",
                     rate_after.value, "actions/min", rate_after.event_ids, clock=at,
                 ),
                 _fact(
                     key, "high_turnovers_before",
-                    f"{name} high turnovers before substitution, {at - window}-{at}'",
+                    f"{label} high turnovers before substitution, {at - window}-{at}'",
                     turnovers_before.value, "turnovers", turnovers_before.event_ids, clock=at,
                 ),
                 _fact(
                     key, "high_turnovers_after",
-                    f"{name} high turnovers after substitution, {at}-{at + window}'",
+                    f"{label} high turnovers after substitution, {at}-{at + window}'",
                     turnovers_after.value, "turnovers", turnovers_after.event_ids, clock=at,
                 ),
                 _fact(
                     key, "window",
-                    f"{name} pressing and high-turnover comparison window, "
+                    f"{label} defensive actions per minute and high turnovers comparison window, "
                     f"{at - window}-{at}' and {at}-{at + window}'",
                     window, "minutes", [substitution.event_id], clock=at,
                 ),
@@ -329,7 +367,7 @@ class SignalTracker:
             if change <= analytics_threshold("possession_swing_pp"):
                 continue
             key = f"possession_swing_{team}"
-            name = self._name(team)  # type: ignore[arg-type]
+            name, label = self._name(team), self._label(team)  # type: ignore[arg-type]
             signals.append(
                 TacticalSignal(
                     key=key,
@@ -344,23 +382,23 @@ class SignalTracker:
                     facts=(
                         _fact(
                             key, "before",
-                            f"{name} possession in {now - 2 * length}-{now - length}'",
+                            f"{label} possession in {now - 2 * length}-{now - length}'",
                             prior_fact.value, "%", prior_fact.event_ids, clock=now,
                         ),
                         _fact(
                             key, "after",
-                            f"{name} possession in {now - length}-{now}'",
+                            f"{label} possession in {now - length}-{now}'",
                             recent_fact.value, "%", recent_fact.event_ids, clock=now,
                         ),
                         _fact(
                             key, "change",
-                            f"{name} possession swing, {now - 2 * length}-{now - length}' "
+                            f"{label} possession swing, {now - 2 * length}-{now - length}' "
                             f"vs {now - length}-{now}'",
                             change, "percentage points", recent_fact.event_ids, clock=now,
                         ),
                         _fact(
                             key, "window",
-                            f"{name} possession comparison windows, "
+                            f"{label} possession comparison windows, "
                             f"{now - 2 * length}-{now - length}' and "
                             f"{now - length}-{now}'",
                             length, "minutes", recent_fact.event_ids, clock=now,
@@ -389,6 +427,7 @@ class SignalTracker:
                 continue
             key = f"xg_surge_{team}"
             name, other_name = self._name(team), self._name(opponent)  # type: ignore[arg-type]
+            label, other_label = self._label(team), self._label(opponent)  # type: ignore[arg-type]
             signals.append(
                 TacticalSignal(
                     key=key,
@@ -401,16 +440,21 @@ class SignalTracker:
                     ),
                     facts=(
                         _fact(
-                            key, "xg", f"{name} xG, {now - length}-{now}'",
+                            key, "xg", f"{label} xG, {now - length}-{now}'",
                             xg[team].value, "xG", xg[team].event_ids, clock=now,
                         ),
                         _fact(
-                            key, "opponent_xg", f"{other_name} xG, {now - length}-{now}'",
+                            key, "opponent_xg", f"{other_label} xG, {now - length}-{now}'",
                             xg[opponent].value, "xG", xg[opponent].event_ids, clock=now,
                         ),
                         _fact(
-                            key, "window", f"{name} xG comparison window, {now - length}-{now}'",
+                            key, "window", f"{label} xG comparison window, {now - length}-{now}'",
                             length, "minutes", xg[team].event_ids, clock=now,
+                        ),
+                        _fact(
+                            key, "chance_descriptor",
+                            f"{label} chance quality, {now - length}-{now}'",
+                            window_chance_descriptor(own), None, xg[team].event_ids, clock=now,
                         ),
                     ),
                 )
@@ -448,7 +492,7 @@ class SignalTracker:
             if not team_recent or len(team_recent) < 2 * team_average:
                 continue
             key = f"high_turnover_surge_{team}"
-            name = self._name(team)  # type: ignore[arg-type]
+            name, label = self._name(team), self._label(team)  # type: ignore[arg-type]
             signals.append(
                 TacticalSignal(
                     key=key,
@@ -464,7 +508,7 @@ class SignalTracker:
                         _fact(
                             key,
                             "recent",
-                            f"{name} high turnovers in the last {window} minutes",
+                            f"{label} high turnovers in the last {window} minutes",
                             len(team_recent),
                             "turnovers",
                             [event.event_id for event in team_recent],
@@ -473,7 +517,7 @@ class SignalTracker:
                         _fact(
                             key,
                             "match_average",
-                            f"{name} match-to-date high turnovers per {window} minutes, "
+                            f"{label} match-to-date high turnovers per {window} minutes, "
                             f"0-{now}'",
                             round(team_average, 2),
                             "turnovers",
@@ -483,7 +527,7 @@ class SignalTracker:
                         _fact(
                             key,
                             "window",
-                            f"{name} high-turnover comparison window, "
+                            f"{label} high turnovers comparison window, "
                             f"{now - window}-{now}'",
                             window,
                             "minutes",

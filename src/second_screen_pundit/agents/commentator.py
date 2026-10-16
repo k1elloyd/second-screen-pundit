@@ -10,16 +10,19 @@ from pydantic import BaseModel, ConfigDict
 
 from second_screen_pundit.agents.clients import create_foundry_agent
 from second_screen_pundit.agents.models import CommentaryLine
+from second_screen_pundit.agents.prompts import COMMENTATOR_INSTRUCTIONS
 from second_screen_pundit.agents.tools.analytics import (
     Fact,
     ToolResult,
     chance_descriptor,
     formation_at,
+    match_context,
     match_state,
     shot_summary,
 )
 from second_screen_pundit.agents.tools.parameters import FormationAtParams, MatchStateParams, ShotSummaryParams
 from second_screen_pundit.engine.schema import Event, MatchInfo
+from second_screen_pundit.engine.teams import team_name
 
 
 _EVENT_ID_PATTERN = re.compile(r"\bm\d{2}-e\d{4,}\b", re.IGNORECASE)
@@ -27,15 +30,14 @@ _PLAYER_ID_PATTERN = re.compile(r"\b[a-z0-9]+-p\d{2}\b", re.IGNORECASE)
 _FACT_ID_PATTERN = re.compile(
     r"\b(?:match_state|possession_window|xg_timeline|shot_summary|"
     r"pressing_intensity|pass_network|formation_at|key_moments|"
-    r"compare_windows|tactical_signals):[a-z0-9_:-]+\b",
+    r"compare_windows|tactical_signals|match_context):[a-z0-9_:-]+\b",
     re.IGNORECASE,
 )
 
 
 def validate_plain_spoken_text(text: str) -> None:
     if (
-        "[" in text
-        or "]" in text
+        any(bracket in text for bracket in "[]()")
         or _EVENT_ID_PATTERN.search(text)
         or _PLAYER_ID_PATTERN.search(text)
         or _FACT_ID_PATTERN.search(text)
@@ -74,9 +76,7 @@ def console_tool_results(
     event_name = event.type
     if event.type == "card":
         event_name = f"{event.detail.get('colour', 'unknown')} card"
-    event_team = (
-        team_display_name(info, team) if team in {"home", "away"} else "Match-level"
-    )
+    event_team = team_name(info, team).full if team in {"home", "away"} else "Match-level"
     event_fact = Fact(
         fact_id=f"match_state:{event.seq}:event",
         label=f"{event_team} {event_name} event at {minute}'",
@@ -87,6 +87,7 @@ def console_tool_results(
     results = [
         ToolResult(tool=state.tool, facts=[score]),
         ToolResult(tool=state.tool, facts=[event_fact]),
+        match_context(events, as_of=event.seq, goal=event if event.type == "goal" else None),
     ]
     if event.type == "goal":
         scoring_shots = [
@@ -102,7 +103,7 @@ def console_tool_results(
             shot_facts = [
                 Fact(
                     fact_id=f"shot_summary:{event.seq}:scoring_shot",
-                    label=f"{team_display_name(info, event.team or 'home')} scoring shot at {minute}'",
+                    label=f"{team_name(info, event.team or 'home').full} scoring shot at {minute}'",
                     value="scoring shot",
                     unit=None,
                     event_ids=[shot.event_id],
@@ -113,7 +114,7 @@ def console_tool_results(
                     Fact(
                         fact_id=f"shot_summary:{event.seq}:chance_descriptor",
                         label=(
-                            f"{team_display_name(info, event.team or 'home')} scoring chance "
+                            f"{team_name(info, event.team or 'home').full} scoring chance "
                             f"description at {minute}'"
                         ),
                         value=descriptor,
@@ -144,11 +145,7 @@ def console_tool_results(
                 facts=[
                     fact
                     for fact in state.facts
-                    if fact.label.startswith(
-                        f"{info.home.name} cards"
-                        if event.team == "home"
-                        else f"{info.away.name} cards"
-                    )
+                    if fact.label.startswith(f"{team_name(info, event.team or 'home').full} cards")
                 ],
             )
         )
@@ -173,13 +170,12 @@ def console_tool_results(
                 ],
             )
         ])
-    del info
     return results
 
 
 def team_display_name(info: MatchInfo, team: str) -> str:
-    name = info.home.name if team == "home" else info.away.name
-    return re.sub(r"\s+FC$", "", name, flags=re.IGNORECASE)
+    """The accepted short form of a team's name, used in spoken text."""
+    return team_name(info, team).short
 
 
 def score_phrase(info: MatchInfo, score: str) -> str:
@@ -285,18 +281,7 @@ class Commentator:
             model_fast=model_fast,
             model_deep=model_deep,
             credential=credential,
-            instructions=(
-                "You are a measured football broadcast commentator. Write in British English, "
-                "avoid hype, and produce one or two short sentences of no more than 200 characters. "
-                "Use only the supplied facts and events. Return references through fact_ids and "
-                "event_ids only; never put citations, square brackets, event IDs, or fact IDs in "
-                "text. The text must be plain spoken English with no markup. Do not state any "
-                "number unless that value appears in a supplied fact. Use the supplied deterministic "
-                "score phrase verbatim whenever stating the score. Refer to players by name, never "
-                "by shirt number. Never state an xG or expected-goals decimal; use a supplied chance "
-                "description instead. Match the "
-                "line_id and insight_id exactly."
-            ),
+            instructions=COMMENTATOR_INSTRUCTIONS,
             tools=[],
             middleware=middleware,
         )

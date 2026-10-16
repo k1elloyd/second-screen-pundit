@@ -18,6 +18,7 @@ from second_screen_pundit.agents.pipeline import (
     _cached_tool_results,
 )
 from second_screen_pundit.agents.speech import SpeechSynthesizer
+from second_screen_pundit.agents.voice_trial import run_voice_trial
 from second_screen_pundit.engine.generate import generate_match, get_match_info
 
 
@@ -120,6 +121,20 @@ async def run_phase2_gate(output_path: Path) -> None:
         )
 
 
+def run_voice_trial_gate() -> None:
+    load_dotenv()
+    settings = AgentSettings.from_environment()
+    speech_endpoint, speech_region = settings.require_speech()
+    with DefaultAzureCredential() as credential:
+        results = run_voice_trial(
+            endpoint=speech_endpoint,
+            region=speech_region,
+            credential=credential,
+        )
+    for result in results:
+        print(json.dumps(result.__dict__))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a Second Screen Pundit acceptance gate.")
     parser.add_argument(
@@ -132,10 +147,17 @@ def main() -> None:
         action="store_true",
         help="Replay a match through the live dispatcher and report per-path latency.",
     )
+    parser.add_argument(
+        "--voice-trial",
+        action="store_true",
+        help="Synthesise the trial lines with each candidate voice into data/audio/voice-trials/.",
+    )
     parser.add_argument("--match", choices=("m01", "m02", "m03"), default="m01")
     parser.add_argument("--speed", type=int, default=20)
     args = parser.parse_args()
-    if args.live_latency:
+    if args.voice_trial:
+        run_voice_trial_gate()
+    elif args.live_latency:
         asyncio.run(run_live_latency_gate(args.match, args.speed))
     else:
         asyncio.run(run_phase2_gate(args.output))

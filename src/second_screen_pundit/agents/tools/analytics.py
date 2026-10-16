@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from decimal import ROUND_HALF_UP, Decimal
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any, TypeVar
@@ -24,6 +25,7 @@ from second_screen_pundit.agents.tools.parameters import (
 )
 from second_screen_pundit.engine.generate import get_match_info
 from second_screen_pundit.engine.schema import Event
+from second_screen_pundit.engine.teams import team_name
 
 
 class Fact(BaseModel):
@@ -33,6 +35,7 @@ class Fact(BaseModel):
     label: str
     value: float | int | str
     unit: str | None = None
+    spoken_value: int | float | None = None
     event_ids: list[str]
 
 
@@ -85,14 +88,47 @@ def big_chance_threshold() -> float:
     return _thresholds()["big_chance_xg"]
 
 
+def is_big_chance(xg: float | None) -> bool:
+    """The single big-chance rule, shared by must-say, key moments and the descriptor."""
+    return xg is not None and xg >= big_chance_threshold()
+
+
 def chance_descriptor(xg: float | None) -> str | None:
     if xg is None:
         return None
-    if xg >= 0.3:
+    if is_big_chance(xg):
         return "a big chance"
-    if xg >= 0.1:
+    if xg >= _thresholds()["half_chance_xg"]:
         return "a half-chance"
     return None
+
+
+def window_chance_descriptor(xg: float) -> str:
+    """Team-level wording for an xG surge; contains no number, so it can always be spoken."""
+    if xg >= _thresholds()["xg_surge_strong"]:
+        return "a string of clear chances"
+    return "the better of the chances"
+
+
+_SPOKEN_WHOLE_UNITS = {"%", "percentage points"}
+_SPOKEN_ONE_DECIMAL_UNITS = {"actions/min", "turnovers"}
+
+
+def spoken_value(value: float | int | str, unit: str | None) -> int | float | None:
+    """A rounded value for speech, or None when the exact value is already speakable.
+
+    Percentages are spoken as whole numbers and rates to one decimal place. xG is never
+    spoken as a number, so it gets no spoken value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float) or unit == "xG":
+        return None
+    if unit in _SPOKEN_WHOLE_UNITS:
+        rounded: int | float = int(Decimal(str(value)).quantize(Decimal("1"), ROUND_HALF_UP))
+    elif unit in _SPOKEN_ONE_DECIMAL_UNITS:
+        rounded = float(Decimal(str(value)).quantize(Decimal("0.1"), ROUND_HALF_UP))
+    else:
+        return None
+    return None if float(rounded) == float(value) else rounded
 
 
 def analytics_threshold(name: str) -> float:
@@ -153,6 +189,7 @@ def _fact(
         label=label,
         value=value,
         unit=unit,
+        spoken_value=spoken_value(value, unit),
         event_ids=list(dict.fromkeys(event.event_id for event in events))[
             -_MAX_EVIDENCE_EVENT_IDS:
         ],
@@ -164,10 +201,10 @@ def _team_events(events: list[Event], team: Team) -> list[Event]:
 
 
 def _team_name(events: list[Event], team: Team) -> str:
-    info = get_match_info(events[0].match_id) if events else None
-    if info is None:
+    """The canonical full name, which every fact label starts with."""
+    if not events:
         return team.title()
-    return info.home.name if team == "home" else info.away.name
+    return team_name(get_match_info(events[0].match_id), team).full
 
 
 def _possession(events: list[Event], team: Team) -> tuple[float, list[Event]]:
@@ -487,7 +524,6 @@ def key_moments(
     as_of: int,
 ) -> ToolResult:
     visible = _visible(events, as_of)
-    thresholds = _thresholds()
     ranked: list[tuple[tuple[int, float, int], Event, str]] = []
     for event in visible:
         if event.type == "goal":
@@ -496,7 +532,7 @@ def key_moments(
             ranked.append(((1, 0, event.seq), event, "Red card"))
         elif event.type == "formation_change":
             ranked.append(((2, 0, event.seq), event, "Formation change"))
-        elif event.type == "shot" and (event.xg or 0) > thresholds["big_chance_xg"]:
+        elif event.type == "shot" and is_big_chance(event.xg):
             ranked.append(((3, -(event.xg or 0), event.seq), event, "Big chance"))
         elif event.type == "card" and event.detail.get("colour") == "yellow":
             ranked.append(((4, 0, event.seq), event, "Yellow card"))
@@ -610,6 +646,65 @@ def compare_windows(
         ),
     ]
     return ToolResult(tool="compare_windows", facts=facts, caveats=caveats)
+
+
+FULL_TIME_MINUTE = 90
+
+
+def goal_context(events: list[Event], goal: Event) -> str:
+    """Classify a goal from the score immediately before and after it.
+
+    opener: the first goal of the match. equaliser: it levels the score. go-ahead goal: it
+    turns a draw into a lead. goal that extends the lead: the scorer was already ahead.
+    consolation: the scorer is still behind afterwards.
+    """
+    if goal.type != "goal" or goal.team is None:
+        raise ValueError("goal_context requires a goal event with a team")
+    before = [event for event in events if event.type == "goal" and event.seq < goal.seq]
+    if not before:
+        return "opener"
+    own = sum(event.team == goal.team for event in before) + 1
+    other = sum(event.team != goal.team for event in before)
+    if own == other:
+        return "equaliser"
+    if own < other:
+        return "consolation"
+    return "go-ahead goal" if own - 1 == other else "goal that extends the lead"
+
+
+def match_context(
+    events: list[Event],
+    *,
+    as_of: int,
+    goal: Event | None = None,
+) -> ToolResult:
+    """Deterministic clock facts, plus the goal context when the run is about a goal."""
+    visible = _visible(events, as_of)
+    if not visible:
+        raise ValueError("match_context requires at least one visible event")
+    latest = max(visible, key=lambda event: event.seq)
+    clock = latest.minute + latest.added_minute
+    facts = [
+        _fact("match_context", f"Match-level clock at {clock}'", clock, "minute", [latest]),
+        _fact(
+            "match_context",
+            f"Match-level minutes remaining at {clock}'",
+            max(0, FULL_TIME_MINUTE - clock),
+            "minutes",
+            [latest],
+        ),
+    ]
+    if goal is not None and goal.seq <= as_of:
+        facts.append(
+            _fact(
+                "match_context",
+                f"{_team_name(visible, goal.team)} goal context at {clock}'",  # type: ignore[arg-type]
+                goal_context(visible, goal),
+                None,
+                [goal],
+            )
+        )
+    return ToolResult(tool="match_context", facts=facts)
 
 
 TOOL_PARAMETERS: dict[str, type[BaseModel]] = {

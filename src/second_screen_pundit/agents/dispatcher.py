@@ -15,6 +15,7 @@ from second_screen_pundit.engine.schema import Event, MatchInfo
 
 WINDOW_MATCH_MINUTES = 3
 PENDING_SIGNAL_EXPIRY_MINUTES = 10
+RECENT_LINES_FOR_COMMENTATOR = 3
 
 BoundaryDecision = Literal["no_signal", "held_cooldown", "held_in_flight", "dispatched"]
 
@@ -68,6 +69,7 @@ class LiveDispatcher:
         self._last_line_minute: int | None = None
         self._generation = 0
         self._in_flight = 0
+        self._recent_lines: list[str] = []
 
     async def run(
         self,
@@ -212,7 +214,10 @@ class LiveDispatcher:
                 as_of=outcome.event.seq,
                 signals=signals,
                 is_stale=is_stale,
+                recent_lines=tuple(self._recent_lines[-RECENT_LINES_FOR_COMMENTATOR:]),
             )
+            if outcome.result.status == "commentary" and outcome.result.line is not None:
+                self._recent_lines.append(outcome.result.line.text)
         except Exception as exc:  # noqa: BLE001 - one failed window must not stop the replay
             outcome.error = f"{type(exc).__name__}: {str(exc)[:160]}"
         outcome.elapsed_ms = round((time.monotonic() - started) * 1000)

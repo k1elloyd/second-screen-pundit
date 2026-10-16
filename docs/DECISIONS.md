@@ -239,3 +239,89 @@ Rerun after the evidence-check coverage changes, using `.venv\Scripts\python.exe
 Tactical lines: 21' possession swing; 33' xG surge; 69' formation change to 4-2-3-1 (**deterministic fallback**); 75' formation change to 3-4-3 (**deterministic fallback**); 87' xG surge with a high-turnover surge. The 75' line explicitly says Ashbridge Rovers changed to a 3-4-3 shape, with Port Calder leading 2-1. The two formation windows failed the agent evidence check twice and were emitted from their verified deterministic facts with `source: "fallback"`. The other four tactical windows dropped because the Director declined twice and two model lines failed evidence validation twice (`CommentaryLine must cite an event`). No window timed out. All 8 fast-path lines were emitted by the Commentator; no Director or Analyst call was made on that route.
 
 The 32 model calls all reported `finish_reason=stop`; no role truncated, so no token cap was raised. Role timings including retries: Director, 7 calls, median 2,891 ms, slowest 3,388 ms; Analyst, 11 calls, median 2,936 ms, slowest 4,967 ms; Commentator, 14 calls, median 2,813 ms, slowest 4,134 ms. Median input/output/reasoning tokens were Director 653/158/112, Analyst 1,270/133/0, and Commentator 894/225/86.5. The full test suite passed: 86 passed, 2 deselected.
+
+## Phase 2c: voice and commentary style
+
+Source for the Commentator's instructions and fallback variants: `prompts/commentator-persona.md`.
+
+### Changes
+
+- **Team names.** `engine/teams.py` defines one canonical full name per team (the squad name, for example "Port Calder FC") and one accepted short form (the same name without "FC"). Every analytics, console and signal fact label starts with the full name. The evidence check finds a label's team by either form, and accepts either form in text. Previously, signal labels used the short form and failed the full-name prefix check, so Port Calder's signal numbers and formations, including the deterministic fallbacks, were rejected.
+- **Opponent and window labels.** Every tactical signal now carries an `_opponent` fact. The high-turnover and substitution-pressing window labels now contain a metric term the check recognises.
+- **Match clock.** `match_context` facts "Match-level clock" and "Match-level minutes remaining" are added to every live run. A minute or time remaining is grounded only by these facts, in a sentence containing *minute* or *minutes left/remaining/to go/to play*.
+- **Goal context.** Each goal gets a fact with one of: opener, equaliser, go-ahead goal, goal that extends the lead, consolation. "Consolation" means the scorer is still behind after the goal; the instructions say to treat it as "a goal back" live, because the final result isn't known.
+- **Spoken values.** `Fact.spoken_value` holds a deterministic rounding (half up) for speech: whole numbers for `%` and percentage points, one decimal place for rates. xG never gets one. The evidence check accepts either the exact value or the spoken value.
+- **One big-chance threshold.** xG ≥ 0.3 everywhere (`is_big_chance`): must-say shots, key moments and the "a big chance" descriptor. Previously must-say used > 0.25.
+- **xG-surge descriptor.** A team-level `_chance_descriptor` fact ("the better of the chances", or "a string of clear chances" from 0.8 xG in the window). It contains no number.
+- **Recent lines.** The dispatcher passes the last 3 emitted lines to the Commentator as `recent_lines`.
+- **Instructions.** The Commentator instructions are rebuilt from the persona file: hard rules, goal context, formation wording, content limits and variety rules. The Analyst gets the formation-headline wording from the persona diagnosis.
+- **Fallbacks.** `agents/fallbacks.py` holds the persona variants plus `booking` and `signal_red_card_formation`. A variant is chosen at random, seeded by the line ID, so replays are reproducible; a variant that fails the evidence check is skipped for the next. Non-mandatory signal windows now fall back too, once the Director has approved them.
+- **A gap found by the tests.** When a red card and its reshape reach the same tactical window, the old fallback used only the first mandatory signal and dropped the formation. The combined `signal_red_card_formation` variants now carry both beats.
+- **Delivery tier and SSML.** `CommentaryLine.delivery_tier` is set by the server from the event or signal; the model's value is overwritten. `speech.build_ssml` builds the document with the tier's style and style degree, XML-escapes every inserted value, and synthesis uses `speak_ssml_async`. The old error path called `SpeechSynthesisCancellationDetails.from_result`, which doesn't exist in the Python SDK; it now reads `result.cancellation_details`.
+
+### Voice trial
+
+Microsoft Learn's voice list (checked 2026-10-16) shows **no en-GB voice with `sports_commentary` or `sports_commentary_excited`**:
+
+| Voice | Type | Styles listed on Learn |
+| :--- | :--- | :--- |
+| `en-GB-SoniaNeural` (current default) | Standard | cheerful, sad |
+| `en-GB-RyanNeural` | Standard | chat, cheerful, sad, whispering |
+| Other en-GB standard voices | Standard | none |
+| `en-GB-AdaMultilingualNeural`, `en-GB-OllieMultilingualNeural` | Multilingual | none |
+| `en-GB-Ada`, `-Ollie`, `-Ryan`, `-Sonia:DragonHDLatestNeural` | Neural HD | none (Dragon HD voices don't support `mstts:express-as`) |
+| MAI voices | MAI | no en-GB MAI voice is listed |
+
+The only voice on Learn listing the sports styles is `zh-CN-YunjianNeural`, which spells them `sports-commentary` and `sports-commentary-excited`.
+
+Prices, from the Azure Retail Prices API (UK South, pay-as-you-go, USD): standard neural **$15** per 1M characters, Neural HD **$22** per 1M characters. No MAI meter is listed. The public pricing page renders its prices in script, so it showed none.
+
+Method (`python -m second_screen_pundit.agents.gate --voice-trial`, output in `data/audio/voice-trials/`):
+- The same 6 persona lines (2 goals, a red card, a substitution, a formation change, a tactical insight) are rendered with each voice: twice without a style and once with the tier's style.
+- Two identical requests never return identical MP3 bytes, so bytes can't be compared. The evidence used is the audio duration the service reports.
+- A styled render the same length as two equal plain renders means the style was ignored; a different length means it changed the delivery.
+- The method only shows that delivery changed, not how it sounds; a listen is still needed.
+
+| Voice | Result on the 6 lines |
+| :--- | :--- |
+| `en-GB-SoniaNeural` | Style **ignored** on all 6: durations identical to the plain renders |
+| `en-GB-RyanNeural` | Delivery **changed** on 5 of 6 (formation line unchanged), although Learn doesn't list these styles for Ryan |
+| `en-GB-OllieMultilingualNeural` | Style **ignored** on all 6 |
+| `en-GB-Ollie:DragonHDLatestNeural` | **Unsupported voice** (error 1007) on this UK South resource |
+
+Controls on one line: Ryan with its documented `cheerful` style changed delivery (7.61 s against 7.96 s plain). Yunjian changed delivery with **both** spellings (6.70 s against 7.34 s), so the underscore form used in the code is accepted. The resource also returned 429 Too Many Requests during the trial; the trial retries 429s only.
+
+The default voice was not changed.
+
+### Gates: m01 and m02 at 20x
+
+Full suite: 106 passed, 2 deselected. Budget 15,000 ms per window, unchanged.
+
+| Match | Path | Windows | Lines | Fallback lines | Dropped | Commentator per line, median / slowest | Whole run per line, median / slowest |
+| :--- | :--- | ---: | ---: | ---: | :--- | :--- | :--- |
+| m01 | Fast path | 8 | 8 | 5 | 0 | 7,195 / 7,938 ms | 7,336 / 8,282 ms |
+| m01 | Tactical (30 boundaries) | 8 | 7 | 5 | 1 (Director declined) | 6,729 / 7,889 ms | 12,406 / 14,844 ms |
+| m02 | Fast path | 5 | 5 | 2 | 0 | 4,632 / 8,367 ms | 4,750 / 8,500 ms |
+| m02 | Tactical (30 boundaries) | 7 | 7 | 6 | 0 | 6,369 / 7,527 ms | 10,000 / 13,672 ms |
+
+Every m01 and m02 beat was emitted, including m02's red card (39' tactical, 38' fast path) and 4-4-1 (39' fast path, 45' tactical). No window timed out.
+
+**Regression: the Commentator's own lines often fail, and fallbacks carry most of the commentary** (m01 10 of 15 lines, m02 8 of 12). The fallback reasons were:
+
+| Reason | m01 | m02 |
+| :--- | ---: | ---: |
+| Structured output failed on both attempts | 7 | 5 |
+| …of which with `finish_reason=length` | 2 | 1 |
+| Evidence check failed twice | 1 | 2 |
+
+Commentator median tokens rose from 894 input, 225 output and 86 reasoning (coverage-recovery gate) to 1,807 / 368 / 162 (m01) and 1,849 / 383 / 183 (m02), against a 400-token cap that includes reasoning. The longer persona instructions, the extra prompt fields and the `delivery_tier` field in the response schema are the likely causes. The structured-output failures without truncation aren't diagnosed: the validation error isn't logged. Per-call Commentator median was 3,644 ms (m01) and 3,356 ms (m02), against 2,708 ms before. Lines ready after their event's release: 5 per match, at most 5,250 ms late.
+
+Not fixed at this gate; candidates for the next step:
+- raise the Commentator cap
+- remove `delivery_tier` from the model's response schema, since the server sets it
+- log the validation error
+- shorten the instructions
+
+Also seen in the emitted lines:
+- **Weak agent lines that still pass the check:** "At 21 minutes, Ashbridge Rovers have 31 possession before and 53 after against Port Calder FC", and an m02 line containing a newline.
+- **Formation changes heard twice:** the fast path announces them and the mandatory tactical signal repeats them (m01 67'/69' and 72'/75', m02 39'/45').
