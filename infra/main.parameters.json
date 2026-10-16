@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "existingFoundryAccountName": {
+      "value": "${EXISTING_FOUNDRY_ACCOUNT_NAME}"
+    },
+    "existingFoundryResourceGroup": {
+      "value": "${EXISTING_FOUNDRY_RESOURCE_GROUP}"
+    }
+  }
+}

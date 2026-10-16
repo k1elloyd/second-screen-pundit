@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "second-screen-pundit"
+version = "0.1.0"
+description = "An explainable second-screen experience for fictional football matches."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "agent-framework-foundry==1.15.0",
+    "azure-cognitiveservices-speech==1.52.0",
+    "azure-identity==1.26.0",
+    "fastapi==0.143.2",
+    "pydantic==2.14.1",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "python-dotenv==1.2.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "-m", "not live"]
+markers = [
+    "live: requires Azure authentication and a live Microsoft Foundry deployment",
+]
