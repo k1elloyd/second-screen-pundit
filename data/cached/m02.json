@@ -1,0 +1,86 @@
+{
+  "match_id": "m02",
+  "label": "Pre-generated red-card reshape commentary",
+  "commentary": [
+    {
+      "line_id": "m02-l001",
+      "text": "Port Calder make the breakthrough, giving the home side an early foothold and setting up a demanding response for Merehaven Athletic.",
+      "insight_id": "m02-i0463",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m02-e0462", "m02-e0463"],
+      "tone": "measured"
+    },
+    {
+      "line_id": "m02-l002",
+      "text": "Port Calder are shown a red card, a major turning point that immediately changes the home side's task without the ball.",
+      "insight_id": "m02-i0651",
+      "fact_ids": [],
+      "event_ids": ["m02-e0651"],
+      "tone": "urgent"
+    },
+    {
+      "line_id": "m02-l003",
+      "text": "The home team respond by reshaping their formation, looking to protect the middle while keeping an outlet available for a counter.",
+      "insight_id": "m02-i0669",
+      "fact_ids": ["formation_at:home_formation"],
+      "event_ids": ["m02-e0669"],
+      "tone": "analytical"
+    },
+    {
+      "line_id": "m02-l004",
+      "text": "Merehaven Athletic take advantage of the open space and score, testing Port Calder's revised structure as the visitors look to extend their control.",
+      "insight_id": "m02-i0928",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m02-e0927", "m02-e0928"],
+      "tone": "measured"
+    },
+    {
+      "line_id": "m02-l005",
+      "text": "Merehaven Athletic lead 2-1 after adding another goal, and must balance their shape with the need to threaten forward.",
+      "insight_id": "m02-i1418",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m02-e1417", "m02-e1418"],
+      "tone": "reflective"
+    },
+    {
+      "line_id": "m02-l006",
+      "text": "Merehaven Athletic lead 2-1 after finishing the move with a goal, while the home side's reshaped formation remains visible.",
+      "insight_id": "m02-i1418",
+      "fact_ids": ["match_state:score", "formation_at:home_formation"],
+      "event_ids": ["m02-e0669", "m02-e1418"],
+      "tone": "analytical"
+    }
+  ],
+  "questions": [
+    {
+      "question": "What followed the red card?",
+      "answer": "The home side changed formation shortly after the dismissal, and the later match-state entries record how the contest unfolded.",
+      "fact_ids": ["match_state:score", "formation_at:home_formation"],
+      "event_ids": ["m02-e0651", "m02-e0669", "m02-e0928"]
+    }
+  ],
+  "recap": {
+    "headline": "Merehaven Athletic exploit a reshaped contest",
+    "summary": "An early Port Calder goal was followed by a red card for the home side. Merehaven Athletic changed the score after Port Calder altered their formation.",
+    "key_moments": [
+      {
+        "minute": 27,
+        "text": "Port Calder open the scoring.",
+        "event_ids": ["m02-e0463"]
+      },
+      {
+        "minute": 38,
+        "text": "A red card forces Port Calder to adjust.",
+        "event_ids": ["m02-e0651"]
+      },
+      {
+        "minute": 39,
+        "text": "Port Calder change their formation.",
+        "event_ids": ["m02-e0669"]
+      }
+    ],
+    "audio_script": "Port Calder scored before the match shifted with a red card for the home side. The hosts changed formation to meet the new challenge, but Merehaven Athletic found further openings. The event log records each cited moment and the verified score.",
+    "fact_ids": ["match_state:score", "formation_at:home_formation"],
+    "event_ids": ["m02-e0463", "m02-e0651", "m02-e0669", "m02-e0928", "m02-e1418"]
+  }
+}

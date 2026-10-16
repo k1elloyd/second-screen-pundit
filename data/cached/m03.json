@@ -1,0 +1,70 @@
+{
+  "match_id": "m03",
+  "label": "Pre-generated pressing-masterclass commentary",
+  "commentary": [
+    {
+      "line_id": "m03-l001",
+      "text": "Ashbridge Rovers open the scoring, giving the home side a foothold and making Merehaven Athletic adjust to the match's first goal.",
+      "insight_id": "m03-i0379",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m03-e0379"],
+      "tone": "measured"
+    },
+    {
+      "line_id": "m03-l002",
+      "text": "The home side score again, turning a promising spell into a clear attacking moment against Merehaven Athletic.",
+      "insight_id": "m03-i0878",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m03-e0877", "m03-e0878"],
+      "tone": "urgent"
+    },
+    {
+      "line_id": "m03-l003",
+      "text": "Ashbridge Rovers keep finding dangerous territory, and another home goal gives the match a clear direction.",
+      "insight_id": "m03-i1325",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m03-e1324", "m03-e1325"],
+      "tone": "analytical"
+    },
+    {
+      "line_id": "m03-l004",
+      "text": "Merehaven Athletic are forced into another defensive response as the home side turn a strong spell into a further scoring opportunity.",
+      "insight_id": "m03-i1325",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m03-e1324", "m03-e1325"],
+      "tone": "reflective"
+    }
+  ],
+  "questions": [
+    {
+      "question": "Did the high press create scoring moments?",
+      "answer": "The logged home goals provide the decisive moments, and the event IDs make each scoring sequence traceable.",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m03-e0379", "m03-e0878", "m03-e1325"]
+    }
+  ],
+  "recap": {
+    "headline": "Ashbridge Rovers turn pressure into goals",
+    "summary": "Ashbridge Rovers scored through the match and made their aggressive work without the ball count in the attacking third.",
+    "key_moments": [
+      {
+        "minute": 22,
+        "text": "Ashbridge Rovers open the scoring.",
+        "event_ids": ["m03-e0379"]
+      },
+      {
+        "minute": 51,
+        "text": "The home side add another goal.",
+        "event_ids": ["m03-e0878"]
+      },
+      {
+        "minute": 77,
+        "text": "Ashbridge Rovers find the net again.",
+        "event_ids": ["m03-e1325"]
+      }
+    ],
+    "audio_script": "Ashbridge Rovers made their pressing approach count by turning high regains into attacking moments. The home side scored across the match and kept Merehaven Athletic under pressure. Each moment in this recap is linked to the synthetic event log and the verified score.",
+    "fact_ids": ["match_state:score"],
+    "event_ids": ["m03-e0379", "m03-e0878", "m03-e1325"]
+  }
+}

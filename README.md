@@ -4,7 +4,7 @@ An explainable second-screen experience for fictional football matches.
 
 ## Build status
 
-This repository is at **Phase 1**: deterministic synthetic matches, event-log replay, analytics tools, and a console Commentator. The API, other agents, speech, and deployable Azure infrastructure are not included yet.
+This repository is at **Phase 2**: deterministic synthetic matches, analytics tools, five Foundry agents in Agent Framework workflows, evidence validation, cached/off narrative modes, and server-side Azure Speech MP3 synthesis. The FastAPI application and deployable Azure infrastructure are later phases.
 
 ## Local setup
 
@@ -20,7 +20,7 @@ Install the exact versions declared in `pyproject.toml`:
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-Copy `.env.example` to `.env` and fill in the Foundry project endpoint and deployment names. Do not commit `.env`. Local Azure access uses `DefaultAzureCredential`; sign in with `az login` first.
+Copy `.env.example` to `.env` and fill in the Foundry project endpoint, deployment names, and Azure Speech custom endpoint and region. Do not commit `.env`. Local Azure access uses `DefaultAzureCredential`; sign in with `az login` first.
 
 Run the offline test suite (live Azure tests are excluded by default):
 
@@ -40,4 +40,12 @@ Run the console Commentator against the deterministic late-comeback match at 60x
 .\.venv\Scripts\python.exe -m second_screen_pundit.console m01 --speed 60
 ```
 
-Generated JSONL match logs are written under `data/matches/` and are ignored by Git. The azd and Bicep files are still scaffolding only; resource provisioning and a container build are added in a later phase.
+Run the Phase 2 gate. It prints one cited transcript and writes a Speech-generated MP3 after verifying its duration is at least two minutes:
+
+```powershell
+.\.venv\Scripts\python.exe -m second_screen_pundit.agents.gate
+```
+
+The evidence-check number extraction is adapted from Brian Benz's MIT-licensed [football-results-dashboard grounding.py](https://github.com/bbenz/football-results-dashboard/blob/main/agent/grounding.py); its license is retained in `third_party/bbenz_grounding/`.
+
+Generated JSONL match logs and MP3 gate output are written under `data/matches/` and `data/audio/`, and are ignored by Git. The azd and Bicep files are still scaffolding only; resource provisioning and a container build are added in a later phase.

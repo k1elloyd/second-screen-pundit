@@ -223,3 +223,4 @@ __marimo__/
 
 # Generated match data
 /data/matches/*.jsonl
+/data/audio/*.mp3

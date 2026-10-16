@@ -1,0 +1,164 @@
+{
+  "match_id": "m01",
+  "label": "Pre-generated late-comeback commentary",
+  "commentary": [
+    {
+      "line_id": "m01-l001",
+      "text": "Port Calder lead 1-0 after finding the opening goal, and Ashbridge Rovers now face a demanding response.",
+      "insight_id": "m01-i0395",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e0394", "m01-e0395"],
+      "tone": "measured"
+    },
+    {
+      "line_id": "m01-l002",
+      "text": "Port Calder lead 1-0 after turning a decisive attack into a breakthrough, leaving the home defence to regroup.",
+      "insight_id": "m01-i0395",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e0394", "m01-e0395"],
+      "tone": "reflective"
+    },
+    {
+      "line_id": "m01-l003",
+      "text": "Port Calder lead 2-0 after adding another goal, leaving Ashbridge Rovers needing a more direct route forward.",
+      "insight_id": "m01-i1045",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1044", "m01-e1045"],
+      "tone": "urgent"
+    },
+    {
+      "line_id": "m01-l004",
+      "text": "Port Calder lead 2-0 after making their pressure count again, and the home side need a response.",
+      "insight_id": "m01-i1045",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1044", "m01-e1045"],
+      "tone": "measured"
+    },
+    {
+      "line_id": "m01-l005",
+      "text": "Ashbridge Rovers refresh their personnel as they look to shift the contest towards the attacking half and give the match a different pattern.",
+      "insight_id": "m01-i1131",
+      "fact_ids": [],
+      "event_ids": ["m01-e1131"],
+      "tone": "analytical"
+    },
+    {
+      "line_id": "m01-l006",
+      "text": "The home side first reshape their structure, asking the midfield to offer a steadier platform while the search for a route back continues.",
+      "insight_id": "m01-i1149",
+      "fact_ids": ["formation_at:home_formation"],
+      "event_ids": ["m01-e1149"],
+      "tone": "measured"
+    },
+    {
+      "line_id": "m01-l007",
+      "text": "Ashbridge Rovers now commit to a more aggressive shape, with the back three giving them another way to stretch the visitors.",
+      "insight_id": "m01-i1235",
+      "fact_ids": ["formation_at:home_formation"],
+      "event_ids": ["m01-e1235"],
+      "tone": "analytical"
+    },
+    {
+      "line_id": "m01-l008",
+      "text": "The home side have their goal, and a difficult afternoon now has a fresh edge as Ashbridge Rovers begin to believe in the recovery.",
+      "insight_id": "m01-i1271",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1270", "m01-e1271"],
+      "tone": "urgent"
+    },
+    {
+      "line_id": "m01-l009",
+      "text": "That finish gives Ashbridge Rovers a foothold in the match, with Port Calder suddenly asked to defend the space behind their midfield.",
+      "insight_id": "m01-i1271",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1270", "m01-e1271"],
+      "tone": "reflective"
+    },
+    {
+      "line_id": "m01-l010",
+      "text": "Ashbridge Rovers score again, and the game has become a much tighter contest as the home side turn their pressure into another breakthrough.",
+      "insight_id": "m01-i1392",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1391", "m01-e1392"],
+      "tone": "urgent"
+    },
+    {
+      "line_id": "m01-l011",
+      "text": "Port Calder are being pulled deeper, while Ashbridge Rovers have earned renewed belief through a sharper and more purposeful spell.",
+      "insight_id": "m01-i1392",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1391", "m01-e1392"],
+      "tone": "analytical"
+    },
+    {
+      "line_id": "m01-l012",
+      "text": "The home side keep pushing and find another goal, completing a remarkable swing in momentum after the visitors had controlled the earlier scoring.",
+      "insight_id": "m01-i1513",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1512", "m01-e1513"],
+      "tone": "urgent"
+    },
+    {
+      "line_id": "m01-l013",
+      "text": "Ashbridge Rovers have turned persistence into a lead, and Port Calder must now find composure while the home supporters celebrate the late change.",
+      "insight_id": "m01-i1513",
+      "fact_ids": ["match_state:score"],
+      "event_ids": ["m01-e1512", "m01-e1513"],
+      "tone": "reflective"
+    },
+    {
+      "line_id": "m01-l014",
+      "text": "The final scoring moment captures the comeback, with Ashbridge Rovers rewarded for changing their approach and refusing to let the match drift away.",
+      "insight_id": "m01-i1513",
+      "fact_ids": ["match_state:score", "formation_at:home_formation"],
+      "event_ids": ["m01-e1235", "m01-e1513"],
+      "tone": "measured"
+    },
+    {
+      "line_id": "m01-l015",
+      "text": "Port Calder began with the advantage, but the home side have transformed the ending through a new shape and a sustained run of incisive attacks.",
+      "insight_id": "m01-i1513",
+      "fact_ids": ["match_state:score", "formation_at:home_formation"],
+      "event_ids": ["m01-e1235", "m01-e1513"],
+      "tone": "reflective"
+    }
+  ],
+  "questions": [
+    {
+      "question": "What changed before the home side came back?",
+      "answer": "Ashbridge Rovers changed their formation before the later goals, and the match log records the scoring events behind the recovery.",
+      "fact_ids": ["match_state:score", "formation_at:home_formation"],
+      "event_ids": ["m01-e1235", "m01-e1271", "m01-e1392", "m01-e1513"]
+    },
+    {
+      "question": "How did Port Calder take control early?",
+      "answer": "The logged away goals put Port Calder in front before Ashbridge Rovers reshaped their approach.",
+      "fact_ids": ["match_state:score", "formation_at:home_formation"],
+      "event_ids": ["m01-e0395", "m01-e1045", "m01-e1235"]
+    }
+  ],
+  "recap": {
+    "headline": "Ashbridge Rovers complete a late comeback",
+    "summary": "Port Calder established an early lead before Ashbridge Rovers changed their shape and replied with a late scoring surge.",
+    "key_moments": [
+      {
+        "minute": 23,
+        "text": "Port Calder open the scoring and set the contest on a different course.",
+        "event_ids": ["m01-e0395"]
+      },
+      {
+        "minute": 72,
+        "text": "Ashbridge Rovers switch to a more aggressive formation.",
+        "event_ids": ["m01-e1235"]
+      },
+      {
+        "minute": 88,
+        "text": "The home side complete the turnaround with a late goal.",
+        "event_ids": ["m01-e1513"]
+      }
+    ],
+    "audio_script": "Port Calder struck first and added another goal, putting Ashbridge Rovers under pressure. The home side changed their shape and gradually found a route back into the match. Their response gathered pace, and the late scoring moments completed a memorable turnaround. Every cited moment is tied to the synthetic event log.",
+    "fact_ids": ["match_state:score", "formation_at:home_formation"],
+    "event_ids": ["m01-e0395", "m01-e1045", "m01-e1235", "m01-e1271", "m01-e1392", "m01-e1513"]
+  }
+}

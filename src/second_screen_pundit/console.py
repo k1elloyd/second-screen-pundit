@@ -40,7 +40,7 @@ def _commentary_events(events: list[Event]) -> list[Event]:
 
 async def run_console(match_id: str, speed: int) -> None:
     load_dotenv()
-    required = ("FOUNDRY_PROJECT_ENDPOINT", "MODEL_FAST")
+    required = ("FOUNDRY_PROJECT_ENDPOINT", "MODEL_FAST", "MODEL_DEEP")
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         raise RuntimeError(
@@ -56,7 +56,8 @@ async def run_console(match_id: str, speed: int) -> None:
     with DefaultAzureCredential() as credential:
         commentator = Commentator(
             endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
-            deployment=os.environ["MODEL_FAST"],
+            model_fast=os.environ["MODEL_FAST"],
+            model_deep=os.environ["MODEL_DEEP"],
             credential=credential,
         )
         replay.start()

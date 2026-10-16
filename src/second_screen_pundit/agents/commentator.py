@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Literal
 
-from agent_framework import Agent
-from agent_framework.foundry import FoundryChatClient
+from agent_framework import FunctionMiddleware
 from azure.core.credentials import TokenCredential
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
+from second_screen_pundit.agents.clients import create_foundry_agent
+from second_screen_pundit.agents.models import CommentaryLine
 from second_screen_pundit.agents.tools.analytics import (
     ToolResult,
     formation_at,
@@ -38,17 +38,6 @@ def validate_plain_spoken_text(text: str) -> None:
         raise ValueError(
             "CommentaryLine.text must be plain spoken English; citations belong in ID fields"
         )
-
-
-class CommentaryLine(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    line_id: str
-    text: str = Field(max_length=200)
-    insight_id: str
-    fact_ids: list[str]
-    event_ids: list[str]
-    tone: Literal["measured", "reflective", "urgent", "analytical"]
 
 
 class ConsoleInsight(BaseModel):
@@ -183,16 +172,17 @@ class Commentator:
     def __init__(
         self,
         endpoint: str,
-        deployment: str,
+        model_fast: str,
+        model_deep: str,
         credential: TokenCredential,
+        middleware: tuple[FunctionMiddleware, ...] = (),
     ) -> None:
-        self.agent = Agent(
-            client=FoundryChatClient(
-                project_endpoint=endpoint,
-                model=deployment,
-                credential=credential,
-            ),
-            name="Commentator",
+        self.agent = create_foundry_agent(
+            "commentator",
+            endpoint=endpoint,
+            model_fast=model_fast,
+            model_deep=model_deep,
+            credential=credential,
             instructions=(
                 "You are a measured football broadcast commentator. Write in British English, "
                 "avoid hype, and produce one or two short sentences of no more than 200 characters. "
@@ -200,14 +190,12 @@ class Commentator:
                 "event_ids only; never put citations, square brackets, event IDs, or fact IDs in "
                 "text. The text must be plain spoken English with no markup. Do not state any "
                 "number unless that value appears in a supplied fact. Refer to players by name, "
-                "never by shirt number. Match the line_id and insight_id exactly."
+                "never by shirt number. When the away side leads, state the score from the leading "
+                "team's perspective and name them, for example, 'Port Calder lead 1-0'. Match the "
+                "line_id and insight_id exactly."
             ),
             tools=[],
-            default_options={
-                "max_tokens": 256,
-                "store": False,
-                "response_format": CommentaryLine,
-            },
+            middleware=middleware,
         )
 
     async def commentate(self, insight: ConsoleInsight, event: Event) -> CommentaryLine:
