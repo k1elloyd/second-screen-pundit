@@ -1,0 +1,47 @@
+storylines:
+  m01:
+    seed: 41017
+    home: ashbridge
+    away: port_calder
+    stadium: Brackenfield Ground
+    beats:
+      - {kind: goal, minute: 23, team: away, player: 11, xg: 0.31}
+      - {kind: goal, minute: 61, team: away, player: 9, xg: 0.26}
+      - {kind: substitution, minute: 66, team: home, player_on: 12, player_off: 8}
+      - {kind: formation, minute: 67, team: home, formation: 4-2-3-1}
+      - {kind: formation, minute: 72, team: home, formation: 3-4-3}
+      - {kind: goal, minute: 74, team: home, player: 11, xg: 0.34}
+      - {kind: goal, minute: 81, team: home, player: 9, xg: 0.27}
+      - {kind: goal, minute: 88, team: home, player: 10, xg: 0.41}
+  m02:
+    seed: 92031
+    home: port_calder
+    away: merehaven
+    stadium: Saltmere Park
+    beats:
+      - {kind: goal, minute: 27, team: home, player: 11, xg: 0.28}
+      - {kind: red_card, minute: 38, team: home, player: 4}
+      - {kind: formation, minute: 39, team: home, formation: 4-4-1}
+      - {kind: goal, minute: 54, team: away, player: 10, xg: 0.29}
+      - {kind: final_third, minute: 60, team: away}
+      - {kind: final_third, minute: 68, team: away}
+      - {kind: final_third, minute: 76, team: away}
+      - {kind: goal, minute: 82, team: away, player: 11, xg: 0.32}
+      - {kind: final_third, minute: 86, team: away}
+  m03:
+    seed: 77503
+    home: ashbridge
+    away: merehaven
+    stadium: Wrenlow Field
+    away_xg_limit: 0.25
+    beats:
+      - {kind: high_turnover, minute: 18, team: home, player: 6}
+      - {kind: goal, minute: 22, team: home, player: 11, xg: 0.25}
+      - {kind: high_turnover, minute: 35, team: home, player: 7}
+      - {kind: high_turnover, minute: 47, team: home, player: 8}
+      - {kind: goal, minute: 51, team: home, player: 9, xg: 0.29}
+      - {kind: high_turnover, minute: 57, team: home, player: 8}
+      - {kind: high_turnover, minute: 68, team: home, player: 6}
+      - {kind: high_turnover, minute: 74, team: home, player: 7}
+      - {kind: goal, minute: 77, team: home, player: 10, xg: 0.31}
+      - {kind: high_turnover, minute: 84, team: home, player: 7}

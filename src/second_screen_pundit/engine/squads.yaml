@@ -1,0 +1,55 @@
+teams:
+  - id: ashbridge
+    name: Ashbridge Rovers
+    stadium: Brackenfield Ground
+    formation: 4-3-3
+    players:
+      - {id: ashbridge-p01, name: Aven Bramblet, position: GK}
+      - {id: ashbridge-p02, name: Brio Cinderby, position: DF}
+      - {id: ashbridge-p03, name: Cely Dovetail, position: DF}
+      - {id: ashbridge-p04, name: Daro Emberton, position: DF}
+      - {id: ashbridge-p05, name: Evin Fallowmere, position: DF}
+      - {id: ashbridge-p06, name: Fira Gildern, position: MF}
+      - {id: ashbridge-p07, name: Garo Hushwell, position: MF}
+      - {id: ashbridge-p08, name: Halen Ironsage, position: MF}
+      - {id: ashbridge-p09, name: Ivo Juniperby, position: FW}
+      - {id: ashbridge-p10, name: Juno Kestrelane, position: FW}
+      - {id: ashbridge-p11, name: Kiva Larkspur, position: FW}
+      - {id: ashbridge-p12, name: Loran Mallowfen, position: SUB}
+      - {id: ashbridge-p13, name: Mera Northwick, position: SUB}
+  - id: port_calder
+    name: Port Calder FC
+    stadium: Saltmere Park
+    formation: 4-2-3-1
+    players:
+      - {id: port_calder-p01, name: Nilo Oakenfold, position: GK}
+      - {id: port_calder-p02, name: Orin Puddlewick, position: DF}
+      - {id: port_calder-p03, name: Pavo Quillmere, position: DF}
+      - {id: port_calder-p04, name: Quen Rillstone, position: DF}
+      - {id: port_calder-p05, name: Rumi Silvergrove, position: DF}
+      - {id: port_calder-p06, name: Sela Thistleford, position: MF}
+      - {id: port_calder-p07, name: Tavi Umbervale, position: MF}
+      - {id: port_calder-p08, name: Ulen Vellumby, position: MF}
+      - {id: port_calder-p09, name: Varo Brackenley, position: MF}
+      - {id: port_calder-p10, name: Aven Dovetail, position: MF}
+      - {id: port_calder-p11, name: Brio Fallowmere, position: FW}
+      - {id: port_calder-p12, name: Cely Gildern, position: SUB}
+      - {id: port_calder-p13, name: Daro Hushwell, position: SUB}
+  - id: merehaven
+    name: Merehaven Athletic
+    stadium: Wrenlow Field
+    formation: 4-4-2
+    players:
+      - {id: merehaven-p01, name: Evin Ironsage, position: GK}
+      - {id: merehaven-p02, name: Fira Juniperby, position: DF}
+      - {id: merehaven-p03, name: Garo Kestrelane, position: DF}
+      - {id: merehaven-p04, name: Halen Larkspur, position: DF}
+      - {id: merehaven-p05, name: Ivo Mallowfen, position: DF}
+      - {id: merehaven-p06, name: Juno Northwick, position: MF}
+      - {id: merehaven-p07, name: Kiva Oakenfold, position: MF}
+      - {id: merehaven-p08, name: Loran Puddlewick, position: MF}
+      - {id: merehaven-p09, name: Mera Quillmere, position: MF}
+      - {id: merehaven-p10, name: Nilo Rillstone, position: FW}
+      - {id: merehaven-p11, name: Orin Silvergrove, position: FW}
+      - {id: merehaven-p12, name: Pavo Thistleford, position: SUB}
+      - {id: merehaven-p13, name: Quen Umbervale, position: SUB}

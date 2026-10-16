@@ -4,7 +4,7 @@ An explainable second-screen experience for fictional football matches.
 
 ## Build status
 
-This repository is at **Phase 0**: project scaffolding and documented SDK verification. Match generation, agents, the API, and deployable Azure infrastructure are not included yet.
+This repository is at **Phase 1**: deterministic synthetic matches, event-log replay, analytics tools, and a console Commentator. The API, other agents, speech, and deployable Azure infrastructure are not included yet.
 
 ## Local setup
 
@@ -34,4 +34,10 @@ After setting the local Foundry values, run the Phase 0 live gate. It makes one 
 .\.venv\Scripts\python.exe -m pytest -s -m live tests\test_foundry_live.py
 ```
 
-The azd and Bicep files are scaffolding only; resource provisioning and a container build are added in a later phase.
+Run the console Commentator against the deterministic late-comeback match at 60x:
+
+```powershell
+.\.venv\Scripts\python.exe -m second_screen_pundit.console m01 --speed 60
+```
+
+Generated JSONL match logs are written under `data/matches/` and are ignored by Git. The azd and Bicep files are still scaffolding only; resource provisioning and a container build are added in a later phase.
