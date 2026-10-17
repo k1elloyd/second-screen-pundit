@@ -81,6 +81,7 @@ from second_screen_pundit.agents.signals import (
 from second_screen_pundit.agents.tools.analytics import (
     Fact,
     ToolResult,
+    chance_summary,
     is_big_chance,
     key_moments,
     match_context,
@@ -559,69 +560,114 @@ def _fallback_explanation(
     )
 
 
+def _recap_snapshot(events: list[Event], as_of: int) -> list[ToolResult]:
+    """The recap's facts: the full-time snapshot with its turning points, and the chances."""
+    return [
+        *match_snapshot(events, as_of=as_of, moments=RECAP_MOMENTS, minor=False),
+        chance_summary(events, as_of=as_of),
+    ]
+
+
+def _digit_ordinal(value: int) -> str:
+    suffix = "th" if 10 <= value % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+    return f"{value}{suffix}"
+
+
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:] + ("" if text.endswith((".", "!", "?")) else ".")
+
+
 def _fallback_recap(
-    results: Sequence[ToolResult],
+    info: MatchInfo,
     events: list[Event],
     as_of: int,
     *,
     notice: str,
-) -> Recap:
+) -> tuple[Recap, list[ToolResult]]:
+    """A readable recap written only from the deterministic snapshot.
+
+    The headline is the winner-first score phrase. The summary tells the goals and red cards
+    in order, from each moment's own description, then names the team with the better of the
+    chances and its rounded expected goals. No xG decimal appears anywhere.
+    """
+    results = _recap_snapshot(events, as_of)
+    phrase = full_time_score_phrase(info, str(_snapshot_score(results).value))
+    moments: list[tuple[int, str, Fact]] = []
+    for result in results:
+        rows = {str(row.get("fact_id")): row for row in result.table or []}
+        for fact in result.facts:
+            row = rows.get(fact.fact_id)
+            if row is not None:
+                # "Consolation" was live wording; at full time a team may have come back.
+                description = str(row["description"]).replace("the consolation", "a goal back")
+                moments.append((int(row["minute"]), description, fact))
+    reds = [moment for moment in moments if "red card at" in moment[2].label]
+    goals = [moment for moment in moments if " goal at " in moment[2].label]
+    # The story: every red card and the latest goals, which decide the result.
+    turning = sorted(
+        [*reds, *goals[-max(0, RECAP_STORY_MOMENTS - len(reds)):]] if goals else reds,
+        key=lambda moment: moment[0],
+    )[-RECAP_STORY_MOMENTS:]
+    chosen = sorted(reds[:3] + goals[::-1][: 3 - len(reds[:3])], key=lambda moment: moment[0])
+    chosen += [moment for moment in moments if moment not in chosen][: 3 - len(chosen)]
+    if len(chosen) < 3:
+        raise ValueError("The visible event log does not contain three recap moments")
+    chosen.sort(key=lambda moment: moment[0])
+    key_moments = [
+        RecapMoment(minute=minute, text=_sentence(description), event_ids=fact.event_ids[:1])
+        for minute, description, fact in chosen
+    ]
+    story = " ".join(
+        f"In the {_digit_ordinal(minute)} minute, {description}."
+        for minute, description, _ in (turning or chosen)
+    )
     facts = _result_fact_map(results)
-    key_result = next((result for result in results if result.tool == "key_moments"), None)
-    if key_result is None:
-        raise ValueError("Deterministic recap requires key_moments facts")
-    event_by_id = {event.event_id: event for event in events}
-    moments: list[RecapMoment] = []
-    for fact in key_result.facts:
-        event_id = next(
-            (candidate for candidate in fact.event_ids if candidate in event_by_id),
+    chances = ""
+    leader = next(
+        (fact for fact in facts.values() if fact.value == "the better of the chances"), None
+    )
+    if leader is not None:
+        team = leader.label.split(" chance quality", 1)[0]
+        rounded = next(
+            (
+                fact
+                for fact in facts.values()
+                if fact.label.startswith(f"{team} expected goals, rounded")
+            ),
             None,
         )
-        if event_id is None:
-            continue
-        event = event_by_id[event_id]
-        if event.seq > as_of:
-            continue
-        moments.append(
-            RecapMoment(
-                minute=_event_clock(event),
-                text=f"A {str(fact.value).replace('_', ' ')} changes the shape of the match.",
-                event_ids=[event_id],
+        if rounded is not None and int(rounded.value) > 0:
+            chances = (
+                f" {team} had the better of the chances, with about {rounded.value} "
+                "expected goals."
             )
-        )
-        if len(moments) == 3:
-            break
-    if len(moments) < 3:
-        raise ValueError("The visible event log does not contain three recap moments")
-    citations = list(
-        dict.fromkeys(
-            fact_id
-            for result in results
-            for fact_id in (fact.fact_id for fact in result.facts)
-        )
-    )
-    cited_events = list(
-        dict.fromkeys(
-            [*_all_event_ids(results), *(event_id for moment in moments for event_id in moment.event_ids)]
-        )
-    )
-    score = next(
-        (fact for fact in facts.values() if fact.label.startswith("Match-level score")),
-        None,
-    )
-    score_text = f" The verified score is {score.value}." if score is not None else ""
-    return Recap(
-        headline="Verified match recap",
-        summary=f"The deterministic event log records the match's key turning points.{score_text}",
-        key_moments=moments,
-        audio_script="The match's key turning points are shown with their event references.",
-        notice=notice,
-        fact_ids=citations,
-        event_ids=cited_events,
+        else:
+            chances = f" {team} had the better of the chances."
+    summary = f"{phrase} at {info.stadium}. {story}{chances}"
+    return (
+        Recap(
+            headline=f"{phrase} at {info.stadium}",
+            summary=summary,
+            key_moments=key_moments,
+            audio_script=summary,
+            notice=notice,
+            fact_ids=list(facts),
+            event_ids=list(
+                dict.fromkeys(
+                    [
+                        *_all_event_ids(results),
+                        *(event_id for moment in key_moments for event_id in moment.event_ids),
+                    ]
+                )
+            ),
+        ),
+        results,
     )
 
 
 RECAP_MOMENTS = 12
+# The fallback recap tells at most this many goals and red cards, so it stays short.
+RECAP_STORY_MOMENTS = 5
 
 _RETRY_HINTS = (
     ("ungrounded number", "Use only numbers that are fact values; give a minute only for a listed key moment."),
@@ -629,6 +675,7 @@ _RETRY_HINTS = (
     ("formation", "Write a formation exactly as a fact value, with that team named in the sentence."),
     ("per cent", "Write each percentage with %."),
     ("fact_id", "Cite only the listed F IDs."),
+    ("xG decimals", "Never write xG; say who had the better of the chances, or about N expected goals from a rounded fact."),
 )
 
 
@@ -640,6 +687,70 @@ def _retry_feedback(failures: Sequence[str]) -> str:
         if any(key in failure for failure in failures)
     ]
     return "; ".join(failures) + (". " + " ".join(hints) if hints else "")
+
+
+def _cite_used_facts(
+    explanation: Explanation,
+    report: EvidenceReport,
+    *,
+    model_fact_ids: Sequence[str],
+    snapshot_fact_ids: Sequence[str],
+    results: Sequence[ToolResult],
+    events: list[Event],
+    as_of: int,
+    info: MatchInfo,
+) -> tuple[Explanation, EvidenceReport]:
+    """Cite only the facts the answer used, once it has passed with every snapshot fact.
+
+    Kept: the tool-result facts the model cited from its own tool calls, and, for each number,
+    score, formation or minute in the answer, the snapshot facts the evidence check matched
+    to it (the model's own choice first, when it cited one of them). The claims list and event
+    IDs follow the kept facts, so an answer that uses one stat cites exactly that fact.
+    """
+    snapshot = set(snapshot_fact_ids)
+    probe = explanation.model_copy(update={"claims": [], "cannot_tell": [], "notice": None})
+    probe_report = check_evidence(
+        probe, events=events, as_of=as_of, tool_results=list(results), info=info
+    )
+    chosen = [fact_id for fact_id in model_fact_ids if fact_id not in snapshot]
+    # Most specific mentions first, so a minute that several facts carry (a window such as
+    # 59-75') is covered by a fact already kept for a number, not by one more fact.
+    for group in sorted(probe_report.grounding, key=len):
+        preferred = [fact_id for fact_id in group if fact_id in model_fact_ids]
+        if preferred:
+            chosen.extend(preferred)
+        elif not any(fact_id in chosen for fact_id in group):
+            chosen.append(group[0])
+    kept = set(chosen)
+    # The model's own citations first, in its order; then the ones the check matched.
+    chosen = list(
+        dict.fromkeys(
+            [*(fact_id for fact_id in model_fact_ids if fact_id in kept), *chosen]
+        )
+    )
+    facts_by_id = _result_fact_map(results)
+    cited = [facts_by_id[fact_id] for fact_id in chosen if fact_id in facts_by_id]
+    narrowed = explanation.model_copy(
+        update={
+            "claims": [_fact_claim(fact) for fact in cited],
+            "fact_ids": [fact.fact_id for fact in cited],
+            "event_ids": list(
+                dict.fromkeys(event_id for fact in cited for event_id in fact.event_ids)
+            ),
+        }
+    )
+    narrowed_report = check_evidence(
+        narrowed, events=events, as_of=as_of, tool_results=list(results), info=info
+    )
+    if not narrowed_report.passed:
+        # Shouldn't happen: every kept fact grounded something. Keep the passing answer.
+        logger.warning(
+            "question_citation_narrowing_failed match_id=%s failures=%s",
+            info.match_id,
+            "; ".join(narrowed_report.failures),
+        )
+        return explanation, report
+    return narrowed, narrowed_report
 
 
 def _snapshot_fact_ids(snapshot: Sequence[ToolResult]) -> list[str]:
@@ -1769,6 +1880,20 @@ class PunditPipeline:
                     info=info,
                 )
                 if report.passed:
+                    explanation, report = _cite_used_facts(
+                        explanation,
+                        report,
+                        model_fact_ids=[
+                            fact_id
+                            for alias in reply.fact_ids
+                            if (fact_id := aliases.real(alias)) is not None
+                        ],
+                        snapshot_fact_ids=given_fact_ids,
+                        results=accumulated_results,
+                        events=events,
+                        as_of=as_of,
+                        info=info,
+                    )
                     return QuestionResult(
                         explanation,
                         tuple(accumulated_results),
@@ -1951,25 +2076,29 @@ class PunditPipeline:
                 info,
                 events,
                 as_of,
-                _deterministic_results(events, as_of),
                 "Narrative mode is off; showing a deterministic recap.",
                 0,
             )
 
         deadline = self.settings.recap_timeout_seconds
-        snapshot = await asyncio.to_thread(
-            match_snapshot, events, as_of=as_of, moments=RECAP_MOMENTS, minor=False
-        )
+        snapshot = await asyncio.to_thread(_recap_snapshot, events, as_of)
         aliases = _FactAliases()
         stats_facts, moment_facts = _prompt_facts(snapshot, aliases, moment_event_ids=True)
+        # The recap never shows raw xG: the model gets the chance summary instead.
+        stats_facts = [item for item in stats_facts if item.get("unit") != "xG"]
+        for moment in moment_facts:
+            moment["description"] = str(moment["description"]).replace(
+                "the consolation", "a goal back"
+            )
         score_fact = _snapshot_score(snapshot)
+        recap_score_phrase = full_time_score_phrase(info, str(score_fact.value))
         prompt_base = {
             "match": {
                 "home": info.home.name,
                 "away": info.away.name,
                 "stadium": info.stadium,
             },
-            "score_phrase": full_time_score_phrase(info, str(score_fact.value)),
+            "score_phrase": recap_score_phrase,
             "facts": stats_facts,
             "key_moments": moment_facts,
         }
@@ -2039,6 +2168,11 @@ class PunditPipeline:
                     as_of=as_of,
                     given_fact_ids=given_fact_ids,
                 )
+                if recap is not None and recap_score_phrase.casefold() not in recap.headline.casefold():
+                    recap, problems = None, [
+                        f"the headline must contain score_phrase word for word: "
+                        f"{recap_score_phrase!r}"
+                    ]
                 if recap is None:
                     feedback = "; ".join(problems)
                     continue
@@ -2075,9 +2209,8 @@ class PunditPipeline:
             notice = "The recap took too long; a recap from verified facts is shown."
         if result is not None:
             return result
-        deterministic = await asyncio.to_thread(_deterministic_results, events, as_of)
-        fallback = self._fallback_recap_result(
-            info, events, as_of, deterministic, notice, attempt_count
+        fallback = await asyncio.to_thread(
+            self._fallback_recap_result, info, events, as_of, notice, attempt_count
         )
         return replace(fallback, timings=tuple(timings))
 
@@ -2086,11 +2219,10 @@ class PunditPipeline:
         info: MatchInfo,
         events: list[Event],
         as_of: int,
-        results: Sequence[ToolResult],
         notice: str,
         attempts: int,
     ) -> RecapResult:
-        recap = _fallback_recap(results, events, as_of, notice=notice)
+        recap, results = _fallback_recap(info, events, as_of, notice=notice)
         report = check_evidence(
             recap,
             events=events,
@@ -2134,12 +2266,10 @@ class PunditPipeline:
             ],
         )
         if not report.passed:
-            deterministic = _deterministic_results(events, as_of)
             return self._fallback_recap_result(
                 info,
                 events,
                 as_of,
-                deterministic,
                 "The cached recap is not valid at this replay point; verified facts are shown.",
                 0,
             )

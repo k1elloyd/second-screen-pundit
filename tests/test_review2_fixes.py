@@ -230,9 +230,18 @@ def test_snapshot_headline_facts_ground_the_answer_without_being_listed(
     )
 
     assert result.source == "agent", result.evidence.failures
-    assert [claim.text for claim in result.explanation.claims] == [
-        "Port Calder FC players on the pitch: 10 players."
-    ]
+    # Session B: the claims are the facts the answer used, the model's own citation first,
+    # not only the ones it listed.
+    claims = [claim.text for claim in result.explanation.claims]
+    assert claims[0] == "Port Calder FC players on the pitch: 10 players."
+    assert sorted(claims[1:]) == sorted(
+        [
+            "Match-level score: 1-0.",
+            "Port Calder FC formation: 4-4-1.",
+            "Port Calder FC formation before the change: 4-2-3-1.",
+            "Port Calder FC red card: red card.",
+        ]
+    )
 
 
 def test_snapshot_window_is_a_minute_range_not_a_score_and_stats_need_no_listing(
@@ -262,7 +271,11 @@ def test_snapshot_window_is_a_minute_range_not_a_score_and_stats_need_no_listing
     )
 
     assert result.source == "agent", result.evidence.failures
-    assert result.explanation.claims == []
+    # Session B: the two stats the answer used are cited, though the model listed none.
+    assert [claim.text for claim in result.explanation.claims] == [
+        "Merehaven Athletic possession: 55.8 %.",
+        "Merehaven Athletic shots: 27 shots.",
+    ]
 
 
 def test_question_retries_after_an_exception_with_the_parse_error_as_feedback(

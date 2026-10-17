@@ -435,3 +435,25 @@ There are no penalty events in the data, so penalties have no tier yet.
 
 - **Server.** The dispatcher's `on_line_ready` hook starts TTS as soon as a line passes its checks, while it waits out the broadcast delay. If the audio is ready at release, the `commentary` event carries `audio_id`; otherwise the text goes at once and `commentary_audio` follows.
 - **Browser.** One `Audio` element, unlocked with a silent clip inside the Start click. Lines play in order with no per-line player. At most one line waits behind the one playing, and a line's audio is dropped if it hasn't started 12 s after its text arrived. Answers, the recap and "▶ Replay" go to the front without cutting off the current line. Mute clears the queue and is kept in `localStorage`. Pause and Resume also pause and resume the queue. If the unlock failed, an "Enable audio" button appears.
+
+## Phase 3 Session B, group 2: trust and accuracy
+
+### Q&A citations
+
+Phase 3 cited every snapshot fact for every answer. Now an answer cites only:
+- the facts from the model's own tool calls that it listed, and
+- for each number, score, formation or minute in the answer, the snapshot fact the evidence check matched to it. If the model listed one of the matching facts, that one is used. The check now returns this as `EvidenceReport.grounding`.
+
+How it works: the answer is first checked against every snapshot fact, as before, so the pass rate doesn't change. Then the citations are narrowed to the facts that were used, and the narrowed answer is checked again. If the narrowed answer ever failed, the passing answer would be kept and `question_citation_narrowing_failed` logged; no test produces this. The claims list and event IDs follow the narrowed facts. An answer that uses one stat cites exactly that fact, whatever the model listed, and an answer with no numbers cites nothing. Most specific mentions are handled first, so a minute window such as `59-75'` is covered by the fact already kept for its number rather than adding the other team's fact.
+
+### Recap
+
+- **No raw xG.** The recap prompt no longer carries xG facts. A new deterministic `chance_summary` gives each team's big-chance count, its xG rounded half up to whole expected goals ("about 4 expected goals"), and "the better of the chances" for the team with more xG. The check fails any recap text with an xG decimal or any number with two or more decimal places, and the retry says what to write instead.
+- **Headline.** The server rejects a headline without the winner-first `score_phrase` and retries with it named.
+- **Fallback recap.** It is written from the full-time snapshot. The headline is "Merehaven Athletic win 2-1 at Saltmere Park". The summary tells every red card and the latest goals in order, from each moment's description, then "Merehaven Athletic had the better of the chances, with about 4 expected goals." Key moments are the red cards, then the latest goals. "The consolation" becomes "a goal back" at full time, since the team may have come back (m01). It passes the evidence check on all three matches.
+- **Cached recaps.** Headlines reworded to include the score phrase ("Ashbridge Rovers win 3-2 with a late comeback").
+
+### Timing
+
+- **No line before its event** (review 2 finding 9). `publish_outcome` waits on the session's `release_condition` until the viewer stream has released the line's `as_of` event. A test that slows the viewer loop fails without this wait.
+- **Pause is immediate** (finding 10). `BroadcastDelay.pause()` holds every release, events and lines alike. `resume()` pushes each unreleased release time back by the pause (for an event that arrived mid-pause, by the rest of the pause), so the 10 s delay is kept. `/control` calls them when the replay's state becomes paused or running. Arrival stamps are unchanged, so latency figures don't change.

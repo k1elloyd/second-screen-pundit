@@ -42,7 +42,9 @@ _XG_DECIMAL = re.compile(
     r"|\b\d+\.\d+\b[^.!?]{0,32}\b(?:xg|expected goals)\b",
     re.IGNORECASE,
 )
-_SHIRT_NUMBER_PREFIX = re.compile(r"(?:\bNo\.\s*|#)\s*$", re.IGNORECASE)
+# A recap shows no raw xG: any number with two or more decimal places is one.
+_LONG_DECIMAL = re.compile(r"\d\.\d{2,}")
+_SHIRT_NUMBER_PREFIX =re.compile(r"(?:\bNo\.\s*|#)\s*$", re.IGNORECASE)
 _SCALES = {"thousand": 1e3, "million": 1e6, "billion": 1e9}
 _NUMBER_WORDS = {
     "zero": 0,
@@ -76,6 +78,9 @@ class NumberMention:
 class EvidenceReport:
     passed: bool
     failures: tuple[str, ...]
+    # One entry per grounded mention (a number, score, formation or minute), in text order:
+    # the IDs of the cited facts that ground it. Callers use it to cite only what was used.
+    grounding: tuple[tuple[str, ...], ...] = ()
 
 
 Narrative: TypeAlias = CommentaryLine | DirectorDecision | Insight | Explanation | Recap
@@ -208,6 +213,8 @@ def _metric_mentioned(fact: Fact, text: str) -> bool:
         (("match-level clock",), ("minute",)),
         (("shots on target", "on target"), ("on target",)),
         (("best chance",), ("best chance",)),
+        (("big chances",), ("big chances", "clear chances")),
+        (("expected goals, rounded",), ("expected goals",)),
         (("progressive passes", "progressive pass"), ("progressive pass", "progressive passes")),
         (("passing pair",), ("passing pair", "passes")),
         (("defensive actions per minute",), ("defensive actions", "pressing")),
@@ -308,6 +315,7 @@ def _score_matches(
     text: str,
     cited_facts: list[Fact],
     info: MatchInfo | None,
+    grounding: list[tuple[str, ...]] | None = None,
 ) -> list[str]:
     scores = [
         (fact, str(fact.value))
@@ -318,7 +326,7 @@ def _score_matches(
     for match in _SCORE.finditer(text):
         found = (int(match.group("home")), int(match.group("away")))
         accepted = False
-        for _, raw_score in scores:
+        for score_fact, raw_score in scores:
             score_match = re.fullmatch(r"\s*(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*", raw_score)
             if score_match is None:
                 continue
@@ -344,6 +352,8 @@ def _score_matches(
                 break
         if not accepted:
             failures.append(f"score {match.group(0)!r} does not match a cited score fact")
+        elif grounding is not None:
+            grounding.append((score_fact.fact_id,))
     return failures
 
 
@@ -351,9 +361,10 @@ def _formation_matches(
     text: str,
     cited_facts: list[Fact],
     info: MatchInfo | None,
+    grounding: list[tuple[str, ...]] | None = None,
 ) -> list[str]:
-    formations = [
-        str(fact.value)
+    formation_facts = [
+        fact
         for fact in cited_facts
         if "formation" in fact.label.casefold()
         and isinstance(fact.value, str)
@@ -361,15 +372,27 @@ def _formation_matches(
     ]
     failures: list[str] = []
     for match in _FORMATION.finditer(text):
-        if match.group(0) not in formations:
+        matched = tuple(
+            fact.fact_id for fact in formation_facts if str(fact.value) == match.group(0)
+        )
+        if not matched:
             failures.append(f"formation {match.group(0)!r} does not match a cited formation fact")
+        elif grounding is not None:
+            grounding.append(matched)
     for match in _BACK_LINE.finditer(text):
         raw_count = match.group("count").casefold()
         count = _NUMBER_WORDS.get(raw_count)
         if count is None:
             count = int(raw_count)
-        if not any(formation.split("-", 1)[0] == str(count) for formation in formations):
+        matched = tuple(
+            fact.fact_id
+            for fact in formation_facts
+            if str(fact.value).split("-", 1)[0] == str(count)
+        )
+        if not matched:
             failures.append(f"{match.group(0)!r} does not match a cited formation fact")
+        elif grounding is not None:
+            grounding.append(matched)
     return failures
 
 
@@ -402,6 +425,7 @@ def check_evidence(
     failures: list[str] = [
         f"duplicate fact_id within run: {fact_id}" for fact_id in duplicate_ids
     ]
+    grounded: list[tuple[str, ...]] = []
     supplied_event_ids = set(input_event_ids) | {
         event_id
         for result in tool_results
@@ -483,23 +507,31 @@ def check_evidence(
                 )
         if isinstance(output, CommentaryLine) and _XG_DECIMAL.search(text):
             failures.append("CommentaryLine must not state xG or expected-goals decimals")
+        if isinstance(output, Recap) and (_XG_DECIMAL.search(text) or _LONG_DECIMAL.search(text)):
+            failures.append("recap must not state xG decimals")
         cited_facts = [facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id]
         # Answers and recaps may give the minute of an event they cite (spec: "or the minute
         # of a cited event"), or a minute in a cited fact's label, such as its window
         # 59-75'. Live lines keep the stricter clock-fact rule.
-        cited_minutes: set[float] = set()
+        # Each cited minute maps to the cited facts that carry it (through an event or the
+        # label); a minute from an event ID cited directly maps to no fact.
+        cited_minutes: dict[float, list[str]] = {}
         if isinstance(output, Explanation | Recap):
-            cited_minutes = {
-                float(event.minute + event.added_minute)
-                for event_id in [*event_ids, *(i for fact in cited_facts for i in fact.event_ids)]
-                if (event := event_by_id.get(event_id)) is not None and event.seq <= as_of
-            } | {
-                float(minute)
-                for fact in cited_facts
-                for match in _LABEL_MINUTES.finditer(fact.label)
-                for minute in match.groups()
-                if minute is not None
-            }
+            for event_id in event_ids:
+                event = event_by_id.get(event_id)
+                if event is not None and event.seq <= as_of:
+                    cited_minutes.setdefault(float(event.minute + event.added_minute), [])
+            for fact in cited_facts:
+                for event_id in fact.event_ids:
+                    event = event_by_id.get(event_id)
+                    if event is not None and event.seq <= as_of:
+                        cited_minutes.setdefault(
+                            float(event.minute + event.added_minute), []
+                        ).append(fact.fact_id)
+                for match in _LABEL_MINUTES.finditer(fact.label):
+                    for minute in match.groups():
+                        if minute is not None:
+                            cited_minutes.setdefault(float(minute), []).append(fact.fact_id)
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             score_spans = list(_SCORE.finditer(sentence))
             formation_spans = list(_FORMATION.finditer(sentence))
@@ -515,8 +547,10 @@ def check_evidence(
                 if number.value in cited_minutes and _is_minute_mention(
                     sentence, number, number_end
                 ):
+                    grounded.append(tuple(dict.fromkeys(cited_minutes[number.value])))
                     continue
                 grounding = _grounding_facts(number, sentence, cited_facts, info=info)
+                grounded.append(tuple(fact.fact_id for fact in grounding))
                 if not grounding:
                     failures.append(f"ungrounded number {number.text!r}")
                 elif all(fact.unit == "%" for fact in grounding) and not _PERCENT_AFTER.match(
@@ -525,8 +559,12 @@ def check_evidence(
                     failures.append(
                         f"percentage {number.text!r} must be spoken with % or per cent"
                     )
-        failures.extend(_score_matches(text, cited_facts, info))
-        failures.extend(_formation_matches(text, cited_facts, info))
+        failures.extend(_score_matches(text, cited_facts, info, grounded))
+        failures.extend(_formation_matches(text, cited_facts, info, grounded))
 
     unique_failures = tuple(dict.fromkeys(failures))
-    return EvidenceReport(passed=not unique_failures, failures=unique_failures)
+    return EvidenceReport(
+        passed=not unique_failures,
+        failures=unique_failures,
+        grounding=tuple(group for group in grounded if group),
+    )

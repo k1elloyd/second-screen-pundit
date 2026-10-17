@@ -119,5 +119,8 @@ RECAP_INSTRUCTIONS = (
     "description, for example 'Port Calder lead 2-0', never a phrase such as two-goal "
     "deficit. Name the team in every sentence with a statistic, one team per number; never "
     "write both teams or neither side with a number.\n"
+    "CHANCES. Never write xG or an xG decimal. Say which team had the better of the chances, "
+    "or give a big-chances count, or 'about N expected goals' from a rounded fact, with "
+    "that team named.\n"
     + _GROUNDING_RULES
 )

@@ -854,6 +854,45 @@ def match_snapshot(
     return results
 
 
+def chance_summary(events: list[Event], *, as_of: int) -> ToolResult:
+    """The chances each team had, in words a viewer can hear: never an xG decimal.
+
+    Per team: the count of big chances (the one big-chance rule) and the match xG rounded half
+    up to a whole number of expected goals ("about 4 expected goals"). The team with more xG
+    also gets the live commentary's wording, "the better of the chances".
+    """
+    visible = _visible(events, as_of)
+    if not visible:
+        raise ValueError("chance_summary requires at least one visible event")
+    latest = max(visible, key=lambda event: event.seq)
+    clock = latest.minute + latest.added_minute
+    shots = [event for event in visible if event.type == "shot"]
+    xg: dict[Team, float] = {}
+    facts: list[Fact] = []
+    for team in ("home", "away"):
+        name = _team_name(visible, team)
+        team_shots = [event for event in shots if event.team == team]
+        big = [event for event in team_shots if is_big_chance(event.xg)]
+        xg[team] = sum(event.xg or 0 for event in team_shots)
+        rounded = int(Decimal(str(round(xg[team], 3))).quantize(Decimal("1"), ROUND_HALF_UP))
+        facts.extend([
+            _fact("chance_summary", f"{name} big chances through {clock}'", len(big), "big chances", big),
+            _fact("chance_summary", f"{name} expected goals, rounded, through {clock}'", rounded, "expected goals", team_shots),
+        ])
+    if xg["home"] != xg["away"]:
+        leader: Team = "home" if xg["home"] > xg["away"] else "away"
+        facts.append(
+            _fact(
+                "chance_summary",
+                f"{_team_name(visible, leader)} chance quality through {clock}'",
+                "the better of the chances",
+                None,
+                [event for event in shots if event.team == leader],
+            )
+        )
+    return ToolResult(tool="chance_summary", facts=facts)
+
+
 TOOL_PARAMETERS: dict[str, type[BaseModel]] = {
     "match_state": MatchStateParams,
     "possession_window": PossessionWindowParams,

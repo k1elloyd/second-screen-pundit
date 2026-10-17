@@ -387,6 +387,12 @@ def create_app(
         line = outcome.result.line
         if line is None:
             return
+        # A line never reaches the viewer before its event: wait for the viewer stream, not
+        # only for the delay, since the two release loops can wake in either order.
+        async with session.release_condition:
+            await session.release_condition.wait_for(
+                lambda: session.viewer_released_as_of >= outcome.event.seq
+            )
         public_line_id = f"{session.replay_id}-{line.line_id}"
         public_line = line.model_copy(update={"line_id": public_line_id})
         events_by_id = {event.event_id: event for event in session.events}
@@ -701,6 +707,11 @@ def create_app(
         if action not in {"pause", "resume"}:
             raise HTTPException(status_code=422, detail="Action must be pause or resume.")
         state = await session.replay.control(action)
+        # The viewer's delayed stream pauses with the replay, so nothing more arrives.
+        if state == "paused":
+            session.delay.pause()
+        elif state == "running":
+            session.delay.resume()
         return {"replay_id": replay_id, "state": state}
 
     async def answer(
