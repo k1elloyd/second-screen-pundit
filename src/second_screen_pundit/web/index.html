@@ -2,139 +2,149 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- resizes-content: on Android the layout shrinks above the on-screen keyboard. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#07131c">
   <title>Second Screen Pundit</title>
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <header class="masthead">
-    <a class="brand" href="/" aria-label="Second Screen Pundit home">
-      <span class="brand-mark">SS</span>
-      <span>SECOND SCREEN <b>PUNDIT</b></span>
-    </a>
-    <div class="warm-status" id="warm-status" role="status" aria-live="polite">
-      <span class="status-dot"></span><span>Pundit warming up…</span>
-    </div>
-  </header>
+  <div class="app-shell" id="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Second Screen Pundit home">
+        <span class="brand-mark">SS</span>
+        <span class="brand-name">SECOND SCREEN <b>PUNDIT</b></span>
+      </a>
+      <section class="scoreboard" aria-label="Scoreboard">
+        <span class="team-name team-home" id="home-name">Home</span>
+        <div class="score-center">
+          <div class="scoreline"><span id="home-score">0</span><i>–</i><span id="away-score">0</span></div>
+          <div class="match-clock"><span class="live-light" id="live-light"></span><span id="clock">PRE-MATCH</span></div>
+        </div>
+        <span class="team-name team-away" id="away-name">Away</span>
+      </section>
+      <div class="warm-status" id="warm-status" role="status" aria-live="polite">
+        <span class="status-dot"></span><span>Pundit warming up…</span>
+      </div>
+    </header>
 
-  <main class="page-shell">
     <section class="control-bar" aria-label="Match controls">
-      <div class="picker">
-        <label for="match-picker">Choose a fixture</label>
-        <select id="match-picker" disabled></select>
-      </div>
-      <div class="speed-picker">
-        <label for="speed-picker">Replay speed</label>
-        <select id="speed-picker">
-          <option value="1">1×</option>
-          <option value="5">5×</option>
-          <option value="10">10×</option>
-          <option value="20" selected>20×</option>
-          <option value="60">60×</option>
-        </select>
-      </div>
+      <label class="sr-only" for="match-picker">Choose a fixture</label>
+      <select id="match-picker" class="match-picker" disabled></select>
+      <label class="sr-only" for="speed-picker">Replay speed</label>
+      <select id="speed-picker" class="speed-picker" title="Replay speed">
+        <option value="1">1×</option>
+        <option value="5">5×</option>
+        <option value="10">10×</option>
+        <option value="20" selected>20×</option>
+        <option value="60">60×</option>
+      </select>
       <button class="button button-primary" id="start-button" disabled>Start replay</button>
-      <div class="control-spacer"></div>
       <button class="button button-quiet" id="pause-button" disabled>Pause</button>
       <button class="button button-quiet" id="resume-button" disabled>Resume</button>
+      <span class="live-tag" id="live-tag">STANDBY</span>
+      <div class="control-spacer"></div>
+      <button class="text-button" id="enable-audio" type="button" hidden>Enable audio</button>
+      <label class="toggle"><input id="mute-audio" type="checkbox"> Mute</label>
+      <label class="toggle toggle-soon" title="Crowd sound is coming soon">
+        <input id="crowd-audio" type="checkbox" disabled> Crowd <span class="soon">soon</span>
+      </label>
+      <button class="button button-quiet info-toggle" id="info-toggle" type="button"
+        aria-expanded="false" aria-controls="match-info">Match info</button>
     </section>
 
-    <section class="scoreboard" aria-label="Scoreboard">
-      <div class="score-team score-home">
-        <span class="team-label" id="home-team">HOME</span>
-        <span class="team-name" id="home-name">Select a fixture</span>
-      </div>
-      <div class="score-center">
-        <div class="scoreline"><span id="home-score">0</span><i>—</i><span id="away-score">0</span></div>
-        <div class="match-clock"><span class="live-light" id="live-light"></span><span id="clock">PRE-MATCH</span></div>
-      </div>
-      <div class="score-team score-away">
-        <span class="team-label">AWAY</span>
-        <span class="team-name" id="away-name">SECOND SCREEN</span>
-      </div>
-      <div class="fixture-caption" id="stadium"></div>
-    </section>
-
-    <div class="dashboard">
-      <section class="panel timeline-panel" aria-labelledby="timeline-title">
-        <div class="panel-heading">
-          <div><span class="eyebrow">ON THE PITCH</span><h2 id="timeline-title">Match timeline</h2></div>
-          <span class="live-tag" id="live-tag">STANDBY</span>
-        </div>
-        <ol class="timeline-list" id="timeline" aria-live="polite">
-          <li class="empty-state">The live event feed will appear here when the replay begins.</li>
-        </ol>
-      </section>
-
-      <section class="panel commentary-panel" aria-labelledby="commentary-title">
-        <div class="panel-heading">
-          <div><span class="eyebrow">FROM THE BOOTH</span><h2 id="commentary-title">Commentary</h2></div>
-          <div class="audio-controls">
-            <button class="text-button" id="enable-audio" type="button" hidden>Enable audio</button>
-            <label class="mute-toggle"><input id="mute-audio" type="checkbox"> Mute</label>
+    <main class="workspace">
+      <aside class="match-info" id="match-info" aria-label="Match info">
+        <section class="info-block pitch-block" aria-labelledby="pitch-title">
+          <div class="info-heading">
+            <h2 id="pitch-title">On the pitch</h2>
+            <span class="fixture-caption" id="stadium"></span>
           </div>
-        </div>
-        <div class="commentary-list" id="commentary" aria-live="polite">
-          <p class="empty-state">Commentary and audio will arrive with the match.</p>
-        </div>
-      </section>
+          <svg class="pitch" id="pitch" viewBox="0 0 105 68" role="img" aria-label="Pitch mini-map: latest event position">
+            <rect class="pitch-grass" x="0" y="0" width="105" height="68"/>
+            <g class="pitch-lines">
+              <rect x="1" y="1" width="103" height="66"/>
+              <line x1="52.5" y1="1" x2="52.5" y2="67"/>
+              <circle cx="52.5" cy="34" r="9.15"/>
+              <rect x="1" y="13.85" width="16.5" height="40.3"/>
+              <rect x="87.5" y="13.85" width="16.5" height="40.3"/>
+              <rect x="1" y="24.85" width="5.5" height="18.3"/>
+              <rect x="98.5" y="24.85" width="5.5" height="18.3"/>
+            </g>
+            <line class="pitch-trail" id="pitch-trail" x1="0" y1="0" x2="0" y2="0" style="display: none"/>
+            <circle class="pitch-ball" id="pitch-ball" cx="52.5" cy="34" r="1.8" style="display: none"/>
+          </svg>
+          <p class="pitch-caption" id="pitch-caption">Waiting for kick-off</p>
+          <div class="pitch-legend">
+            <span><i class="swatch swatch-home"></i><span id="legend-home">Home</span> attack →</span>
+            <span>← <span id="legend-away">Away</span> attack<i class="swatch swatch-away"></i></span>
+          </div>
+        </section>
 
-      <section class="panel ask-panel" aria-labelledby="ask-title">
-        <div class="panel-heading">
-          <div><span class="eyebrow">YOUR SECOND SCREEN</span><h2 id="ask-title">Ask the pundit</h2></div>
-          <span class="limit-note">6 questions / minute</span>
+        <section class="info-block" aria-labelledby="stats-title">
+          <div class="info-heading"><h2 id="stats-title">Formations and stats</h2></div>
+          <table class="stats-table">
+            <thead><tr><th scope="col" id="stats-home">Home</th><th scope="col"></th><th scope="col" id="stats-away">Away</th></tr></thead>
+            <tbody>
+              <tr><td id="formation-home">–</td><th scope="row">Formation</th><td id="formation-away">–</td></tr>
+              <tr><td id="shots-home">0</td><th scope="row">Shots</th><td id="shots-away">0</td></tr>
+              <tr><td id="target-home">0</td><th scope="row">On target</th><td id="target-away">0</td></tr>
+              <tr><td id="fouls-home">0</td><th scope="row">Fouls</th><td id="fouls-away">0</td></tr>
+              <tr><td id="cards-home">0</td><th scope="row">Cards</th><td id="cards-away">0</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section class="info-block moments-block" aria-labelledby="moments-title">
+          <div class="info-heading"><h2 id="moments-title">Key moments</h2></div>
+          <ol class="moments" id="key-moments" aria-live="polite">
+            <li class="empty-state">Goals, cards, substitutions and changes of shape appear here.</li>
+          </ol>
+        </section>
+      </aside>
+
+      <section class="feed-column" aria-label="Commentary and questions">
+        <div class="feed-wrap">
+          <div class="feed" id="commentary" role="log" aria-live="polite" tabindex="0">
+            <p class="empty-state" id="feed-empty">Commentary and audio will arrive with the match. The viewer feed runs on a short broadcast delay.</p>
+          </div>
+          <button class="new-lines-pill" id="new-lines" type="button" hidden>↓ New lines</button>
         </div>
-        <form id="ask-form">
-          <label class="sr-only" for="question-input">Ask a question about the match</label>
-          <textarea id="question-input" maxlength="300" rows="3" placeholder="Ask about the tactics, chances or turning points…" disabled></textarea>
-          <div class="ask-actions">
-            <button class="button button-quiet mic-button" id="mic-button" type="button" disabled aria-pressed="false">
-              <span aria-hidden="true">●</span> <span id="mic-label">Push to talk</span>
+        <form class="ask-bar" id="ask-form">
+          <div class="ask-row">
+            <label class="sr-only" for="question-input">Ask a question about the match</label>
+            <textarea id="question-input" maxlength="300" rows="1"
+              placeholder="Ask the pundit about this match…" disabled></textarea>
+            <button class="button button-quiet mic-button" id="mic-button" type="button" disabled aria-pressed="false" title="Push to talk">
+              <span aria-hidden="true">●</span> <span id="mic-label">Talk</span>
             </button>
-            <span class="character-count" id="character-count">0 / 300</span>
             <button class="button button-primary" id="ask-button" type="submit" disabled>Ask</button>
           </div>
+          <div class="ask-meta">
+            <p class="inline-message" id="ask-message" role="status" aria-live="polite"></p>
+            <span class="character-count" id="character-count">0 / 300</span>
+            <span class="limit-note">6 questions / minute</span>
+          </div>
+          <div class="ask-footer">
+            <span>All fixtures and players are fictional.</span>
+            <span id="connection-state">Waiting for a fixture</span>
+          </div>
         </form>
-        <p class="inline-message" id="ask-message" role="status" aria-live="polite"></p>
-        <div class="answer-card" id="answer-card" hidden>
-          <span class="eyebrow">PUNDIT'S ANSWER</span>
-          <p id="answer-text"></p>
-          <ul class="answer-claims" id="answer-claims" hidden></ul>
-          <p class="transcript" id="answer-transcript"></p>
-          <div class="audio-replay" id="answer-audio" hidden></div>
-        </div>
       </section>
-
-      <section class="panel recap-panel" id="recap-panel" aria-labelledby="recap-title" hidden>
-        <div class="panel-heading">
-          <div><span class="eyebrow">FULL TIME</span><h2 id="recap-title">The final word</h2></div>
-          <span class="full-time-tag">RECAP</span>
-        </div>
-        <h3 id="recap-headline"></h3>
-        <p id="recap-summary"></p>
-        <ol class="recap-moments" id="recap-moments"></ol>
-        <div class="audio-replay" id="recap-audio" hidden></div>
-        <p class="notice" id="recap-notice"></p>
-      </section>
-    </div>
-    <footer class="page-footer">
-      <span>All fixtures and players are fictional.</span>
-      <span id="connection-state">Waiting for a fixture</span>
-    </footer>
-  </main>
+    </main>
+  </div>
 
   <dialog id="evidence-dialog" class="evidence-dialog">
     <div class="dialog-heading">
-      <div><span class="eyebrow">SHOW YOUR WORK</span><h2>Line evidence</h2></div>
+      <div><span class="eyebrow">SHOW YOUR WORK</span><h2 id="evidence-title">Line evidence</h2></div>
       <button class="icon-button" id="close-evidence" aria-label="Close evidence">×</button>
     </div>
     <p class="evidence-line" id="evidence-line"></p>
     <div class="evidence-badge" id="evidence-badge"></div>
     <h3>Verified facts</h3>
     <ul id="evidence-facts"></ul>
-    <h3>Events behind the line</h3>
+    <h3>Events behind it</h3>
     <ul id="evidence-events"></ul>
   </dialog>
 </body>

@@ -776,7 +776,23 @@ def create_app(
                 ),
             )
         session = check_question_access(payload.replay_id, request)
-        return await answer(session, uuid4().hex, question, started)
+        question_id = uuid4().hex
+        result = await answer(session, question_id, question, started)
+        # The text goes back at once; the spoken answer follows on the replay's SSE stream,
+        # the same way as for a spoken question.
+        task = asyncio.create_task(speak_answer(session, question_id, result["explanation"]["answer"]))
+        session.question_tasks.add(task)
+        task.add_done_callback(session.question_tasks.discard)
+        return {**result, "audio_pending": True}
+
+    async def speak_answer(session: ReplaySession, question_id: str, text: str) -> None:
+        audio_id = await synthesize(session, text)
+        await session.queue.put(
+            (
+                "answer_audio" if audio_id is not None else "answer_audio_unavailable",
+                {"question_id": question_id, "audio_id": audio_id},
+            )
+        )
 
     async def answer_spoken(
         session: ReplaySession,
@@ -813,13 +829,7 @@ def create_app(
             )
             return
         await session.queue.put(("answer", {**payload, "audio_pending": True}))
-        audio_id = await synthesize(session, payload["explanation"]["answer"])
-        await session.queue.put(
-            (
-                "answer_audio" if audio_id is not None else "answer_audio_unavailable",
-                {"question_id": question_id, "audio_id": audio_id},
-            )
-        )
+        await speak_answer(session, question_id, payload["explanation"]["answer"])
 
     @app.post("/api/ask-audio", status_code=202)
     async def ask_audio(

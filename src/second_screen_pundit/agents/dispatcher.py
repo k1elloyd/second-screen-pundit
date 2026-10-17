@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from second_screen_pundit.agents.config import AgentSettings
@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 BoundaryDecision = Literal["no_signal", "held_cooldown", "held_in_flight", "dispatched"]
 OutcomeHandler = Callable[["WindowOutcome"], object]
+# Results that carry a line for the viewer: written live, or pre-generated in cached mode.
+LINE_STATUSES = frozenset({"commentary", "cached"})
+
+
+def _has_line(result: LiveWindowResult | None) -> bool:
+    return result is not None and result.status in LINE_STATUSES and result.line is not None
 
 
 @dataclass
@@ -77,6 +83,9 @@ class LiveDispatcher:
         self._generation = 0
         self._in_flight = 0
         self._recent_lines: list[str] = []
+        # Lines already sent. In cached mode a pre-generated line can match two windows (the
+        # goal's fast path and the next tactical window, which holds the goal's shot).
+        self._published_line_ids: set[str] = set()
         # Formation changes the fast path has announced; the tactical lane skips their signal,
         # so each change is heard once.
         self._announced_formations: set[str] = set()
@@ -224,7 +233,7 @@ class LiveDispatcher:
             await self._run(outcome, window, signals, lambda: self._generation != generation)
         finally:
             self._in_flight -= 1
-        if outcome.result is not None and outcome.result.status == "commentary":
+        if _has_line(outcome.result):
             self._last_line_minute = now
 
     async def _run(
@@ -245,8 +254,17 @@ class LiveDispatcher:
                 is_stale=is_stale,
                 recent_lines=tuple(self._recent_lines[-RECENT_LINES_FOR_COMMENTATOR:]),
             )
-            if outcome.result.status == "commentary" and outcome.result.line is not None:
-                self._recent_lines.append(outcome.result.line.text)
+            line = outcome.result.line if _has_line(outcome.result) else None
+            if line is not None and line.line_id in self._published_line_ids:
+                outcome.result = replace(
+                    outcome.result,
+                    status="skipped",
+                    line=None,
+                    notice="This line was already published for an earlier window.",
+                )
+            elif line is not None:
+                self._published_line_ids.add(line.line_id)
+                self._recent_lines.append(line.text)
         except Exception as exc:  # noqa: BLE001 - one failed window must not stop the replay
             outcome.error = f"{type(exc).__name__}: {str(exc)[:160]}"
             logger.warning(
@@ -256,18 +274,9 @@ class LiveDispatcher:
                 type(exc).__name__,
             )
         outcome.elapsed_ms = round((time.monotonic() - started) * 1000)
-        if (
-            self.on_line_ready is not None
-            and outcome.result is not None
-            and outcome.result.status == "commentary"
-            and outcome.result.line is not None
-        ):
+        if self.on_line_ready is not None and _has_line(outcome.result):
             self.on_line_ready(outcome)
-        if (
-            self.delay is not None
-            and outcome.result is not None
-            and outcome.result.status == "commentary"
-        ):
+        if self.delay is not None and _has_line(outcome.result):
             seen = self.delay.seen_at(outcome.event.seq)
             outcome.ready_after_event_ms = round((time.monotonic() - seen) * 1000)
             outcome.released_late_ms = round(

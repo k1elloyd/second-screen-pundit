@@ -370,7 +370,7 @@ Scope: findings 1, 2, 3, 4 (items 1–4), 6 (prompt and ID validation) and 15 of
 - **Explainer reply.** The model returns `ExplainerReply { answer, fact_ids }` only. Facts are shown to it as short aliases (`F1`…), including tool results (the capture middleware restores the real IDs). The server maps aliases back, derives event IDs from the cited facts, and lists the cited facts as deterministic claims. `xg_timeline` is not offered to the Explainer.
 - **Snapshot facts are cited by the server.** Every snapshot fact given to the Explainer or the Recap Producer is cited for its output, as the live Analyst path does for the score. The spec grounds a number in "this run's tool results", and the models listed the facts they used unreliably: in live runs an answer stated the score and previous formation without their IDs, and a recap quoted shot counts and xG without theirs. The number check is unchanged: a matching value, with the team and metric named in the same sentence. Facts from tool calls the model makes must still be cited by the model.
 - **Caps and budget.** `reasoning.effort: low` for both. Explainer `max_tokens` 1,500; Recap 2,500 (one recap hit 1,500 and stopped with `finish_reason=length`; a later one used 1,576). `finish_reason` is logged per call and returned in each answer payload. `EXPLAINER_TIMEOUT_SECONDS` is 20 and `LIVE_WINDOW_TIMEOUT_SECONDS` 15 again (the spec values). An exception now retries once, with the parse error as feedback.
-- **Text before audio.** `/api/ask` returns the checked text at once (no TTS, as before). `/api/ask-audio` returns `202 {question_id, transcript}` as soon as speech-to-text finishes; the answer follows on the replay's SSE stream as `answer`, then its audio as `answer_audio` (or `answer_audio_unavailable` / `answer_error`). The 30-second limit covers STT plus the answer.
+- **Text before audio.** `/api/ask` returns the checked text at once (no TTS, as before; *changed in Session B, see "App shell": typed answers are now spoken too*). `/api/ask-audio` returns `202 {question_id, transcript}` as soon as speech-to-text finishes; the answer follows on the replay's SSE stream as `answer`, then its audio as `answer_audio` (or `answer_audio_unavailable` / `answer_error`). The 30-second limit covers STT plus the answer.
 - **Out of scope.** A question with betting terms or a denylisted real name gets a fixed reply with no model call.
 - **Content filter.** It blocks only the hashed real-name denylist (possessives folded) and betting terms ("odds", except "against the odds"/"against all odds"; "stakes" no longer matches). The capitalised-word heuristic is gone. It runs only on the model-written answer, never on notices or deterministic fact text. Viewer-facing notices and errors no longer contain exception class names.
 - **Formation reset.** The 46' kick-off carries no formation, and `_formation_at` reads only the period-1 kick-off, so stale event logs are also correct. m02's home formation at 60' is 4-4-1.
@@ -505,3 +505,34 @@ m01 has no red card, so the red-card style was checked on m02.
 - **Red card heard twice.** In m02 the fast path and the mandatory tactical signal each produced a red-card line, 0.3 s apart (review 2 finding 14).
 - **Minutes still spoken as numbers.** Agent lines still say "At 21 minutes" and "24 minutes left". Spoken text reads them correctly, but they're repetitive.
 - **Missing full stop.** One line ended "The score is level at 0-0" without one.
+
+## Phase 3 Session B: app shell
+
+### Layout
+
+- **One fixed screen.** The page no longer scrolls. The shell fills the viewport height (`100dvh`). The scoreboard and controls stay at the top, only the feed scrolls, and the ask bar is pinned beneath the feed.
+- **Breakpoint at 1024px.** From 1024px wide, two columns: match info on the left (about 40%: pitch mini-map, formations and stats, key moments) and the feed on the right (about 60%). Below 1024px, one column, with match info in a collapsible "Match info" drawer that opens over the feed. 1024px is the narrowest width at which a 40% column still fits the pitch and the stats table side by side with a readable feed.
+- **Key moments scroll inside their own box.** The list grows all match and can't fit beside the pitch and stats on a 768px-tall screen, so it is the one scroller outside the feed. On short desktop screens (860px tall or less) the pitch shrinks, so about five moments stay visible at 1366×768.
+- **Feed.** Newest at the bottom. It follows the newest line only when the viewer is within 80px of the bottom; otherwise a "↓ New lines" pill appears. The "following" state survives resizes, the drawer and the keyboard.
+- **Q&A in the feed.** "YOU ASKED", then "Thinking…", replaced by the answer card with Why? and Replay. An answer's Why? is built from its own payload and the events the page has already received, so it needs no API call.
+- **Mini-map.** An SVG pitch showing the latest event's position, and its pass or carry end, in the team's colour. Away coordinates are flipped for display, as the spec says. It uses event data only.
+- **Shortcuts.** `/` focuses the ask box (not from inside another text field). Enter sends; Shift+Enter starts a new line.
+- **Crowd.** A disabled toggle marked "soon"; there is no crowd audio.
+
+### Phone keyboard
+
+- **Android Chrome.** The viewport meta has `interactive-widget=resizes-content`, so the layout viewport shrinks above the keyboard and the `100dvh` shell shrinks with it.
+- **iOS Safari.** The keyboard overlays the page and only the visual viewport shrinks. `app.js` listens to `visualViewport` resize and scroll and sets the shell height to `visualViewport.height`, translated by `offsetTop`, so the ask bar sits on the keyboard's top edge.
+- **How it was checked.** Both cases were checked in Playwright Chromium: a 390×510 viewport with the box focused (Android model), and a stubbed 510px visual viewport inside an 844px page, with and without a 40px `offsetTop` (iOS model). The ask bar ended at the keyboard edge each time. No real device has been tested yet.
+- **Screenshots** are in `docs/screenshots/app-shell/`, taken against the current code in cached mode.
+
+### Typed answers are spoken (changes the Phase 3 note)
+
+`/api/ask` still returns the checked text at once, now with `audio_pending: true`. It then synthesises the answer in the background and sends `answer_audio` (or `answer_audio_unavailable`) over the replay's SSE stream, with the same `question_id`, exactly as a spoken question does. The page plays it through the same audio queue, so it follows Mute and jumps the queue like a spoken answer, and the answer card gets a Replay button.
+
+### Cached mode published lines twice (fixed)
+
+Cached mode is what viewers get when the spending guard switches the site to `NARRATIVE_MODE=cached`.
+- **Cause.** For each window, cached mode picks the first pre-generated line that cites any event in the window. Two windows can match one line: a goal's fast-path window, and the next tactical window, which holds the goal's linked shot (the shot is not must-say, so it falls into the tactical window). Nothing recorded which lines had gone out, so the line was published twice under one `line_id`. A dry run published 11 lines for 8 distinct in m01 (3 repeated), 7 for 5 in m02 (2 repeated) and 4 for 3 in m03 (1 repeated).
+- **Second problem.** The dispatcher treated only status `"commentary"` as a line, and cached results have status `"cached"`. Cached lines therefore skipped early audio, the broadcast-delay bookkeeping and the recent-lines memory. With both copies sharing one ID, the page attached audio to the first card only, so the second stayed on "Preparing audio…".
+- **Fix.** The dispatcher counts both statuses as lines, and keeps the set of published `line_id`s; a repeat becomes `skipped`. `tests/test_cached_mode.py` checks that each line is published once on all three matches, and that every cached line gets early audio. Both checks failed before the fix.

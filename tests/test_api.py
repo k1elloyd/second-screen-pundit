@@ -176,6 +176,45 @@ def test_spoken_question_uses_the_same_viewer_cutoff_and_returns_server_audio() 
     assert audio.content == b"stub-mp3"
 
 
+def test_typed_answer_text_returns_at_once_and_its_audio_follows_on_sse() -> None:
+    events = generate_match("m02")
+    goal = next(event for event in events if event.type == "goal")
+    pipeline = _GoalCutoffPipeline(goal.seq)
+    synthesizer = _SynthesisStub()
+    app = create_app(
+        settings=_settings(),
+        pipeline=pipeline,  # type: ignore[arg-type]
+        speech_recognizer=_SpeechStub(),  # type: ignore[arg-type]
+        speech_synthesizer=synthesizer,  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as client:
+        session = _session("typed-audio-replay", goal_seq=goal.seq, released_as_of=goal.seq)
+        app.state.sessions[session.replay_id] = session
+        response = client.post(
+            "/api/ask",
+            json={"replay_id": session.replay_id, "question": "Has a goal been scored?"},
+            headers={"X-Forwarded-For": "198.51.100.24"},
+        )
+        body = response.json()
+
+        async def next_item() -> tuple[str, dict]:
+            item = await asyncio.wait_for(session.queue.get(), timeout=5)
+            assert item is not None
+            return item
+
+        audio_name, audio_event = client.portal.call(next_item)
+        audio = client.get(f"/api/audio/{audio_event['audio_id']}")
+
+    assert response.status_code == 200
+    assert "goal is visible" in body["explanation"]["answer"]
+    assert body["audio_pending"] is True
+    assert body["audio_id"] is None
+    assert audio_name == "answer_audio"
+    assert audio_event["question_id"] == body["question_id"]
+    assert audio.content == b"stub-mp3"
+
+
 def _denylist(monkeypatch, name: str) -> None:
     """Add a fictional name to the hashed denylist, so no real name appears in the tests."""
     fingerprints = {

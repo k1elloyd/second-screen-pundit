@@ -2,6 +2,11 @@ const el = (id) => document.getElementById(id);
 const tabId = sessionStorage.getItem("pundit-tab-id") || crypto.randomUUID();
 sessionStorage.setItem("pundit-tab-id", tabId);
 
+const KEY_EVENT_TYPES = ["goal", "card", "substitution", "formation_change", "half_time", "full_time"];
+// The feed auto-scrolls only when the viewer is this close to the newest line.
+const STICK_TO_BOTTOM_PX = 80;
+const MAX_FEED_CARDS = 200;
+
 const state = {
   warmup: "warming",
   replayId: null,
@@ -10,11 +15,21 @@ const state = {
   replayComplete: false,
   score: { home: 0, away: 0 },
   events: 0,
+  eventsById: new Map(),
+  stats: null,
   recording: null,
-  pendingQuestionId: null,
+  // question_id -> the answer card waiting for a spoken question's answer over SSE.
+  pendingAnswers: new Map(),
   questionAudioSeconds: 15,
   questionAudioBytes: 1_000_000,
+  questionLimit: 300,
 };
+
+function freshStats() {
+  const side = () => ({ shots: 0, target: 0, fouls: 0, cards: 0, formation: "–" });
+  return { home: side(), away: side() };
+}
+state.stats = freshStats();
 
 function showMessage(target, text, isError = false) {
   target.textContent = text || "";
@@ -28,6 +43,13 @@ async function responseJson(response) {
     throw new Error(message);
   }
   return body;
+}
+
+function make(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
 }
 
 async function loadMatches() {
@@ -49,8 +71,10 @@ async function loadMatches() {
 function updateMatchLabels() {
   const selected = [...el("match-picker").options].find((item) => item.selected);
   if (!selected) return;
-  el("home-name").textContent = selected.dataset.home || "Home";
-  el("away-name").textContent = selected.dataset.away || "Away";
+  const home = selected.dataset.home || "Home";
+  const away = selected.dataset.away || "Away";
+  for (const id of ["home-name", "stats-home", "legend-home"]) el(id).textContent = home;
+  for (const id of ["away-name", "stats-away", "legend-away"]) el(id).textContent = away;
   el("stadium").textContent = selected.dataset.stadium || "";
 }
 
@@ -59,11 +83,11 @@ async function checkWarmup() {
     const health = await responseJson(await fetch("/healthz", { cache: "no-store" }));
     state.warmup = health.warmup;
     const limits = health.limits || {};
-    const questionLimit = limits.question_characters || 300;
+    state.questionLimit = limits.question_characters || 300;
     state.questionAudioSeconds = limits.question_audio_seconds || 15;
     state.questionAudioBytes = limits.question_audio_bytes || 1_000_000;
-    el("question-input").maxLength = questionLimit;
-    el("character-count").textContent = `${el("question-input").value.length} / ${questionLimit}`;
+    el("question-input").maxLength = state.questionLimit;
+    updateCharacterCount();
     document.querySelector(".limit-note").textContent =
       `${limits.questions_per_minute || 6} questions / ${limits.question_rate_window_seconds || 60}s`;
     const status = el("warm-status");
@@ -73,7 +97,8 @@ async function checkWarmup() {
       health.warmup === "ready" ? "Pundit ready" :
       health.warmup === "failed" ? "Pundit unavailable — check server logs" :
       "Pundit warming up…";
-    el("match-picker").disabled = !health.ready || Boolean(state.replayId);
+    status.title = status.lastElementChild.textContent;
+    el("match-picker").disabled = !health.ready || (Boolean(state.replayId) && !state.replayComplete);
     el("start-button").disabled = !health.ready || (Boolean(state.replayId) && !state.replayComplete);
   } catch (error) {
     showMessage(el("connection-state"), error.message, true);
@@ -87,7 +112,7 @@ function eventText(event) {
     kickoff: "Kick-off",
     pass: event.outcome === "success" ? "completed a pass" : "misplaced a pass",
     carry: event.outcome === "success" ? "carried the ball forward" : "lost the ball in a carry",
-    shot: "had a shot",
+    shot: event.outcome === "success" ? "had a shot on target" : "had a shot",
     goal: "GOAL",
     save: "made a save",
     tackle: event.outcome === "success" ? "won a tackle" : "missed a tackle",
@@ -102,7 +127,83 @@ function eventText(event) {
   return `${team}${player}${labels[event.type] || event.type}`;
 }
 
+// Match info: formations, stats, key moments and the pitch mini-map, all from released events.
+
+function renderStats() {
+  for (const side of ["home", "away"]) {
+    const stats = state.stats[side];
+    el(`formation-${side}`).textContent = stats.formation;
+    el(`shots-${side}`).textContent = String(stats.shots);
+    el(`target-${side}`).textContent = String(stats.target);
+    el(`fouls-${side}`).textContent = String(stats.fouls);
+    el(`cards-${side}`).textContent = String(stats.cards);
+  }
+}
+
+function countEvent(event) {
+  const stats = event.team ? state.stats[event.team] : null;
+  if (!stats) return;
+  if (event.type === "shot") {
+    stats.shots += 1;
+    // For a shot, outcome "success" means on target (event schema).
+    if (event.outcome === "success") stats.target += 1;
+  }
+  if (event.type === "foul") stats.fouls += 1;
+  if (event.type === "card") stats.cards += 1;
+  if ((event.type === "kickoff" && event.period === 1) || event.type === "formation_change") {
+    if (event.detail.formation) stats.formation = event.detail.formation;
+  }
+}
+
+function addKeyMoment(event) {
+  if (!KEY_EVENT_TYPES.includes(event.type)) return;
+  const list = el("key-moments");
+  list.querySelector(".empty-state")?.remove();
+  const item = make("li", [event.team || "", event.type].join(" ").trim());
+  const clock = make("span", "moment-clock",
+    event.type === "half_time" ? "HT" : event.type === "full_time" ? "FT" : `${event.clock}'`);
+  item.append(clock, make("span", "moment-text", eventText(event)));
+  list.prepend(item);
+}
+
+// SVG elements have no `hidden` property, so visibility goes through `display`.
+function showSvg(node, visible) {
+  node.style.display = visible ? "" : "none";
+}
+
+// Coordinates are normalised so the acting team attacks towards x = 100; the away team's
+// are flipped for display so both teams share one pitch (home attacks left to right).
+function pitchPoint(x, y, team) {
+  const flip = team === "away";
+  return [(flip ? 100 - x : x) * 1.05, (flip ? 100 - y : y) * 0.68];
+}
+
+function renderPitch(event) {
+  if (event.x == null || event.y == null) return;
+  const team = event.team === "away" ? "away" : "home";
+  const [cx, cy] = pitchPoint(event.x, event.y, team);
+  const ball = el("pitch-ball");
+  ball.setAttribute("cx", cx.toFixed(2));
+  ball.setAttribute("cy", cy.toFixed(2));
+  ball.setAttribute("class", `pitch-ball ${team}`);
+  showSvg(ball, true);
+  const trail = el("pitch-trail");
+  if (event.end_x != null && event.end_y != null) {
+    const [ex, ey] = pitchPoint(event.end_x, event.end_y, team);
+    trail.setAttribute("x1", cx.toFixed(2));
+    trail.setAttribute("y1", cy.toFixed(2));
+    trail.setAttribute("x2", ex.toFixed(2));
+    trail.setAttribute("y2", ey.toFixed(2));
+    trail.setAttribute("class", `pitch-trail ${team}`);
+    showSvg(trail, true);
+  } else {
+    showSvg(trail, false);
+  }
+  el("pitch-caption").textContent = `${event.clock}' · ${eventText(event)}`;
+}
+
 function renderEvent(event) {
+  state.eventsById.set(event.event_id, event);
   if (event.type === "goal" && event.team) state.score[event.team] += 1;
   el("home-score").textContent = String(state.score.home);
   el("away-score").textContent = String(state.score.away);
@@ -114,23 +215,55 @@ function renderEvent(event) {
     el("live-tag").textContent = "ON AIR";
     el("live-tag").classList.add("on-air");
   }
-  const list = el("timeline");
-  if (state.events === 0) list.replaceChildren();
   state.events += 1;
-  const item = document.createElement("li");
-  item.className = `timeline-item${["goal", "card", "substitution", "formation_change", "half_time", "full_time"].includes(event.type) ? " key-event" : ""}`;
-  const time = document.createElement("span");
-  time.className = "event-clock";
-  time.textContent = `${event.clock}'`;
-  const description = document.createElement("span");
-  description.className = "event-description";
-  description.textContent = eventText(event);
-  item.append(time, description);
-  list.prepend(item);
-  while (list.children.length > 70) list.lastElementChild.remove();
+  countEvent(event);
+  renderStats();
+  addKeyMoment(event);
+  renderPitch(event);
   if (event.type === "full_time") {
     el("connection-state").textContent = "Full time · recap pending";
   }
+}
+
+// The feed: commentary, questions, answers and the recap, newest at the bottom.
+
+// Whether the viewer is following the newest line; kept across resizes and the keyboard.
+let feedFollowing = true;
+
+function feedIsNearBottom() {
+  const feed = el("commentary");
+  return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= STICK_TO_BOTTOM_PX;
+}
+
+function scrollFeedToBottom() {
+  const feed = el("commentary");
+  feed.scrollTop = feed.scrollHeight;
+  feedFollowing = true;
+  el("new-lines").hidden = true;
+}
+
+// Append (or swap in) a card, keeping the viewer at the newest line only if they were there.
+function placeInFeed(card, { replace = null, forceScroll = false } = {}) {
+  const feed = el("commentary");
+  const stick = forceScroll || feedIsNearBottom();
+  el("feed-empty")?.remove();
+  if (replace && replace.isConnected) replace.replaceWith(card);
+  else feed.append(card);
+  while (feed.children.length > MAX_FEED_CARDS) {
+    const oldest = feed.firstElementChild;
+    const height = oldest.offsetHeight;
+    oldest.remove();
+    if (!stick) feed.scrollTop -= height;
+  }
+  if (stick) scrollFeedToBottom();
+  else if (!replace) el("new-lines").hidden = false;
+}
+
+// A card that grows (a Replay button arriving) keeps the newest line in view if it was.
+function keepFeedPinned(change) {
+  const stick = feedIsNearBottom();
+  change();
+  if (stick) scrollFeedToBottom();
 }
 
 function audioUrl(id) {
@@ -256,102 +389,111 @@ class AudioQueue {
 const audioQueue = new AudioQueue();
 
 function replayButton(onClick) {
-  const button = document.createElement("button");
+  const button = make("button", "text-button replay-audio", "▶ Replay");
   button.type = "button";
-  button.className = "text-button replay-audio";
-  button.textContent = "▶ Replay";
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function whyButton(onClick) {
+  const button = make("button", "text-button", "Why?");
+  button.type = "button";
   button.addEventListener("click", onClick);
   return button;
 }
 
 function attachLineAudio(card, lineId, audioId) {
-  card.querySelector(".audio-status")?.remove();
-  card.querySelector(".replay-audio")?.remove();
-  card.querySelector(".line-actions").append(
-    replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay", lineId })),
-  );
+  keepFeedPinned(() => {
+    card.querySelector(".audio-status")?.remove();
+    card.querySelector(".replay-audio")?.remove();
+    card.querySelector(".line-actions").append(
+      replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay", lineId })),
+    );
+  });
+}
+
+function fillEvidence(title, text, badge, factTexts, events) {
+  el("evidence-title").textContent = title;
+  el("evidence-line").textContent = text;
+  el("evidence-badge").textContent = badge;
+  const facts = el("evidence-facts");
+  facts.replaceChildren(...factTexts.map((fact) => make("li", "", fact)));
+  if (!facts.children.length) facts.append(make("li", "", "No analytics facts were cited."));
+  const list = el("evidence-events");
+  list.replaceChildren(...events.map((event) => make("li", "", `${event.clock}' · ${eventText(event)}`)));
+  if (!list.children.length) list.append(make("li", "", "No event references were attached."));
+  el("evidence-dialog").showModal();
 }
 
 async function showEvidence(line) {
-  const dialog = el("evidence-dialog");
   showMessage(el("ask-message"), "");
   try {
     const result = await responseJson(await fetch(`/api/lines/${encodeURIComponent(line.line_id)}/evidence`));
-    el("evidence-line").textContent = result.line.text;
-    el("evidence-badge").textContent = `${result.agent} line · ${result.evidence?.passed ? "evidence passed" : "evidence unavailable"}`;
-    const facts = el("evidence-facts");
-    facts.replaceChildren();
-    for (const fact of result.facts) {
-      const li = document.createElement("li");
-      li.textContent = `${fact.label}: ${fact.value}${fact.unit ? ` ${fact.unit}` : ""} · ${fact.fact_id}`;
-      facts.append(li);
-    }
-    if (!facts.children.length) {
-      const li = document.createElement("li");
-      li.textContent = "No analytics facts were cited on this line.";
-      facts.append(li);
-    }
-    const events = el("evidence-events");
-    events.replaceChildren();
-    for (const event of result.events) {
-      const li = document.createElement("li");
-      li.textContent = `${event.clock}' · ${event.team_name || "Match"} · ${event.type} · ${event.event_id}`;
-      events.append(li);
-    }
-    if (!events.children.length) {
-      const li = document.createElement("li");
-      li.textContent = "No event references were attached to this line.";
-      events.append(li);
-    }
-    dialog.showModal();
+    fillEvidence(
+      "Line evidence",
+      result.line.text,
+      `${result.agent === "fallback" ? "Written from verified facts" : "Pundit line"} · ${result.evidence?.passed ? "evidence passed" : "evidence unavailable"}`,
+      result.facts.map((fact) => `${fact.label}: ${fact.value}${fact.unit ? ` ${fact.unit}` : ""}`),
+      result.events,
+    );
   } catch (error) {
     showMessage(el("ask-message"), error.message, true);
   }
 }
 
+// An answer's evidence comes from its own payload and the events this page has received.
+function showAnswerEvidence(result) {
+  const explanation = result.explanation;
+  const events = (explanation.event_ids || [])
+    .map((id) => state.eventsById.get(id))
+    .filter(Boolean);
+  const checked = result.source === "agent" || result.source === "cached";
+  fillEvidence(
+    "Answer evidence",
+    explanation.answer,
+    checked ? "Pundit answer · evidence passed" : "Verified match facts",
+    (explanation.claims || []).map((claim) => claim.text),
+    events,
+  );
+}
+
+const TIER_LABELS = {
+  goal_peak: "Goal", goal_equaliser: "Equaliser", goal: "Goal", big_chance: "Big chance",
+  red_card: "Red card", formation: "Change of shape", tactical: "Tactical",
+  substitution: "Substitution", booking: "Booking", routine: "Commentary",
+};
+
+function lineMinute(line) {
+  const clocks = (line.event_ids || [])
+    .map((id) => state.eventsById.get(id)?.clock)
+    .filter((clock) => clock != null);
+  return clocks.length ? `${Math.max(...clocks)}'` : "";
+}
+
 function renderCommentary(payload) {
-  const list = el("commentary");
-  if (list.querySelector(".empty-state")) list.replaceChildren();
-  const card = document.createElement("article");
-  card.className = "commentary-card";
-  const top = document.createElement("div");
-  top.className = "commentary-top";
-  const badge = document.createElement("span");
-  badge.className = `source-badge${payload.line.source === "fallback" ? " fallback" : ""}`;
-  badge.textContent = payload.line.source === "fallback" ? "Fallback" : "Pundit";
-  const minute = document.createElement("span");
-  minute.className = "line-clock";
-  minute.textContent = `${payload.line.delivery_tier.replaceAll("_", " ")} · ${payload.line.line_id.split("-").at(-1)}`;
-  top.append(badge, minute);
-  const text = document.createElement("p");
-  text.textContent = payload.line.text;
-  const actions = document.createElement("div");
-  actions.className = "line-actions";
-  const why = document.createElement("button");
-  why.className = "text-button";
-  why.textContent = "Why?";
-  why.addEventListener("click", () => showEvidence(payload.line));
-  actions.append(why);
-  card.append(top, text, actions);
-  card.dataset.lineId = payload.line.line_id;
+  const line = payload.line;
+  const card = make("article", "feed-card commentary-card");
+  const top = make("div", "card-top");
+  const badge = make("span", `source-badge${line.source === "fallback" ? " fallback" : ""}`,
+    TIER_LABELS[line.delivery_tier] || "Commentary");
+  top.append(badge, make("span", "line-clock", lineMinute(line)));
+  const actions = make("div", "line-actions");
+  actions.append(whyButton(() => showEvidence(line)));
+  card.append(top, make("p", "", line.text), actions);
+  card.dataset.lineId = line.line_id;
   card.dataset.arrivedAt = String(Date.now());
   if (payload.audio_id) {
-    attachLineAudio(card, payload.line.line_id, payload.audio_id);
+    attachLineAudio(card, line.line_id, payload.audio_id);
   } else {
-    const audioNotice = document.createElement("span");
-    audioNotice.className = "line-clock audio-status";
-    audioNotice.textContent = payload.audio_pending
-      ? "Preparing audio…"
-      : "Audio unavailable · text only";
-    actions.append(audioNotice);
+    actions.append(make("span", "line-clock audio-status",
+      payload.audio_pending ? "Preparing audio…" : "Audio unavailable · text only"));
   }
-  list.prepend(card);
-  while (list.children.length > 30) list.lastElementChild.remove();
+  placeInFeed(card);
   if (payload.audio_id) {
     audioQueue.enqueue({
       id: payload.audio_id,
       kind: "line",
-      lineId: payload.line.line_id,
+      lineId: line.line_id,
       expiresAt: Date.now() + LINE_AUDIO_STALE_MS,
     });
   }
@@ -371,61 +513,105 @@ function updateCommentaryAudio(payload) {
   });
 }
 
-function setRecapAudio(audioId) {
-  const holder = el("recap-audio");
-  holder.replaceChildren();
-  holder.hidden = !audioId;
-  if (!audioId) return;
-  holder.append(replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay" })));
-  audioQueue.enqueue({ id: audioId, kind: "recap" });
+// Q&A in the feed: a "YOU ASKED" card, then a Thinking… card that the answer replaces.
+
+function questionCard(text) {
+  const card = make("article", "feed-card question-card");
+  card.append(make("span", "eyebrow", "YOU ASKED"), make("p", "question-text", text));
+  return card;
 }
 
-function setAnswerAudio(audioId) {
-  const holder = el("answer-audio");
-  holder.replaceChildren();
-  holder.hidden = !audioId;
-  if (!audioId) return;
-  holder.append(replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay" })));
+function thinkingCard(text = "Thinking") {
+  const card = make("article", "feed-card answer-card thinking");
+  const top = make("div", "card-top");
+  top.append(make("span", "eyebrow", "PUNDIT'S ANSWER"));
+  const body = make("p", "", text);
+  body.append(make("span", "thinking-dots"));
+  card.append(top, body);
+  return card;
+}
+
+function answerCard(result) {
+  const card = make("article", "feed-card answer-card");
+  const top = make("div", "card-top");
+  top.append(make("span", "eyebrow", "PUNDIT'S ANSWER"));
+  card.append(top, make("p", "", result.explanation.answer));
+  const claims = result.explanation.claims || [];
+  if (claims.length) {
+    const list = make("ul", "answer-claims");
+    list.append(...claims.map((claim) => make("li", "", claim.text)));
+    card.append(list);
+  }
+  const blockMessages = {
+    "betting language": "Betting language was blocked.",
+    "a blocked real-club name": "A real club or league name was blocked.",
+  };
+  const notice = result.blocked
+    ? claims.length
+      ? "Some generated wording was withheld; verified match facts are shown."
+      : blockMessages[result.blocked_reason] || "Some answer content was blocked."
+    : result.explanation.notice || "";
+  if (notice) card.append(make("p", "answer-notice", notice));
+  const actions = make("div", "line-actions");
+  actions.append(whyButton(() => showAnswerEvidence(result)));
+  if (result.audio_pending) actions.append(make("span", "line-clock audio-status", "Preparing audio…"));
+  card.append(actions);
+  return card;
+}
+
+function attachAnswerAudio(card, audioId) {
+  keepFeedPinned(() => {
+    card.querySelector(".audio-status")?.remove();
+    card.querySelector(".replay-audio")?.remove();
+    card.querySelector(".line-actions")
+      .append(replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay" })));
+  });
   audioQueue.enqueue({ id: audioId, kind: "answer" });
+}
+
+function errorCard(message) {
+  const card = make("article", "feed-card answer-card");
+  card.append(make("p", "answer-notice", message));
+  return card;
 }
 
 function renderRecap(payload) {
   const recap = payload.recap;
-  el("recap-panel").hidden = false;
-  el("recap-headline").textContent = recap.headline;
-  el("recap-summary").textContent = recap.summary;
-  const list = el("recap-moments");
-  list.replaceChildren();
+  const card = make("article", "feed-card recap-card");
+  card.append(make("span", "eyebrow", "FULL TIME · THE FINAL WORD"), make("h3", "", recap.headline),
+    make("p", "", recap.summary));
+  const list = make("ol", "recap-moments");
   for (const moment of recap.key_moments) {
-    const li = document.createElement("li");
-    li.textContent = `${moment.minute}' · ${moment.text} · ${moment.event_ids.join(", ")}`;
-    list.append(li);
+    const item = make("li");
+    item.append(make("b", "", `${moment.minute}' `), document.createTextNode(moment.text));
+    list.append(item);
   }
-  el("recap-notice").textContent = recap.notice || (
-    payload.audio_pending
-      ? "Preparing audio…"
-      : !payload.audio_id
-        ? "Audio unavailable · text recap shown."
-        : ""
-  );
-  setRecapAudio(payload.audio_id);
+  card.append(list);
+  if (recap.notice) card.append(make("p", "answer-notice", recap.notice));
+  const actions = make("div", "line-actions");
+  card.append(actions);
+  card.id = "recap-card";
+  placeInFeed(card);
+  if (payload.audio_id) setRecapAudio(payload.audio_id);
+  else if (payload.audio_pending) actions.append(make("span", "line-clock audio-status", "Preparing audio…"));
+  else actions.append(make("span", "line-clock audio-status", "Audio unavailable · text recap shown"));
   el("connection-state").textContent = "Full time · recap ready";
+}
+
+function setRecapAudio(audioId) {
+  const card = el("recap-card");
+  if (!card || !audioId) return;
+  keepFeedPinned(() => {
+    card.querySelector(".audio-status")?.remove();
+    card.querySelector(".replay-audio")?.remove();
+    card.querySelector(".line-actions")
+      .append(replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay" })));
+  });
+  audioQueue.enqueue({ id: audioId, kind: "recap" });
 }
 
 function handleSse(name, payload) {
   if (name === "event") renderEvent(payload);
-  if (name === "insight") {
-    const item = document.createElement("li");
-    item.className = "timeline-item";
-    const time = document.createElement("span");
-    time.className = "event-clock";
-    time.textContent = "READ";
-    const text = document.createElement("span");
-    text.className = "event-description";
-    text.textContent = payload.insight.headline;
-    item.append(time, text);
-    el("timeline").prepend(item);
-  }
   if (name === "commentary") renderCommentary(payload);
   if (name === "commentary_audio") updateCommentaryAudio(payload);
   if (name === "commentary_audio_unavailable") {
@@ -435,12 +621,10 @@ function handleSse(name, payload) {
     if (notice) notice.textContent = "Audio unavailable · text only";
   }
   if (name === "recap") renderRecap(payload);
-  if (name === "recap_audio") {
-    setRecapAudio(payload.audio_id);
-    el("recap-notice").textContent = "";
-  }
+  if (name === "recap_audio") setRecapAudio(payload.audio_id);
   if (name === "recap_audio_unavailable") {
-    el("recap-notice").textContent = "Audio unavailable · text recap shown.";
+    const notice = el("recap-card")?.querySelector(".audio-status");
+    if (notice) notice.textContent = "Audio unavailable · text recap shown";
   }
   if (name === "complete") {
     state.replayComplete = true;
@@ -483,18 +667,29 @@ async function consumeStream(url, controller) {
 function resetMatch() {
   state.score = { home: 0, away: 0 };
   state.events = 0;
+  state.eventsById.clear();
+  state.stats = freshStats();
+  state.pendingAnswers.clear();
+  renderStats();
   el("home-score").textContent = "0";
   el("away-score").textContent = "0";
   el("clock").textContent = "PRE-MATCH";
   el("live-tag").textContent = "STANDBY";
   el("live-tag").classList.remove("on-air");
-  el("timeline").replaceChildren();
-  el("commentary").replaceChildren();
-  el("recap-panel").hidden = true;
-  el("answer-card").hidden = true;
+  el("key-moments").replaceChildren(
+    make("li", "empty-state", "Goals, cards, substitutions and changes of shape appear here."));
+  showSvg(el("pitch-ball"), false);
+  showSvg(el("pitch-trail"), false);
+  el("pitch-caption").textContent = "Waiting for kick-off";
+  const empty = make("p", "empty-state",
+    "Commentary will arrive with the match. The viewer feed runs on a short broadcast delay.");
+  empty.id = "feed-empty";
+  el("commentary").replaceChildren(empty);
+  el("new-lines").hidden = true;
   audioQueue.clear();
   el("question-input").value = "";
-  el("character-count").textContent = "0 / 300";
+  autosizeQuestion();
+  updateCharacterCount();
 }
 
 async function startReplay() {
@@ -560,33 +755,16 @@ async function controlReplay(action) {
   }
 }
 
-function displayAnswer(result) {
-  el("answer-card").hidden = false;
-  el("answer-text").textContent = result.explanation.answer;
-  const claims = el("answer-claims");
-  claims.replaceChildren();
-  for (const claim of result.explanation.claims || []) {
-    const item = document.createElement("li");
-    item.textContent = claim.text;
-    claims.append(item);
-  }
-  claims.hidden = claims.childElementCount === 0;
-  el("answer-transcript").textContent = result.transcript ? `Heard: “${result.transcript}”` : "";
-  setAnswerAudio(result.audio_id);
-  const blockMessages = {
-    "betting language": "Betting language was blocked.",
-    "a blocked real-club name": "A real club or league name was blocked.",
-  };
-  const notice = result.blocked
-    ? claims.childElementCount
-      ? "Some generated wording was withheld; verified match facts are shown."
-      : blockMessages[result.blocked_reason] || "Some answer content was blocked."
-    : result.explanation.notice || (result.audio_pending ? "Preparing audio…" : "");
-  showMessage(
-    el("ask-message"),
-    notice,
-    result.blocked && claims.childElementCount === 0,
-  );
+function updateCharacterCount() {
+  el("character-count").textContent = `${el("question-input").value.length} / ${state.questionLimit}`;
+}
+
+function autosizeQuestion() {
+  const input = el("question-input");
+  input.style.height = "";
+  if (!input.value) return; // an empty box stays one line, whatever the placeholder's length
+  input.style.height = `${Math.min(input.scrollHeight + 2, 110)}px`;
+  input.style.overflowY = input.scrollHeight > 110 ? "auto" : "hidden";
 }
 
 async function askTyped(event) {
@@ -595,18 +773,26 @@ async function askTyped(event) {
   if (!question || !state.replayId) return;
   const button = el("ask-button");
   button.disabled = true;
-  showMessage(el("ask-message"), "Checking the released match events…");
+  el("question-input").value = "";
+  autosizeQuestion();
+  updateCharacterCount();
+  showMessage(el("ask-message"), "");
+  // The viewer just acted, so show their question and the wait even if they scrolled up.
+  placeInFeed(questionCard(question), { forceScroll: true });
+  const waiting = thinkingCard();
+  placeInFeed(waiting, { forceScroll: true });
   try {
     const result = await responseJson(await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ replay_id: state.replayId, question }),
     }));
-    displayAnswer(result);
-    el("question-input").value = "";
-    el("character-count").textContent = "0 / 300";
+    const answered = answerCard(result);
+    placeInFeed(answered, { replace: waiting });
+    // Its audio follows on the SSE stream as "answer_audio", as for a spoken question.
+    if (result.audio_pending) state.pendingAnswers.set(result.question_id, answered);
   } catch (error) {
-    showMessage(el("ask-message"), error.message, true);
+    placeInFeed(errorCard(error.message), { replace: waiting });
   } finally {
     button.disabled = false;
   }
@@ -660,7 +846,10 @@ async function convertToWav(blob) {
 }
 
 async function sendSpokenQuestion(blob) {
-  showMessage(el("ask-message"), "Transcribing your question…");
+  const asked = questionCard("Transcribing your question…");
+  placeInFeed(asked, { forceScroll: true });
+  const waiting = thinkingCard("Listening back");
+  placeInFeed(waiting, { forceScroll: true });
   const form = new FormData();
   form.append("replay_id", state.replayId);
   form.append("audio", blob, "question.wav");
@@ -668,29 +857,36 @@ async function sendSpokenQuestion(blob) {
     // 202 with the transcript as soon as speech-to-text finishes; the answer and its audio
     // follow on the replay's SSE stream as "answer" and "answer_audio".
     const pending = await responseJson(await fetch("/api/ask-audio", { method: "POST", body: form }));
-    state.pendingQuestionId = pending.question_id;
-    el("answer-card").hidden = false;
-    el("answer-text").textContent = "";
-    el("answer-claims").replaceChildren();
-    el("answer-claims").hidden = true;
-    setAnswerAudio(null);
-    el("answer-transcript").textContent = `Heard: “${pending.transcript}”`;
-    showMessage(el("ask-message"), "Checking the released match events…");
+    asked.querySelector(".question-text").textContent = `“${pending.transcript}”`;
+    const thinking = thinkingCard();
+    placeInFeed(thinking, { replace: waiting });
+    state.pendingAnswers.set(pending.question_id, thinking);
   } catch (error) {
-    showMessage(el("ask-message"), error.message, true);
+    asked.querySelector(".question-text").textContent = "Spoken question";
+    placeInFeed(errorCard(error.message), { replace: waiting });
   }
 }
 
 function handleAnswerEvent(name, payload) {
-  if (payload.question_id !== state.pendingQuestionId) return;
-  if (name === "answer") displayAnswer(payload);
-  if (name === "answer_error") showMessage(el("ask-message"), payload.message, true);
-  if (name === "answer_audio") {
-    setAnswerAudio(payload.audio_id);
-    if (el("ask-message").textContent === "Preparing audio…") showMessage(el("ask-message"), "");
+  const card = state.pendingAnswers.get(payload.question_id);
+  if (!card) return;
+  if (name === "answer") {
+    const answered = answerCard(payload);
+    placeInFeed(answered, { replace: card });
+    state.pendingAnswers.set(payload.question_id, answered);
   }
-  if (name === "answer_audio_unavailable" && el("ask-message").textContent === "Preparing audio…") {
-    showMessage(el("ask-message"), "Audio unavailable · text answer shown.");
+  if (name === "answer_error") {
+    placeInFeed(errorCard(payload.message), { replace: card });
+    state.pendingAnswers.delete(payload.question_id);
+  }
+  if (name === "answer_audio") {
+    attachAnswerAudio(card, payload.audio_id);
+    state.pendingAnswers.delete(payload.question_id);
+  }
+  if (name === "answer_audio_unavailable") {
+    const notice = card.querySelector(".audio-status");
+    if (notice) notice.textContent = "Audio unavailable · text answer shown";
+    state.pendingAnswers.delete(payload.question_id);
   }
 }
 
@@ -710,8 +906,9 @@ async function toggleRecording() {
       stream.getTracks().forEach((track) => track.stop());
       state.recording = null;
       el("mic-button").setAttribute("aria-pressed", "false");
-      el("mic-label").textContent = "Push to talk";
+      el("mic-label").textContent = "Talk";
       el("mic-button").disabled = false;
+      showMessage(el("ask-message"), "");
       try {
         const wav = await convertToWav(new Blob(chunks, { type: recorder.mimeType }));
         if (wav.size > state.questionAudioBytes) {
@@ -724,12 +921,27 @@ async function toggleRecording() {
     });
     recorder.start();
     el("mic-button").setAttribute("aria-pressed", "true");
-    el("mic-label").textContent = "Stop recording";
+    el("mic-label").textContent = "Stop";
     showMessage(el("ask-message"), `Listening · up to ${state.questionAudioSeconds} seconds`);
     state.recordingTimer = setTimeout(() => { if (state.recording?.state === "recording") state.recording.stop(); }, state.questionAudioSeconds * 1000);
   } catch (error) {
     showMessage(el("ask-message"), `Microphone unavailable: ${error.message}`, true);
   }
+}
+
+// Mobile: keep the shell inside the visual viewport, so the ask bar sits above the keyboard
+// on browsers that overlay it instead of resizing the page (iOS Safari).
+function fitToVisualViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  const shell = el("app-shell");
+  shell.style.setProperty("--app-height", `${Math.round(viewport.height)}px`);
+  shell.style.transform = viewport.offsetTop ? `translateY(${Math.round(viewport.offsetTop)}px)` : "";
+}
+
+function setDrawer(open) {
+  el("match-info").classList.toggle("open", open);
+  el("info-toggle").setAttribute("aria-expanded", String(open));
 }
 
 el("match-picker").addEventListener("change", updateMatchLabels);
@@ -750,8 +962,44 @@ el("enable-audio").addEventListener("click", () => {
 });
 el("ask-form").addEventListener("submit", askTyped);
 el("question-input").addEventListener("input", () => {
-  el("character-count").textContent = `${el("question-input").value.length} / 300`;
+  updateCharacterCount();
+  autosizeQuestion();
 });
+// Enter sends; Shift+Enter starts a new line.
+el("question-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    el("ask-form").requestSubmit();
+  }
+  if (event.key === "Escape") el("question-input").blur();
+});
+// "/" focuses the ask box from anywhere except another text field.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
+  const target = event.target;
+  if (target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+  if (el("evidence-dialog").open || el("question-input").disabled) return;
+  event.preventDefault();
+  el("question-input").focus();
+});
+el("commentary").addEventListener("scroll", () => {
+  feedFollowing = feedIsNearBottom();
+  if (feedFollowing) el("new-lines").hidden = true;
+}, { passive: true });
+// The feed's height changes with the window, the drawer and the phone keyboard: a viewer
+// following the newest line stays on it.
+new ResizeObserver(() => { if (feedFollowing) scrollFeedToBottom(); }).observe(el("commentary"));
+// The "/" shortcut hint only makes sense with a keyboard, so only on the desktop layout.
+const desktopLayout = matchMedia("(min-width: 1024px)");
+function setQuestionPlaceholder() {
+  el("question-input").placeholder = desktopLayout.matches
+    ? "Ask the pundit about this match…  (press / )"
+    : "Ask the pundit about this match…";
+}
+desktopLayout.addEventListener("change", setQuestionPlaceholder);
+setQuestionPlaceholder();
+el("new-lines").addEventListener("click", scrollFeedToBottom);
+el("info-toggle").addEventListener("click", () => setDrawer(!el("match-info").classList.contains("open")));
 el("mic-button").addEventListener("click", toggleRecording);
 el("mute-audio").checked = audioQueue.muted;
 el("mute-audio").addEventListener("change", () => audioQueue.setMuted(el("mute-audio").checked));
@@ -759,6 +1007,9 @@ el("close-evidence").addEventListener("click", () => el("evidence-dialog").close
 el("evidence-dialog").addEventListener("click", (event) => {
   if (event.target === el("evidence-dialog")) el("evidence-dialog").close();
 });
+window.visualViewport?.addEventListener("resize", fitToVisualViewport);
+window.visualViewport?.addEventListener("scroll", fitToVisualViewport);
+fitToVisualViewport();
 
 loadMatches().then(checkWarmup).catch((error) => showMessage(el("connection-state"), error.message, true));
 setInterval(checkWarmup, 2500);
