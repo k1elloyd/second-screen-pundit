@@ -7,6 +7,9 @@ from typing import Literal
 
 NarrativeMode = Literal["live", "cached", "off"]
 CommentatorEffort = Literal["none", "low"]
+# Both voices are served by the one SPEECH_ENDPOINT resource (Sweden Central).
+DEFAULT_SPEECH_VOICE = "en-GB-Harry:MAI-Voice-2.1-Flash"
+DEFAULT_SPEECH_FALLBACK_VOICE = "en-GB-RyanNeural"
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -63,6 +66,8 @@ class AgentSettings:
     max_concurrent_replays: int = 3
     ask_audio_timeout_seconds: float = 30
     speech_synthesis_timeout_seconds: float = 8
+    speech_voice: str = DEFAULT_SPEECH_VOICE
+    speech_fallback_voice: str = DEFAULT_SPEECH_FALLBACK_VOICE
 
     @classmethod
     def from_environment(cls) -> AgentSettings:
@@ -105,6 +110,10 @@ class AgentSettings:
             ask_audio_timeout_seconds=_positive_float("ASK_AUDIO_TIMEOUT_SECONDS", 30),
             speech_synthesis_timeout_seconds=_positive_float(
                 "SPEECH_SYNTHESIS_TIMEOUT_SECONDS", 8
+            ),
+            speech_voice=os.getenv("SPEECH_VOICE", "").strip() or DEFAULT_SPEECH_VOICE,
+            speech_fallback_voice=(
+                os.getenv("SPEECH_FALLBACK_VOICE", "").strip() or DEFAULT_SPEECH_FALLBACK_VOICE
             ),
         )
 

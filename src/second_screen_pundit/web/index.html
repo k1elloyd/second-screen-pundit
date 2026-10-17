@@ -71,7 +71,10 @@
       <section class="panel commentary-panel" aria-labelledby="commentary-title">
         <div class="panel-heading">
           <div><span class="eyebrow">FROM THE BOOTH</span><h2 id="commentary-title">Commentary</h2></div>
-          <label class="mute-toggle"><input id="mute-audio" type="checkbox"> Mute</label>
+          <div class="audio-controls">
+            <button class="text-button" id="enable-audio" type="button" hidden>Enable audio</button>
+            <label class="mute-toggle"><input id="mute-audio" type="checkbox"> Mute</label>
+          </div>
         </div>
         <div class="commentary-list" id="commentary" aria-live="polite">
           <p class="empty-state">Commentary and audio will arrive with the match.</p>
@@ -100,7 +103,7 @@
           <p id="answer-text"></p>
           <ul class="answer-claims" id="answer-claims" hidden></ul>
           <p class="transcript" id="answer-transcript"></p>
-          <audio id="answer-audio" controls hidden></audio>
+          <div class="audio-replay" id="answer-audio" hidden></div>
         </div>
       </section>
 
@@ -112,7 +115,7 @@
         <h3 id="recap-headline"></h3>
         <p id="recap-summary"></p>
         <ol class="recap-moments" id="recap-moments"></ol>
-        <audio id="recap-audio" controls hidden></audio>
+        <div class="audio-replay" id="recap-audio" hidden></div>
         <p class="notice" id="recap-notice"></p>
       </section>
     </div>

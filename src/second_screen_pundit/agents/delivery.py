@@ -6,7 +6,7 @@ the same moment is always voiced the same way.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from second_screen_pundit.agents.models import DeliveryTier, Tone
@@ -18,21 +18,69 @@ LATE_GO_AHEAD_MINUTE = 75
 @dataclass(frozen=True)
 class TierStyle:
     style: str
-    style_degree: float
+    # None leaves styledegree out: Learn documents no styledegree for MAI voices.
+    style_degree: float | None = None
 
 
-TIER_STYLES: dict[DeliveryTier, TierStyle] = {
-    "goal_peak": TierStyle("sports_commentary_excited", 1.7),
-    "goal_equaliser": TierStyle("sports_commentary_excited", 1.5),
-    "goal": TierStyle("sports_commentary_excited", 1.2),
-    "big_chance": TierStyle("sports_commentary_excited", 1.0),
-    "red_card": TierStyle("sports_commentary", 1.4),
-    "formation": TierStyle("sports_commentary", 1.0),
-    "tactical": TierStyle("sports_commentary", 0.9),
-    "substitution": TierStyle("sports_commentary", 0.8),
-    "booking": TierStyle("sports_commentary", 0.8),
-    "routine": TierStyle("sports_commentary", 0.6),
+@dataclass(frozen=True)
+class VoiceProfile:
+    """The styles one voice supports on Learn, and the style each tier gets with it."""
+
+    supported_styles: frozenset[str]
+    tier_styles: Mapping[DeliveryTier, TierStyle]
+
+    def style_for(self, tier: DeliveryTier | None) -> TierStyle | None:
+        """The tier's style, or None when the tier has none or the voice doesn't support it."""
+        style = self.tier_styles.get(tier) if tier is not None else None
+        if style is None or style.style not in self.supported_styles:
+            return None
+        return style
+
+
+# en-GB-Harry (MAI-Voice-2.1 and -Flash), styles from the Learn MAI-Voice voice table.
+HARRY_PROFILE = VoiceProfile(
+    supported_styles=frozenset({
+        "agent", "angry", "audiobook", "customer_call_center", "disgusted", "educational",
+        "fearful", "joyful", "narrator", "neutral", "sad", "surprised",
+    }),
+    tier_styles={
+        # Late drama: a go-ahead goal from 75', a big chance, a red card.
+        "goal_peak": TierStyle("surprised"),
+        "big_chance": TierStyle("surprised"),
+        "red_card": TierStyle("surprised"),
+        "goal_equaliser": TierStyle("joyful"),
+        "goal": TierStyle("joyful"),
+        "formation": TierStyle("narrator"),
+        "tactical": TierStyle("narrator"),
+        "substitution": TierStyle("neutral"),
+        "booking": TierStyle("neutral"),
+        "routine": TierStyle("neutral"),
+    },
+)
+
+# en-GB-RyanNeural: Learn lists chat, cheerful, sad and whispering; only cheerful and chat fit.
+RYAN_PROFILE = VoiceProfile(
+    supported_styles=frozenset({"chat", "cheerful", "sad", "whispering"}),
+    tier_styles={
+        "goal_peak": TierStyle("cheerful", 1.7),
+        "goal_equaliser": TierStyle("cheerful", 1.5),
+        "goal": TierStyle("cheerful", 1.2),
+        "formation": TierStyle("chat", 1.0),
+        "tactical": TierStyle("chat", 1.0),
+    },
+)
+
+# A voice not listed here gets no style at all.
+NO_STYLE_PROFILE = VoiceProfile(frozenset(), {})
+VOICE_PROFILES: dict[str, VoiceProfile] = {
+    "en-GB-Harry": HARRY_PROFILE,
+    "en-GB-RyanNeural": RYAN_PROFILE,
 }
+
+
+def voice_profile(voice: str) -> VoiceProfile:
+    """Look a voice up by its name without the model suffix (en-GB-Harry:MAI-Voice-2.1-Flash)."""
+    return VOICE_PROFILES.get(voice.split(":", 1)[0], NO_STYLE_PROFILE)
 
 # The persona's tone column, so the model no longer has to return it.
 TIER_TONES: dict[DeliveryTier, Tone] = {

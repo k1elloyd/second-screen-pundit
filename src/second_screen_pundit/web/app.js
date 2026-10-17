@@ -137,6 +137,141 @@ function audioUrl(id) {
   return id ? `/api/audio/${encodeURIComponent(id)}` : "";
 }
 
+// A line's audio is dropped if it hasn't started this long after the line arrived, so the
+// voice never falls far behind the timeline.
+const LINE_AUDIO_STALE_MS = 12_000;
+
+function readStored(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+function writeStored(key, value) {
+  try { localStorage.setItem(key, value); } catch { /* storage unavailable: setting not kept */ }
+}
+
+// A 0.1 s silent WAV, built in the click handler so play() runs inside the user gesture.
+function silentAudioUrl() {
+  return URL.createObjectURL(encodeWav(new Float32Array(1600), 16000));
+}
+
+// One <audio> element plays everything in turn, so lines never overlap. Lines wait in order;
+// at most one waits behind the line that is playing. Answers, the recap and replays go to the
+// front without cutting off the line that is playing.
+class AudioQueue {
+  constructor() {
+    this.el = new Audio();
+    this.items = [];
+    this.playing = null;
+    this.paused = false;
+    this.muted = readStored("pundit-muted") === "1";
+    this.el.addEventListener("ended", () => this.next());
+    this.el.addEventListener("error", () => this.next());
+  }
+
+  // Call synchronously inside the Start click handler, before any await.
+  unlock() {
+    const url = silentAudioUrl();
+    this.el.src = url;
+    return this.el.play()
+      .then(() => {
+        if (this.el.src === url) this.el.pause();
+        el("enable-audio").hidden = true;
+      })
+      .catch(() => {})
+      .finally(() => URL.revokeObjectURL(url));
+  }
+
+  enqueue({ id, kind, lineId = null, expiresAt = null }) {
+    if (!id || this.muted) return;
+    const item = { url: audioUrl(id), kind, lineId, expiresAt };
+    if (kind === "line") {
+      this.items = this.items
+        .filter((queued) => queued.kind !== "line" || queued.expiresAt > Date.now())
+        .filter((queued, index, all) => queued.kind !== "line" ||
+          index === all.findLastIndex((other) => other.kind === "line"));
+      this.items.push(item);
+    } else {
+      this.items.unshift(item);
+    }
+    if (!this.playing && !this.paused) this.next();
+  }
+
+  next() {
+    this.playing = null;
+    document.querySelector(".commentary-card.speaking")?.classList.remove("speaking");
+    if (this.paused) return;
+    const item = this.items.shift();
+    if (!item) return;
+    if (this.muted || (item.expiresAt && item.expiresAt < Date.now())) {
+      this.next();
+      return;
+    }
+    this.playing = item;
+    this.el.src = item.url;
+    if (item.lineId) {
+      [...document.querySelectorAll(".commentary-card")]
+        .find((card) => card.dataset.lineId === item.lineId)?.classList.add("speaking");
+    }
+    this.el.play().catch((error) => {
+      if (error.name === "NotAllowedError") {
+        // The unlock failed: keep the item and ask for a click.
+        this.items.unshift(item);
+        this.playing = null;
+        el("enable-audio").hidden = false;
+      } else {
+        this.next();
+      }
+    });
+  }
+
+  setMuted(muted) {
+    this.muted = muted;
+    writeStored("pundit-muted", muted ? "1" : "0");
+    if (muted) {
+      this.el.pause();
+      this.items = [];
+      this.next();
+    }
+  }
+
+  pause() {
+    this.paused = true;
+    this.el.pause();
+  }
+
+  resume() {
+    this.paused = false;
+    if (this.playing) this.el.play().catch(() => {});
+    else this.next();
+  }
+
+  clear() {
+    this.items = [];
+    this.el.pause();
+    this.playing = null;
+    document.querySelector(".commentary-card.speaking")?.classList.remove("speaking");
+  }
+}
+
+const audioQueue = new AudioQueue();
+
+function replayButton(onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "text-button replay-audio";
+  button.textContent = "▶ Replay";
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function attachLineAudio(card, lineId, audioId) {
+  card.querySelector(".audio-status")?.remove();
+  card.querySelector(".replay-audio")?.remove();
+  card.querySelector(".line-actions").append(
+    replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay", lineId })),
+  );
+}
+
 async function showEvidence(line) {
   const dialog = el("evidence-dialog");
   showMessage(el("ask-message"), "");
@@ -198,37 +333,60 @@ function renderCommentary(payload) {
   why.addEventListener("click", () => showEvidence(payload.line));
   actions.append(why);
   card.append(top, text, actions);
+  card.dataset.lineId = payload.line.line_id;
+  card.dataset.arrivedAt = String(Date.now());
   if (payload.audio_id) {
-    const player = document.createElement("audio");
-    player.controls = true;
-    player.preload = "none";
-    player.src = audioUrl(payload.audio_id);
-    player.muted = el("mute-audio").checked;
-    card.append(player);
+    attachLineAudio(card, payload.line.line_id, payload.audio_id);
   } else {
     const audioNotice = document.createElement("span");
     audioNotice.className = "line-clock audio-status";
     audioNotice.textContent = payload.audio_pending
       ? "Preparing audio…"
       : "Audio unavailable · text only";
-    card.append(audioNotice);
+    actions.append(audioNotice);
   }
-  card.dataset.lineId = payload.line.line_id;
   list.prepend(card);
   while (list.children.length > 30) list.lastElementChild.remove();
+  if (payload.audio_id) {
+    audioQueue.enqueue({
+      id: payload.audio_id,
+      kind: "line",
+      lineId: payload.line.line_id,
+      expiresAt: Date.now() + LINE_AUDIO_STALE_MS,
+    });
+  }
 }
 
 function updateCommentaryAudio(payload) {
   const card = [...document.querySelectorAll(".commentary-card")]
     .find((item) => item.dataset.lineId === payload.line_id);
   if (!card) return;
-  card.querySelector(".audio-status")?.remove();
-  const player = document.createElement("audio");
-  player.controls = true;
-  player.preload = "none";
-  player.src = audioUrl(payload.audio_id);
-  player.muted = el("mute-audio").checked;
-  card.append(player);
+  attachLineAudio(card, payload.line_id, payload.audio_id);
+  // Staleness counts from when the line's text arrived, not from when its audio did.
+  audioQueue.enqueue({
+    id: payload.audio_id,
+    kind: "line",
+    lineId: payload.line_id,
+    expiresAt: Number(card.dataset.arrivedAt) + LINE_AUDIO_STALE_MS,
+  });
+}
+
+function setRecapAudio(audioId) {
+  const holder = el("recap-audio");
+  holder.replaceChildren();
+  holder.hidden = !audioId;
+  if (!audioId) return;
+  holder.append(replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay" })));
+  audioQueue.enqueue({ id: audioId, kind: "recap" });
+}
+
+function setAnswerAudio(audioId) {
+  const holder = el("answer-audio");
+  holder.replaceChildren();
+  holder.hidden = !audioId;
+  if (!audioId) return;
+  holder.append(replayButton(() => audioQueue.enqueue({ id: audioId, kind: "replay" })));
+  audioQueue.enqueue({ id: audioId, kind: "answer" });
 }
 
 function renderRecap(payload) {
@@ -250,10 +408,7 @@ function renderRecap(payload) {
         ? "Audio unavailable · text recap shown."
         : ""
   );
-  const player = el("recap-audio");
-  player.hidden = !payload.audio_id;
-  if (payload.audio_id) player.src = audioUrl(payload.audio_id);
-  player.muted = el("mute-audio").checked;
+  setRecapAudio(payload.audio_id);
   el("connection-state").textContent = "Full time · recap ready";
 }
 
@@ -281,10 +436,7 @@ function handleSse(name, payload) {
   }
   if (name === "recap") renderRecap(payload);
   if (name === "recap_audio") {
-    const player = el("recap-audio");
-    player.hidden = false;
-    player.src = audioUrl(payload.audio_id);
-    player.muted = el("mute-audio").checked;
+    setRecapAudio(payload.audio_id);
     el("recap-notice").textContent = "";
   }
   if (name === "recap_audio_unavailable") {
@@ -340,6 +492,7 @@ function resetMatch() {
   el("commentary").replaceChildren();
   el("recap-panel").hidden = true;
   el("answer-card").hidden = true;
+  audioQueue.clear();
   el("question-input").value = "";
   el("character-count").textContent = "0 / 300";
 }
@@ -419,10 +572,7 @@ function displayAnswer(result) {
   }
   claims.hidden = claims.childElementCount === 0;
   el("answer-transcript").textContent = result.transcript ? `Heard: “${result.transcript}”` : "";
-  const player = el("answer-audio");
-  player.hidden = !result.audio_id;
-  if (result.audio_id) player.src = audioUrl(result.audio_id);
-  player.muted = el("mute-audio").checked;
+  setAnswerAudio(result.audio_id);
   const blockMessages = {
     "betting language": "Betting language was blocked.",
     "a blocked real-club name": "A real club or league name was blocked.",
@@ -523,7 +673,7 @@ async function sendSpokenQuestion(blob) {
     el("answer-text").textContent = "";
     el("answer-claims").replaceChildren();
     el("answer-claims").hidden = true;
-    el("answer-audio").hidden = true;
+    setAnswerAudio(null);
     el("answer-transcript").textContent = `Heard: “${pending.transcript}”`;
     showMessage(el("ask-message"), "Checking the released match events…");
   } catch (error) {
@@ -536,10 +686,7 @@ function handleAnswerEvent(name, payload) {
   if (name === "answer") displayAnswer(payload);
   if (name === "answer_error") showMessage(el("ask-message"), payload.message, true);
   if (name === "answer_audio") {
-    const player = el("answer-audio");
-    player.src = audioUrl(payload.audio_id);
-    player.muted = el("mute-audio").checked;
-    player.hidden = false;
+    setAnswerAudio(payload.audio_id);
     if (el("ask-message").textContent === "Preparing audio…") showMessage(el("ask-message"), "");
   }
   if (name === "answer_audio_unavailable" && el("ask-message").textContent === "Preparing audio…") {
@@ -586,17 +733,28 @@ async function toggleRecording() {
 }
 
 el("match-picker").addEventListener("change", updateMatchLabels);
-el("start-button").addEventListener("click", startReplay);
-el("pause-button").addEventListener("click", () => controlReplay("pause"));
-el("resume-button").addEventListener("click", () => controlReplay("resume"));
+el("start-button").addEventListener("click", () => {
+  audioQueue.unlock(); // in the click itself, before any await, so autoplay is allowed
+  startReplay();
+});
+el("pause-button").addEventListener("click", () => {
+  audioQueue.pause();
+  controlReplay("pause");
+});
+el("resume-button").addEventListener("click", () => {
+  audioQueue.resume();
+  controlReplay("resume");
+});
+el("enable-audio").addEventListener("click", () => {
+  audioQueue.unlock().then(() => audioQueue.next());
+});
 el("ask-form").addEventListener("submit", askTyped);
 el("question-input").addEventListener("input", () => {
   el("character-count").textContent = `${el("question-input").value.length} / 300`;
 });
 el("mic-button").addEventListener("click", toggleRecording);
-el("mute-audio").addEventListener("change", () => {
-  document.querySelectorAll("audio").forEach((player) => { player.muted = el("mute-audio").checked; });
-});
+el("mute-audio").checked = audioQueue.muted;
+el("mute-audio").addEventListener("change", () => audioQueue.setMuted(el("mute-audio").checked));
 el("close-evidence").addEventListener("click", () => el("evidence-dialog").close());
 el("evidence-dialog").addEventListener("click", (event) => {
   if (event.target === el("evidence-dialog")) el("evidence-dialog").close();

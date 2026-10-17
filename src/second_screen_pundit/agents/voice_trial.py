@@ -1,37 +1,33 @@
-"""Voice trial: do candidate voices really apply the sports-commentary styles?
+"""Voice trial: do the configured voices apply their styles, and how long does each line take?
 
-Each line is synthesised twice without a style and once with its tier's style. The MP3
-bytes differ between identical requests, so they can't be compared; the audio duration the
-service reports is the evidence instead. If the two plain renders last exactly as long, the
-voice's timing is deterministic: a styled render of the same length means the style was
-ignored, and a different length means the style changed the delivery. If the two plain
-renders differ in length, the result is inconclusive.
+Each line is synthesised once with the tier's style from the voice's own profile and twice
+without a style. The MP3 bytes differ between identical requests, so they can't be compared;
+the audio duration the service reports is the evidence instead. If the two plain renders last
+exactly as long, the voice's timing is deterministic: a styled render of the same length means
+the style was ignored, and a different length means the style changed the delivery. If the two
+plain renders differ in length, the result is inconclusive.
 
-A documented style on a documented voice acts as a positive control for the method.
+Every request is timed (wall clock, request to audio). The first request per voice includes
+connection set-up and token acquisition, so it is reported separately from the rest.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from azure.core.credentials import TokenCredential
 
-from second_screen_pundit.agents.delivery import TIER_STYLES, TierStyle
+from second_screen_pundit.agents.delivery import TierStyle, voice_profile
 from second_screen_pundit.agents.models import DeliveryTier
 from second_screen_pundit.agents.speech import SpeechArtifact, SpeechSynthesizer, build_ssml
+from second_screen_pundit.agents.spoken import to_spoken
 
 TRIAL_DIR = Path("data/audio/voice-trials")
-CANDIDATE_VOICES = (
-    "en-GB-SoniaNeural",
-    "en-GB-RyanNeural",
-    "en-GB-OllieMultilingualNeural",
-    # HD voice; reported as unsupported if the Speech resource's region doesn't offer it.
-    "en-GB-Ollie:DragonHDLatestNeural",
-)
 # Lines from the verified examples in prompts/commentator-persona.md.
 TRIAL_LINES: tuple[tuple[str, DeliveryTier, str], ...] = (
     (
@@ -45,6 +41,12 @@ TRIAL_LINES: tuple[tuple[str, DeliveryTier, str], ...] = (
         "goal_equaliser",
         "Ivo Juniperby converts a half-chance, and Ashbridge Rovers are back on terms. "
         "The score is level at 2-2.",
+    ),
+    (
+        "goal",
+        "goal",
+        "Brio Fallowmere finishes it off, and Port Calder have the opener. "
+        "Port Calder lead 1-0.",
     ),
     (
         "red-card",
@@ -71,14 +73,6 @@ TRIAL_LINES: tuple[tuple[str, DeliveryTier, str], ...] = (
         "last 10 minutes.",
     ),
 )
-# Positive controls: a documented style on a documented voice, and the only voice Learn
-# lists with sports styles (whose table spells them with hyphens).
-CONTROLS: tuple[tuple[str, TierStyle], ...] = (
-    ("en-GB-RyanNeural", TierStyle("cheerful", 2.0)),
-    ("zh-CN-YunjianNeural", TierStyle("sports_commentary_excited", 2.0)),
-    ("zh-CN-YunjianNeural", TierStyle("sports-commentary-excited", 2.0)),
-)
-CONTROL_TEXT = TRIAL_LINES[0][2]
 
 
 @dataclass(frozen=True)
@@ -86,14 +80,25 @@ class TrialResult:
     voice: str
     line: str
     style: str
-    style_degree: float
+    style_degree: float | None
     verdict: str
     styled_file: str | None
     plain_file: str | None
     styled_seconds: float | None = None
     plain_seconds: float | None = None
     plain_repeat_seconds: float | None = None
+    # Wall-clock milliseconds per request, in request order: styled, plain, plain repeat.
+    request_ms: tuple[int, ...] = ()
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class VoiceTiming:
+    voice: str
+    first_request_ms: int | None
+    later_requests: int
+    later_median_ms: int | None
+    later_slowest_ms: int | None
 
 
 def _slug(voice: str) -> str:
@@ -112,11 +117,19 @@ RETRY_ATTEMPTS = 5
 RETRY_WAIT_SECONDS = 20
 
 
-def _synthesize(synthesizer: SpeechSynthesizer, ssml: str, path: Path) -> SpeechArtifact:
-    """Retry with a pause: the trial makes many quick requests and can hit the rate limit."""
+def _synthesize(
+    synthesizer: SpeechSynthesizer, ssml: str, path: Path, timings: list[int]
+) -> SpeechArtifact:
+    """Retry with a pause: the trial makes many quick requests and can hit the rate limit.
+
+    Only the successful attempt is timed, so a rate-limit wait doesn't count as latency.
+    """
     for attempt in range(1, RETRY_ATTEMPTS + 1):
+        started = time.perf_counter()
         try:
-            return synthesizer.synthesize_ssml_mp3(ssml, path)
+            artifact = synthesizer.synthesize_ssml_mp3(ssml, path)
+            timings.append(round((time.perf_counter() - started) * 1000))
+            return artifact
         except RuntimeError as exc:
             if attempt == RETRY_ATTEMPTS or "429" not in str(exc):
                 raise
@@ -130,30 +143,57 @@ def _trial(
     voice: str,
     name: str,
     text: str,
-    style: TierStyle,
+    style: TierStyle | None,
     directory: Path,
 ) -> TrialResult:
     styled_path = directory / f"{name}.mp3"
     plain_path = directory / f"{name}.plain.mp3"
     repeat_path = directory / f"{name}.plain-repeat.mp3"
+    style_name = style.style if style is not None else "none"
+    degree = style.style_degree if style is not None else None
+    timings: list[int] = []
+    spoken = to_spoken(text)
     try:
-        styled = _synthesize(synthesizer, build_ssml(text, voice=voice, style=style), styled_path)
-        plain = _synthesize(synthesizer, build_ssml(text, voice=voice), plain_path)
-        repeat = _synthesize(synthesizer, build_ssml(text, voice=voice), repeat_path)
-        verdict = _verdict(
-            plain.duration_seconds, repeat.duration_seconds, styled.duration_seconds
+        styled = _synthesize(
+            synthesizer, build_ssml(spoken, voice=voice, style=style), styled_path, timings
+        )
+        plain = _synthesize(synthesizer, build_ssml(spoken, voice=voice), plain_path, timings)
+        repeat = _synthesize(synthesizer, build_ssml(spoken, voice=voice), repeat_path, timings)
+        verdict = (
+            _verdict(plain.duration_seconds, repeat.duration_seconds, styled.duration_seconds)
+            if style is not None
+            else "no style: the voice's profile has none for this tier"
         )
         repeat_path.unlink()
         return TrialResult(
-            voice, name, style.style, style.style_degree, verdict,
+            voice, name, style_name, degree, verdict,
             styled_path.as_posix(), plain_path.as_posix(),
             round(styled.duration_seconds, 3), round(plain.duration_seconds, 3),
-            round(repeat.duration_seconds, 3),
+            round(repeat.duration_seconds, 3), tuple(timings),
         )
     except RuntimeError as exc:
         return TrialResult(
-            voice, name, style.style, style.style_degree, "error", None, None, error=str(exc)
+            voice, name, style_name, degree, "error", None, None,
+            request_ms=tuple(timings), error=str(exc),
         )
+
+
+def voice_timings(results: list[TrialResult]) -> list[VoiceTiming]:
+    """First request per voice, then the median and slowest of the rest."""
+    summary: list[VoiceTiming] = []
+    for voice in dict.fromkeys(result.voice for result in results):
+        timings = [ms for result in results if result.voice == voice for ms in result.request_ms]
+        later = timings[1:]
+        summary.append(
+            VoiceTiming(
+                voice,
+                timings[0] if timings else None,
+                len(later),
+                round(statistics.median(later)) if later else None,
+                max(later) if later else None,
+            )
+        )
+    return summary
 
 
 def run_voice_trial(
@@ -161,28 +201,38 @@ def run_voice_trial(
     endpoint: str,
     region: str,
     credential: TokenCredential,
+    voices: tuple[str, ...],
     output_dir: Path = TRIAL_DIR,
-) -> list[TrialResult]:
+) -> tuple[list[TrialResult], list[VoiceTiming]]:
     results: list[TrialResult] = []
-    for voice in CANDIDATE_VOICES:
+    for voice in voices:
+        # No fallback here: each voice is measured on its own.
         synthesizer = SpeechSynthesizer(
-            endpoint=endpoint, region=region, credential=credential, voice_name=voice
+            endpoint=endpoint,
+            region=region,
+            credential=credential,
+            voice_name=voice,
+            fallback_voice_name=None,
         )
+        profile = voice_profile(voice)
         directory = output_dir / _slug(voice)
         for index, (name, tier, text) in enumerate(TRIAL_LINES, start=1):
             results.append(
-                _trial(synthesizer, voice, f"{index:02d}-{name}", text, TIER_STYLES[tier], directory)
+                _trial(
+                    synthesizer, voice, f"{index:02d}-{name}", text,
+                    profile.style_for(tier), directory,
+                )
             )
-    for voice, style in CONTROLS:
-        synthesizer = SpeechSynthesizer(
-            endpoint=endpoint, region=region, credential=credential, voice_name=voice
-        )
-        name = f"control-{_slug(style.style)}"
-        results.append(
-            _trial(synthesizer, voice, name, CONTROL_TEXT, style, output_dir / "controls" / _slug(voice))
-        )
+    timings = voice_timings(results)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "report.json").write_text(
-        json.dumps([asdict(result) for result in results], indent=2), encoding="utf-8"
+        json.dumps(
+            {
+                "results": [asdict(result) for result in results],
+                "timings": [asdict(timing) for timing in timings],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
-    return results
+    return results, timings

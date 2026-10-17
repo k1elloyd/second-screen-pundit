@@ -17,7 +17,14 @@ from second_screen_pundit.agents.commentator import (
     validate_plain_spoken_text,
 )
 from second_screen_pundit.agents.config import AgentSettings
-from second_screen_pundit.agents.delivery import TIER_STYLES, tier_for_event
+from second_screen_pundit.agents.delivery import (
+    HARRY_PROFILE,
+    RYAN_PROFILE,
+    VOICE_PROFILES,
+    tier_for_event,
+    voice_profile,
+)
+from second_screen_pundit.agents.models import DeliveryTier
 from second_screen_pundit.agents.dispatcher import LiveDispatcher
 from second_screen_pundit.agents.evidence import check_evidence
 from second_screen_pundit.agents.fallbacks import FALLBACK_VARIANTS, fallback_lines
@@ -466,22 +473,76 @@ def test_every_signal_fallback_variant_passes_for_every_team() -> None:
 # SSML
 
 
-def test_ssml_escapes_inserted_text_and_carries_the_tier_style() -> None:
+_SSML_NS = {"s": "http://www.w3.org/2001/10/synthesis", "m": "http://www.w3.org/2001/mstts"}
+
+
+def test_ssml_escapes_inserted_text_and_the_voice_name() -> None:
     ssml = build_ssml(
         'Rovers & "friends" <script> 1-0',
         voice='en-GB-"Sonia"Neural',
         tier="red_card",
     )
     root = ElementTree.fromstring(ssml)
-    namespace = {"s": "http://www.w3.org/2001/10/synthesis", "m": "http://www.w3.org/2001/mstts"}
-    voice = root.find("s:voice", namespace)
+    voice = root.find("s:voice", _SSML_NS)
     assert voice is not None and voice.get("name") == 'en-GB-"Sonia"Neural'
-    express = voice.find("m:express-as", namespace)
+    # A voice without a profile gets no style at all.
+    assert voice.find("m:express-as", _SSML_NS) is None
+    assert voice.text == 'Rovers & "friends" <script> 1-0'
+    assert "<script>" not in ssml
+
+
+def test_ssml_carries_harrys_tier_style_without_a_style_degree() -> None:
+    ssml = build_ssml(
+        'Rovers & "friends" <script> 1-0',
+        voice="en-GB-Harry:MAI-Voice-2.1-Flash",
+        tier="red_card",
+    )
+    root = ElementTree.fromstring(ssml)
+    voice = root.find("s:voice", _SSML_NS)
+    assert voice is not None and voice.get("name") == "en-GB-Harry:MAI-Voice-2.1-Flash"
+    express = voice.find("m:express-as", _SSML_NS)
     assert express is not None
-    assert express.get("style") == TIER_STYLES["red_card"].style == "sports_commentary"
-    assert express.get("styledegree") == "1.4"
+    assert express.get("style") == "surprised"
+    assert express.get("styledegree") is None
     assert express.text == 'Rovers & "friends" <script> 1-0'
     assert "<script>" not in ssml
+
+
+@pytest.mark.parametrize(
+    ("tier", "style"),
+    [
+        ("goal", "joyful"),
+        ("goal_equaliser", "joyful"),
+        ("goal_peak", "surprised"),
+        ("big_chance", "surprised"),
+        ("red_card", "surprised"),
+        ("tactical", "narrator"),
+        ("formation", "narrator"),
+        ("substitution", "neutral"),
+        ("booking", "neutral"),
+        ("routine", "neutral"),
+    ],
+)
+def test_harry_energy_tiers(tier: DeliveryTier, style: str) -> None:
+    chosen = voice_profile("en-GB-Harry:MAI-Voice-2.1-Flash").style_for(tier)
+    assert chosen is not None and chosen.style == style
+
+
+def test_ryan_gets_only_his_documented_styles() -> None:
+    ryan = voice_profile("en-GB-RyanNeural")
+    assert ryan is RYAN_PROFILE
+    styled = build_ssml("Port Calder lead one-nil.", voice="en-GB-RyanNeural", tier="goal")
+    assert 'style="cheerful" styledegree="1.2"' in styled
+    # Ryan has no style that fits a red card: none is sent.
+    assert "express-as" not in build_ssml("Sent off.", voice="en-GB-RyanNeural", tier="red_card")
+
+
+def test_an_unsupported_style_is_never_sent() -> None:
+    from second_screen_pundit.agents.delivery import TierStyle, VoiceProfile
+
+    profile = VoiceProfile(frozenset({"neutral"}), {"goal": TierStyle("joyful")})
+    assert profile.style_for("goal") is None
+    assert profile.style_for(None) is None
 
 
 def test_ssml_without_a_tier_has_no_style() -> None:
@@ -490,7 +551,12 @@ def test_ssml_without_a_tier_has_no_style() -> None:
     ElementTree.fromstring(ssml)
 
 
-def test_every_tier_has_a_valid_style_degree() -> None:
-    for tier, style in TIER_STYLES.items():
-        assert style.style in {"sports_commentary", "sports_commentary_excited"}, tier
-        assert 0.01 <= style.style_degree <= 2, tier
+def test_every_profile_style_is_supported_by_its_voice() -> None:
+    for voice, profile in VOICE_PROFILES.items():
+        for tier, style in profile.tier_styles.items():
+            assert style.style in profile.supported_styles, (voice, tier)
+            if style.style_degree is not None:
+                assert 0.01 <= style.style_degree <= 2, (voice, tier)
+    # Harry has a style for every tier, and MAI voices get no styledegree.
+    assert set(HARRY_PROFILE.tier_styles) == set(DeliveryTier.__args__)  # type: ignore[attr-defined]
+    assert all(style.style_degree is None for style in HARRY_PROFILE.tier_styles.values())

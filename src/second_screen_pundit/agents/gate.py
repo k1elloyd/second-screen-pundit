@@ -107,6 +107,8 @@ async def run_phase2_gate(output_path: Path) -> None:
             endpoint=speech_endpoint,
             region=speech_region,
             credential=credential,
+            voice_name=settings.speech_voice,
+            fallback_voice_name=settings.speech_fallback_voice,
         )
         script = " ".join(validated_text + validated_text[:2])
         artifact = speech.synthesize_mp3(script, output_path)
@@ -125,14 +127,26 @@ def run_voice_trial_gate() -> None:
     load_dotenv()
     settings = AgentSettings.from_environment()
     speech_endpoint, speech_region = settings.require_speech()
+    voices = (settings.speech_voice, settings.speech_fallback_voice)
     with DefaultAzureCredential() as credential:
-        results = run_voice_trial(
+        results, timings = run_voice_trial(
             endpoint=speech_endpoint,
             region=speech_region,
             credential=credential,
+            voices=voices,
         )
     for result in results:
-        print(json.dumps(result.__dict__))
+        print(
+            f"{result.voice:<32} {result.line:<24} style={result.style:<9} "
+            f"ms={list(result.request_ms)} {result.verdict}"
+            + (f" error={result.error}" if result.error else "")
+        )
+    for timing in timings:
+        print(
+            f"TIME {timing.voice}: first request {timing.first_request_ms} ms; "
+            f"after the first, {timing.later_requests} requests, median "
+            f"{timing.later_median_ms} ms, slowest {timing.later_slowest_ms} ms"
+        )
 
 
 def main() -> None:
@@ -150,7 +164,10 @@ def main() -> None:
     parser.add_argument(
         "--voice-trial",
         action="store_true",
-        help="Synthesise the trial lines with each candidate voice into data/audio/voice-trials/.",
+        help=(
+            "Synthesise the trial lines with SPEECH_VOICE and SPEECH_FALLBACK_VOICE into "
+            "data/audio/voice-trials/, timing each request."
+        ),
     )
     parser.add_argument("--match", choices=("m01", "m02", "m03"), default="m01")
     parser.add_argument("--speed", type=int, default=20)

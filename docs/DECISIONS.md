@@ -401,3 +401,37 @@ The recap was agent-written on its second attempt (the first failed on an ungrou
 **Earlier runs while fixing.** Run 1 (headline facts not auto-cited): 5 of 8; the 50' answer stated the score and previous formation without citing them. Run 2 (headline facts auto-cited): 6 of 8, recap agent-written. Run 3 (after adding running scores and the recap story rule): 5 of 8 and a fallback recap; the 74' answer quoted the window `59-75'`, which the check read as a score, and both recap attempts used uncited snapshot stats. Run 4 is the table above. Separately, 8 standalone recaps after the recap changes: m01 3 of 3 agent-written, m02 4 of 5 (the miss was the `length` cut-off that led to the 2,500 cap), m03 1 of 1.
 
 Full suite: 170 passed, 3 deselected (live). The live `test_live_m01_recap_is_agent_written` passed.
+
+## Phase 3 Session B, group 1: what the viewer hears
+
+### Voice: en-GB-Harry (MAI-Voice-2.1-Flash), Ryan as fallback
+
+Evidence from 17 Oct 2026:
+- **UK South rejects MAI voices.** Error 1007, "Unsupported voice … aoai-tts-servercontroller".
+- **No en-GB sports style.** The UK South voice list has no en-GB voice with a sports-commentary style; Ryan has only cheerful and chat.
+- **Sweden Central serves Harry.** The new resource `pundit-speech-swc-kl` serves `en-GB-Harry:MAI-Voice-2.1-Flash`, and in a listening check its styles clearly change the delivery. Learn's MAI-Voice page lists Sweden Central among the serving regions, and lists Harry's styles as agent, angry, audiobook, customer_call_center, disgusted, educational, fearful, joyful, narrator, neutral, sad and surprised. Learn documents no `styledegree` for MAI voices, so none is sent.
+- **Speed.** `python -m second_screen_pundit.agents.gate --voice-trial`, 7 lines × 3 requests per voice, wall clock per request: Harry's first request took 4,308 ms, then a median of 2,428 ms per line (slowest 3,974 ms, 20 requests). Ryan's first took 3,222 ms, then a median of 2,496 ms (slowest 4,152 ms).
+- **Ryan works on the same resource.** All 21 Ryan requests succeeded on the Sweden Central endpoint, so both voices use the one `SPEECH_ENDPOINT`.
+- **The duration method can't prove Harry's styles.** Harry's two plain renders of the same line differ in length on all 7 lines, so the trial reports "inconclusive" for Harry; the evidence that his styles work is the listening check. On Ryan, cheerful and chat changed the duration on all 5 styled lines.
+
+**Settings.** `SPEECH_VOICE` (default `en-GB-Harry:MAI-Voice-2.1-Flash`) and `SPEECH_FALLBACK_VOICE` (default `en-GB-RyanNeural`). If the main voice fails, synthesis retries once with the fallback and logs `speech_voice_fallback`; every success logs `speech_synthesized voice=…`. The text is always sent, whatever happens to the audio.
+
+**Styles per voice** (`agents/delivery.py`, `VOICE_PROFILES`). A style is sent only if the voice's Learn list includes it, and a voice with no profile gets no style. The old `sports_commentary` map is gone: neither voice lists it.
+
+| Tier | Harry | Ryan |
+| :-- | :-- | :-- |
+| Goal, equaliser | joyful | cheerful (1.2, 1.5) |
+| Late go-ahead goal (75'+), big chance, red card | surprised | goal: cheerful 1.7; others none |
+| Formation change, tactical | narrator | chat 1.0 |
+| Substitution, booking, routine | neutral | none |
+
+There are no penalty events in the data, so penalties have no tier yet.
+
+### Spoken text
+
+`agents/spoken.py` `to_spoken`, called only in `SpeechSynthesizer.synthesize_mp3`; displayed text, the evidence check and stored lines are unchanged. The rules follow review 2 finding 8, with British phrasing: "one-nil", "nil-nil", "one-all" for any level score, "four-two-three-one", "in the eighty-eighth minute" (minute marks and "At N minutes" become word ordinals; so does a digit ordinal before "minute", which the review left unchanged), "ninety plus three", "60 to 75 minutes", "between 60 and 75 minutes", "per cent". "N minutes left" and xG are unchanged. The tests check idempotence and that no dashed number pair survives.
+
+### Audio queue
+
+- **Server.** The dispatcher's `on_line_ready` hook starts TTS as soon as a line passes its checks, while it waits out the broadcast delay. If the audio is ready at release, the `commentary` event carries `audio_id`; otherwise the text goes at once and `commentary_audio` follows.
+- **Browser.** One `Audio` element, unlocked with a silent clip inside the Start click. Lines play in order with no per-line player. At most one line waits behind the one playing, and a line's audio is dropped if it hasn't started 12 s after its text arrived. Answers, the recap and "▶ Replay" go to the front without cutting off the current line. Mute clears the queue and is kept in `localStorage`. Pause and Resume also pause and resume the queue. If the unlock failed, an "Enable audio" button appears.

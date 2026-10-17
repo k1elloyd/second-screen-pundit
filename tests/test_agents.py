@@ -1155,8 +1155,8 @@ def test_speech_synthesizer_uses_entra_and_emits_mp3(
     assert observed["synthesizer"]["audio_config"] is None  # type: ignore[index]
     assert observed["format"] == "mp3"
     ssml = str(observed["ssml"])
-    assert '<voice name="en-GB-RyanNeural">' in ssml
-    assert 'style="sports_commentary_excited" styledegree="1.7"' in ssml
+    assert '<voice name="en-GB-Harry:MAI-Voice-2.1-Flash">' in ssml
+    assert '<mstts:express-as style="surprised">' in ssml
     assert "Goal for Ashbridge Rovers &amp; co &lt;now&gt;." in ssml
     assert "<now>" not in ssml
     assert artifact.duration_seconds == 121

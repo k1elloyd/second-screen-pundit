@@ -21,7 +21,7 @@ from second_screen_pundit.agents.pipeline import (
     score_phrase_allowed,
 )
 from second_screen_pundit.agents.prompts import COMMENTATOR_INSTRUCTIONS
-from second_screen_pundit.agents.speech import DEFAULT_VOICE
+from second_screen_pundit.agents.speech import DEFAULT_FALLBACK_VOICE, DEFAULT_VOICE
 from second_screen_pundit.agents.tools.analytics import Fact, ToolResult
 from second_screen_pundit.engine.generate import generate_match, get_match_info
 from tests.test_tactical import _dispatch, _StubPipeline
@@ -258,5 +258,6 @@ def test_fast_path_formation_line_can_name_the_previous_shape(
     assert result.evidence is not None and result.evidence.passed
 
 
-def test_default_voice_is_ryan() -> None:
-    assert DEFAULT_VOICE == "en-GB-RyanNeural"
+def test_default_voice_is_harry_with_ryan_as_fallback() -> None:
+    assert DEFAULT_VOICE == "en-GB-Harry:MAI-Voice-2.1-Flash"
+    assert DEFAULT_FALLBACK_VOICE == "en-GB-RyanNeural"

@@ -60,6 +60,9 @@ class LiveDispatcher:
     settings: AgentSettings
     delay: BroadcastDelay | None = None
     on_outcome: OutcomeHandler | None = None
+    # Called, without awaiting, as soon as a line is ready and before it waits for release,
+    # so audio can be synthesised during the broadcast delay.
+    on_line_ready: OutcomeHandler | None = None
     outcomes: list[WindowOutcome] = field(default_factory=list)
     boundaries: list[BoundaryRecord] = field(default_factory=list)
 
@@ -242,6 +245,13 @@ class LiveDispatcher:
                 type(exc).__name__,
             )
         outcome.elapsed_ms = round((time.monotonic() - started) * 1000)
+        if (
+            self.on_line_ready is not None
+            and outcome.result is not None
+            and outcome.result.status == "commentary"
+            and outcome.result.line is not None
+        ):
+            self.on_line_ready(outcome)
         if (
             self.delay is not None
             and outcome.result is not None

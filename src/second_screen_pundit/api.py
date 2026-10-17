@@ -69,6 +69,8 @@ class ReplaySession:
     recap_task: asyncio.Task[None] | None = None
     runner_task: asyncio.Task[None] | None = None
     question_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # Line audio started while the line waits for release, keyed by the internal line ID.
+    line_audio_tasks: dict[str, asyncio.Task[str | None]] = field(default_factory=dict)
     dispatcher: LiveDispatcher | None = None
     dispatch_source: AsyncIterator[Event] | None = None
     viewer_source: AsyncIterator[Event] | None = None
@@ -321,6 +323,8 @@ def create_app(
             endpoint=endpoint,
             region=region,
             credential=app.state.credential,
+            voice_name=configured_settings.speech_voice,
+            fallback_voice_name=configured_settings.speech_fallback_voice,
         )
         return app.state.speech_recognizer, app.state.speech_synthesizer
 
@@ -356,6 +360,15 @@ def create_app(
         except Exception as exc:
             logger.warning("speech_synthesis_unavailable error=%s", type(exc).__name__)
             return None
+
+    def prepare_line_audio(session: ReplaySession, outcome: WindowOutcome) -> None:
+        """Start the line's TTS during the broadcast delay, so text and audio arrive together."""
+        line = outcome.result.line if outcome.result is not None else None
+        if line is None or session.stopped:
+            return
+        session.line_audio_tasks[line.line_id] = asyncio.create_task(
+            synthesize(session, line.text, tier=line.delivery_tier)
+        )
 
     async def publish_outcome(session: ReplaySession, outcome: WindowOutcome) -> None:
         if outcome.result is None:
@@ -400,6 +413,23 @@ def create_app(
             "agent": line.source,
             "evidence": _evidence_payload(outcome.result.evidence),
         }
+        audio_task = session.line_audio_tasks.pop(line.line_id, None)
+        if audio_task is not None and audio_task.done() and not audio_task.cancelled():
+            # The usual case: the audio was ready before the line's release.
+            audio_id = audio_task.result()
+            await session.queue.put(
+                (
+                    "commentary",
+                    {
+                        "line": public_line.model_dump(mode="json"),
+                        "audio_id": audio_id,
+                        "audio_available": audio_id is not None,
+                        "audio_pending": False,
+                    },
+                )
+            )
+            return
+        # The text never waits for its audio.
         await session.queue.put(
             (
                 "commentary",
@@ -411,7 +441,11 @@ def create_app(
                 },
             )
         )
-        audio_id = await synthesize(session, line.text, tier=line.delivery_tier)
+        audio_id = (
+            await audio_task
+            if audio_task is not None
+            else await synthesize(session, line.text, tier=line.delivery_tier)
+        )
         await session.queue.put(
             (
                 "commentary_audio" if audio_id is not None else "commentary_audio_unavailable",
@@ -526,6 +560,11 @@ def create_app(
         for task in list(session.question_tasks):
             task.cancel()
         await asyncio.gather(*session.question_tasks, return_exceptions=True)
+        audio_tasks = list(session.line_audio_tasks.values())
+        session.line_audio_tasks.clear()
+        for task in audio_tasks:
+            task.cancel()
+        await asyncio.gather(*audio_tasks, return_exceptions=True)
         session.audio.clear()
         sessions.pop(session.replay_id, None)
         if tab_sessions.get(session.tab_id) == session.replay_id:
@@ -636,6 +675,7 @@ def create_app(
             configured_settings,
             delay=delay,
             on_outcome=lambda outcome: publish_outcome(session, outcome),
+            on_line_ready=lambda outcome: prepare_line_audio(session, outcome),
         )
         session.dispatch_source = replay.subscribe()
         session.viewer_source = replay.subscribe()
