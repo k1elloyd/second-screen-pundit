@@ -68,7 +68,7 @@ def test_a_question_and_its_speech_are_traced(spans: InMemorySpanExporter) -> No
         response = client.post(
             "/api/ask",
             json={"replay_id": session.replay_id, "question": "Has a goal been scored?"},
-            headers={"X-Forwarded-For": "198.51.100.70"},
+            headers={"X-Forwarded-For": "198.51.100.70", "X-Replay-Token": session.token},
         )
         assert response.status_code == 200
 

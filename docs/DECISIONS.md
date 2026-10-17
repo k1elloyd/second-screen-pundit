@@ -569,7 +569,11 @@ Mutation checks: with the server ignoring `Last-Event-ID`, the first four fail. 
 
 ### Follow-ups after group 1
 
-- **Only the starting client can use a replay.** The replay ID is `uuid4().hex` (122 random bits), but it appears in URLs and in line IDs. The stream, `/control`, `/api/ask` and `/api/ask-audio` now also require the caller's address (the right-most `X-Forwarded-For` entry, as for the limits) to match the address that started the replay; anyone else gets the same 404 as a missing replay. `tests/test_stream_resume.py::test_only_the_starting_client_can_attach_to_or_drive_a_replay` covers a second client, a resume attempt with `Last-Event-ID`, a spoofed `X-Forwarded-For` prefix, `/control` and `/ask`; it fails with the check removed. **Cost:** a phone that changes network mid-match (Wi-Fi to mobile) gets a new address, so its reconnect is refused and it must press Start again.
+- **A replay belongs to whoever holds its token** (replaced an IP-match check from earlier in group 2, which broke viewers sharing an office address and phones that change network).
+  - `/start` returns `replay_token` (`secrets.token_urlsafe(24)`, 192 bits) with the replay ID. The page keeps it in memory only and sends it as `X-Replay-Token` on the stream, `/control`, `/api/ask` and `/api/ask-audio`. A missing or wrong token gets the same 404 as a missing replay (constant-time compare). The caller's address plays no part, so a reconnect from a new network resumes.
+  - **One replay per viewer**, keyed on `X-Client-ID`: an ID the page makes once and keeps in `sessionStorage` (it replaces `X-Tab-ID`). A viewer's new Start stops only their own earlier replay; two people on one network keep theirs.
+  - **The address is for limits only:** the question rate limit, and at most 3 *running* replays per address (`429` beyond that), inside the global cap of 3. Rotating the client ID or a spoofed `X-Forwarded-For` prefix doesn't escape the per-address cap, since the address is the right-most entry.
+  - Tests: without or with a wrong token, every replay call is refused (fails with the check removed); two client IDs on one address each run a replay and a third is allowed, a fourth gets 429; a reconnect from a different address with the token resumes with contiguous message IDs.
 - **Memory.** When a replay is stopped (a new Start from the same client, or no reconnect within the grace period) its session is removed, its audio cleared and its outbox emptied. A replay that has reached full time is kept while its tab stays open, so audio Replay and Why? still work; it holds no replay slot. Measured for m01 in cached mode: 1,567 outbox messages, 623 KB of JSON, about 4.5 MB of Python heap with stub audio. Real audio is 160 kbit/s MP3, about 20 KB per spoken second: about 2–3 MB of line audio and 1 MB of recap for a 20x match. Spoken answers add about 200 KB each, so the worst case is set by the question limit (6 a minute) times the match length; the group 3 TTS cap bounds it.
 
 ## Phase 4, group 2: infrastructure
@@ -634,3 +638,45 @@ Plain container environment variables, no secrets and no keys: `NARRATIVE_MODE`,
 - `/healthz` reported `warmup: ready`, so the identity's Foundry call worked.
 - Smoke test: m01 at 120x from a script. The first line arrived 22.6 s in, its audio followed as `commentary_audio`, and `/api/audio/{id}` returned a 176,640-byte `audio/mpeg`. When the script left, the replay stopped 30 s later (`replay_stream_not_reconnected`).
 - App Insights, last 30 minutes: `chat gpt-5.4-mini` and `pundit.turn` dependencies, `GET /msi/token` (keyless ingestion and model access), and the app's logs as traces.
+
+## Phase 4, group 3: public-facing safety and first impressions
+
+### Spending guard
+
+- **Caps.** `MODEL_CALLS_PER_DAY` (default 1,500) and `TTS_CHARACTERS_PER_DAY` (default 150,000), per UTC day, for the whole app. Both are Bicep parameters, so `azd env set MODEL_CALLS_PER_DAY 0` then `azd provision` forces cached mode. 0 trips the guard at once.
+- **Counting.** `PunditPipeline` reports every model call *before* making it (live windows, questions and the recap, retries included), so a failed call still counts. TTS characters are counted before each synthesis. Counts are in memory: one replica; they reset at midnight UTC and on a restart.
+- **When either cap is reached:**
+  - A new viewer's `/start` returns `mode: "cached"`, `audio: false` and a short notice: "The pundit has reached today's limit, so this match uses pre-written commentary with audio off. Live commentary is back tomorrow." The page shows it as a card in the feed and disables the mic. That replay uses the cached pipeline: pre-written lines, cached Q&A, the deterministic recap, no model calls and no speech. Lines arrive with `audio_pending: false`, so no card waits for audio.
+  - Start works even if the model warm-up failed, since cached mode doesn't need the model; `/healthz` reports `ready: true` and `limited: true`.
+  - Questions on a replay that was already running live are answered from the cache once the model-call cap is reached.
+  - Speech stops everywhere once the TTS cap is reached: the text is still delivered, and the audio event says "unavailable", as for any TTS failure.
+  - Live windows of replays already running continue until they end. At most 3 replays run, so the overshoot is bounded by those matches.
+  - Spoken questions on a limited replay get a polite 409 ("Spoken questions are off for this match. Please type your question.").
+- **Logging.** `spending_guard_tripped kind=model_calls|tts_characters used=… cap=…` once per cap per day (WARNING, so it reaches App Insights), and `replay_started_limited` for each limited replay.
+- **Tests** (`tests/test_spending.py`): counting, a single log per trip, the daily reset; with the cap at 0, a whole m01 in cached mode with no live-pipeline call and no speech, the notice, a typed answer from the cache and the spoken-question refusal; a TTS cap reached mid-replay gives `answer_audio_unavailable` with the text delivered.
+
+### Warm-up
+
+- **Starting container.** While the container starts (a new revision, a restart, or scale-from-zero with `MIN_REPLICAS=0`), Container Apps ingress holds the first request until the startup probe on `/healthz` passes; uvicorn is up in a few seconds. The page and `/healthz` arrive as soon as it is.
+- **Model warm-up.** The page then shows "Warming up the pundit… Ns" (a running count in the status chip and in the feed's empty state, which is the part phones show) until `/healthz` reports ready. Start stays disabled until then.
+- **Errors during start-up are not errors.** A 5xx or failed request from `/healthz` or `/api/matches` (for example while a revision swaps) keeps the warming message and retries every 2.5 s; nothing is shown in red.
+- **Polling stops once ready** (review 2 finding 17), so an open tab doesn't keep a scale-to-zero app awake. A failed warm-up is retried every 15 s.
+- The first paint already says "Warming up the pundit…", before any script runs.
+
+### Review 2 container-readiness table
+
+| Row | Status | How |
+| :-- | :-- | :-- |
+| Container image | Done | `python:3.12-slim-bookworm`, `ca-certificates`, `libssl3`, `libasound2`, non-root user (group 2). |
+| Working-directory paths | Done, differently | No `DATA_DIR`: `WORKDIR /app` with `data/cached` copied in. The API generates matches in memory (about 130 ms per Start) and never writes `data/matches`; nothing is written at runtime except temp audio under `/tmp`. A read-only, non-root filesystem works. |
+| Audio storage | Done | In memory per replay, cleared when the replay stops; `/tmp` is writable for the synthesis temp file. Bounded by the TTS cap. |
+| In-memory state | Done | `maxReplicas: 1`, one uvicorn worker (`serve.py`). README note on restarts: Phase 5. |
+| Port and bind address | Done | `0.0.0.0:8000` from `serve.py` (`PORT`), Bicep `targetPort` 8000, no `--env-file`. |
+| Health checks | Done | `/healthz` for startup (60 s), liveness and readiness; no model or speech calls (tested); 200 while warming, so the page can say so. |
+| Cold start | Done (page); README note in Phase 5 | Elapsed-seconds count on the warm-up chip and feed. `MIN_REPLICAS=1` keeps judging warm. |
+| SSE through ingress | Done | 240 s request timeout from Learn; resume with `Last-Event-ID` and a 200 s server close (group 1). |
+| Managed identity | Done | `AZURE_CLIENT_ID` set to the user-assigned identity; `DefaultAzureCredential` and the Azure Monitor exporter use it. |
+| Logging | Done | Root logging at INFO in `serve.py`, Azure SDK at WARNING; app logs reach App Insights through `configure_azure_monitor`. |
+| Cost guardrails | Done | Findings 7 and 12 fixed in Session B group 3 (stream deadline, replay slots, right-most `X-Forwarded-For`); per-replay token and per-address cap (group 3); the daily spending guard. |
+| Speech role (added in Session B) | Done | Cognitive Services Speech User on `pundit-speech-swc-kl`, scoped to the resource (group 2). |
+| Ingress request timeout (added in Session B) | Done | Group 1. |

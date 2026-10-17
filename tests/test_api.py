@@ -90,7 +90,7 @@ def _session(
     replay.as_of = goal_seq
     return ReplaySession(
         replay_id=replay_id,
-        tab_id="test-client:test-tab",
+        client_id="test-client",
         client_ip=client_ip,
         info=get_match_info("m02"),
         events=events,
@@ -100,12 +100,13 @@ def _session(
     )
 
 
-def _get_request(client_ip: str, path: str = "/") -> Request:
+def _get_request(client_ip: str, path: str = "/", *, token: str | None = None) -> Request:
     """A bare request from `client_ip`, for calling a route's endpoint directly."""
+    headers = [] if token is None else [(b"x-replay-token", token.encode())]
     return Request({
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
         "method": "GET", "scheme": "http", "path": path, "raw_path": path.encode(),
-        "query_string": b"", "headers": [], "client": (client_ip, 1234),
+        "query_string": b"", "headers": headers, "client": (client_ip, 1234),
         "server": ("127.0.0.1", 8000),
     })
 
@@ -137,7 +138,7 @@ def test_typed_question_uses_viewer_release_not_newer_agent_position() -> None:
         response = client.post(
             "/api/ask",
             json={"replay_id": session.replay_id, "question": "Has a goal been scored?"},
-            headers={"X-Forwarded-For": "198.51.100.22"},
+            headers={"X-Forwarded-For": "198.51.100.22", "X-Replay-Token": session.token},
         )
 
     assert response.status_code == 200
@@ -169,7 +170,7 @@ def test_spoken_question_uses_the_same_viewer_cutoff_and_returns_server_audio() 
             "/api/ask-audio",
             data={"replay_id": session.replay_id},
             files={"audio": ("question.wav", _wav(), "audio/wav")},
-            headers={"X-Forwarded-For": "198.51.100.23"},
+            headers={"X-Forwarded-For": "198.51.100.23", "X-Replay-Token": session.token},
         )
         body = response.json()
 
@@ -222,7 +223,7 @@ def test_typed_answer_text_returns_at_once_and_its_audio_follows_on_sse() -> Non
         response = client.post(
             "/api/ask",
             json={"replay_id": session.replay_id, "question": "Has a goal been scored?"},
-            headers={"X-Forwarded-For": "198.51.100.24"},
+            headers={"X-Forwarded-For": "198.51.100.24", "X-Replay-Token": session.token},
         )
         body = response.json()
 
@@ -478,7 +479,7 @@ def test_match_start_gives_each_client_one_replay_and_caps_at_three() -> None:
         def start(match: str, ip: str, tab: str):
             return client.post(
                 f"/api/matches/{match}/start?speed=120",
-                headers={"X-Tab-ID": tab, "X-Forwarded-For": ip},
+                headers={"X-Client-ID": tab, "X-Forwarded-For": ip},
             )
 
         first = start("m02", "198.51.100.1", "tab-one")
@@ -506,7 +507,7 @@ def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:
             replay = Replay(events, 20)
             session = ReplaySession(
                 replay_id="disconnect-replay",
-                tab_id="test-client:disconnect-tab",
+                client_id="disconnect-client",
                 client_ip="testclient",
                 info=get_match_info("m02"),
                 events=events,
@@ -514,7 +515,7 @@ def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:
                 delay=BroadcastDelay(0),
             )
             app.state.sessions[session.replay_id] = session
-            app.state.tab_sessions[session.tab_id] = session.replay_id
+            app.state.client_sessions[session.client_id] = session.replay_id
             replay.start()
             worker = asyncio.create_task(asyncio.sleep(30))
             session.runner_task = worker
@@ -524,7 +525,9 @@ def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:
                 for route in app.routes
                 if getattr(route, "path", None) == "/api/replays/{replay_id}/stream"
             )
-            response = await route.endpoint(session.replay_id, _get_request("testclient"))
+            response = await route.endpoint(
+                session.replay_id, _get_request("testclient", token=session.token)
+            )
             chunks = [await response.body_iterator.__anext__() for _ in range(2)]
             await response.body_iterator.aclose()
             assert not session.stopped  # still inside the grace period
@@ -569,7 +572,7 @@ def test_sse_reports_worker_failure_and_completes_full_time(
                 "path": "/api/matches/m02/start",
                 "raw_path": b"/api/matches/m02/start",
                 "query_string": b"",
-                "headers": [(b"x-tab-id", b"worker-failure-tab")],
+                "headers": [(b"x-client-id", b"worker-failure-tab")],
                 "client": ("198.51.100.25", 1234),
                 "server": ("127.0.0.1", 8000),
             }
@@ -585,7 +588,9 @@ def test_sse_reports_worker_failure_and_completes_full_time(
             )
             started = await start_endpoint("m02", Request(scope), speed=120)
             session = app.state.sessions[started["replay_id"]]
-            response = await stream_endpoint(started["replay_id"], Request(scope))
+            response = await stream_endpoint(
+                started["replay_id"], _get_request("198.51.100.25", token=started["replay_token"])
+            )
             chunks: list[bytes] = []
             async for chunk in response.body_iterator:
                 chunks.append(chunk)
@@ -632,7 +637,7 @@ def test_live_model_warmup_runs_in_background_and_gates_start() -> None:
         assert client.get("/healthz").json()["warmup"] == "warming"
         gated = client.post(
             "/api/matches/m02/start?speed=20",
-            headers={"X-Tab-ID": "warmup-tab"},
+            headers={"X-Client-ID": "warmup-tab"},
         )
         assert gated.status_code == 503
         time.sleep(0.15)

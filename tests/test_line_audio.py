@@ -82,7 +82,7 @@ def _run(synth: _Synth, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict
                 "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
                 "method": "POST", "scheme": "http", "path": "/api/matches/m02/start",
                 "raw_path": b"/api/matches/m02/start", "query_string": b"",
-                "headers": [(b"x-tab-id", b"line-audio-tab")],
+                "headers": [(b"x-client-id", b"line-audio-tab")],
                 "client": ("198.51.100.40", 1234), "server": ("127.0.0.1", 8000),
             }
             routes = {
@@ -90,7 +90,8 @@ def _run(synth: _Synth, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict
             }
             started = await routes["/api/matches/{match_id}/start"]("m02", Request(scope), speed=120)
             response = await routes["/api/replays/{replay_id}/stream"](
-                started["replay_id"], Request(scope)
+                started["replay_id"],
+                Request({**scope, "headers": [(b"x-replay-token", started["replay_token"].encode())]}),
             )
             received: list[tuple[str, dict]] = []
             buffer = ""

@@ -1,6 +1,7 @@
 const el = (id) => document.getElementById(id);
-const tabId = sessionStorage.getItem("pundit-tab-id") || crypto.randomUUID();
-sessionStorage.setItem("pundit-tab-id", tabId);
+// This viewer's ID, kept for the tab's life: one replay per viewer, not per network address.
+const clientId = sessionStorage.getItem("pundit-client-id") || crypto.randomUUID();
+sessionStorage.setItem("pundit-client-id", clientId);
 
 const KEY_EVENT_TYPES = ["goal", "card", "substitution", "formation_change", "half_time", "full_time"];
 // The feed auto-scrolls only when the viewer is this close to the newest line.
@@ -10,6 +11,10 @@ const MAX_FEED_CARDS = 200;
 const state = {
   warmup: "warming",
   replayId: null,
+  // From /start; held in memory only and sent with every call about this replay.
+  replayToken: null,
+  // False when the server started this replay with audio off (the daily spending cap).
+  audio: true,
   controller: null,
   match: null,
   replayComplete: false,
@@ -78,31 +83,75 @@ function updateMatchLabels() {
   el("stadium").textContent = selected.dataset.stadium || "";
 }
 
+const WARMUP_POLL_MS = 2500;
+const warmupStarted = Date.now();
+const FEED_WAITING_TEXT = "Commentary and audio will arrive with the match. The viewer feed runs on a short broadcast delay.";
+let fixturesLoaded = false;
+
+function warmingText() {
+  return `Warming up the pundit… ${Math.round((Date.now() - warmupStarted) / 1000)}s`;
+}
+
+// Before a match, the feed's empty state says what the pundit is doing: it's the one message
+// that shows on every screen size (the status chip hides its text on phones).
+function setFeedWaiting(text) {
+  const empty = el("feed-empty");
+  if (empty) empty.textContent = text;
+}
+
+function showWarmStatus(kind, text) {
+  const status = el("warm-status");
+  status.classList.toggle("ready", kind === "ready");
+  status.classList.toggle("failed", kind === "failed");
+  status.lastElementChild.textContent = text;
+  status.title = text;
+}
+
+// Polls /healthz until the pundit is ready, then stops, so an open tab doesn't keep the app
+// awake. While the container is starting, /healthz fails (502/503 or no connection): that is
+// still "warming up", never an error.
 async function checkWarmup() {
+  let health = null;
   try {
-    const health = await responseJson(await fetch("/healthz", { cache: "no-store" }));
-    state.warmup = health.warmup;
-    const limits = health.limits || {};
-    state.questionLimit = limits.question_characters || 300;
-    state.questionAudioSeconds = limits.question_audio_seconds || 15;
-    state.questionAudioBytes = limits.question_audio_bytes || 1_000_000;
-    el("question-input").maxLength = state.questionLimit;
-    updateCharacterCount();
-    document.querySelector(".limit-note").textContent =
-      `${limits.questions_per_minute || 6} questions / ${limits.question_rate_window_seconds || 60}s`;
-    const status = el("warm-status");
-    status.classList.toggle("ready", health.ready);
-    status.classList.toggle("failed", health.warmup === "failed");
-    status.lastElementChild.textContent =
-      health.warmup === "ready" ? "Pundit ready" :
-      health.warmup === "failed" ? "Pundit unavailable — check server logs" :
-      "Pundit warming up…";
-    status.title = status.lastElementChild.textContent;
-    el("match-picker").disabled = !health.ready || (Boolean(state.replayId) && !state.replayComplete);
-    el("start-button").disabled = !health.ready || (Boolean(state.replayId) && !state.replayComplete);
-  } catch (error) {
-    showMessage(el("connection-state"), error.message, true);
+    if (!fixturesLoaded) {
+      await loadMatches();
+      fixturesLoaded = true;
+    }
+    const response = await fetch("/healthz", { cache: "no-store" });
+    if (response.ok) health = await response.json();
+  } catch {
+    health = null;
   }
+  if (!health) {
+    showWarmStatus("warming", warmingText());
+    setFeedWaiting(warmingText());
+    setTimeout(checkWarmup, WARMUP_POLL_MS);
+    return;
+  }
+  state.warmup = health.warmup;
+  const limits = health.limits || {};
+  state.questionLimit = limits.question_characters || 300;
+  state.questionAudioSeconds = limits.question_audio_seconds || 15;
+  state.questionAudioBytes = limits.question_audio_bytes || 1_000_000;
+  el("question-input").maxLength = state.questionLimit;
+  updateCharacterCount();
+  document.querySelector(".limit-note").textContent =
+    `${limits.questions_per_minute || 6} questions / ${limits.question_rate_window_seconds || 60}s`;
+  if (health.ready) {
+    showWarmStatus("ready", health.limited ? "Pundit ready · cached" : "Pundit ready");
+    setFeedWaiting(FEED_WAITING_TEXT);
+  } else if (health.warmup === "failed") {
+    showWarmStatus("failed", "Pundit unavailable");
+    setFeedWaiting("The pundit couldn't start. Please try again in a few minutes.");
+  } else {
+    showWarmStatus("warming", warmingText());
+    setFeedWaiting(warmingText());
+  }
+  const busy = Boolean(state.replayId) && !state.replayComplete;
+  el("match-picker").disabled = !health.ready || busy;
+  el("start-button").disabled = !health.ready || busy;
+  // Keep polling only until ready; a failed warm-up is retried slowly in case it recovers.
+  if (!health.ready) setTimeout(checkWarmup, health.warmup === "failed" ? 15000 : WARMUP_POLL_MS);
 }
 
 function eventText(event) {
@@ -642,7 +691,7 @@ function handleSse(name, payload) {
 // Reads one connection of the replay's stream. Returns normally when the server closes it
 // (it does so every few minutes, inside the ingress request timeout).
 async function readStream(url, controller, stream) {
-  const headers = { Accept: "text/event-stream" };
+  const headers = { Accept: "text/event-stream", "X-Replay-Token": state.replayToken };
   if (stream.lastEventId) headers["Last-Event-ID"] = stream.lastEventId;
   const response = await fetch(url, { signal: controller.signal, headers, cache: "no-store" });
   if (!response.ok) {
@@ -740,18 +789,23 @@ async function startReplay() {
     const speed = el("speed-picker").value;
     const started = await responseJson(await fetch(`/api/matches/${matchId}/start?speed=${speed}`, {
       method: "POST",
-      headers: { "X-Tab-ID": tabId },
+      headers: { "X-Client-ID": clientId },
     }));
     state.replayId = started.replay_id;
+    state.replayToken = started.replay_token;
+    state.audio = started.audio !== false;
     el("match-picker").disabled = true;
     el("start-button").disabled = true;
     el("start-button").textContent = "Replay running";
     el("pause-button").disabled = false;
     el("resume-button").disabled = true;
     el("question-input").disabled = false;
-    el("mic-button").disabled = false;
+    el("mic-button").disabled = !state.audio;
     el("ask-button").disabled = false;
-    el("connection-state").textContent = `Connected · ${speed}× replay`;
+    el("connection-state").textContent = started.mode === "cached"
+      ? `Connected · ${speed}× replay · pre-written commentary`
+      : `Connected · ${speed}× replay`;
+    if (started.notice) placeInFeed(errorCard(started.notice));
     const controller = new AbortController();
     state.controller = controller;
     consumeStream(`/api/replays/${started.replay_id}/stream`, controller).catch((error) => {
@@ -770,7 +824,7 @@ async function controlReplay(action) {
   try {
     const body = await responseJson(await fetch(`/api/replays/${state.replayId}/control`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Replay-Token": state.replayToken },
       body: JSON.stringify({ action }),
     }));
     if (body.state === "finished" || body.state === "stopped") {
@@ -819,7 +873,7 @@ async function askTyped(event) {
   try {
     const result = await responseJson(await fetch("/api/ask", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Replay-Token": state.replayToken },
       body: JSON.stringify({ replay_id: state.replayId, question }),
     }));
     const answered = answerCard(result);
@@ -891,7 +945,11 @@ async function sendSpokenQuestion(blob) {
   try {
     // 202 with the transcript as soon as speech-to-text finishes; the answer and its audio
     // follow on the replay's SSE stream as "answer" and "answer_audio".
-    const pending = await responseJson(await fetch("/api/ask-audio", { method: "POST", body: form }));
+    const pending = await responseJson(await fetch("/api/ask-audio", {
+      method: "POST",
+      headers: { "X-Replay-Token": state.replayToken },
+      body: form,
+    }));
     asked.querySelector(".question-text").textContent = `“${pending.transcript}”`;
     const thinking = thinkingCard();
     placeInFeed(thinking, { replace: waiting });
@@ -1046,5 +1104,4 @@ window.visualViewport?.addEventListener("resize", fitToVisualViewport);
 window.visualViewport?.addEventListener("scroll", fitToVisualViewport);
 fitToVisualViewport();
 
-loadMatches().then(checkWarmup).catch((error) => showMessage(el("connection-state"), error.message, true));
-setInterval(checkWarmup, 2500);
+checkWarmup();

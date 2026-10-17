@@ -341,7 +341,7 @@ def test_pause_control_pauses_the_broadcast_delay() -> None:
     with TestClient(app) as client:
         session = ReplaySession(
             replay_id="pause-replay",
-            tab_id="t",
+            client_id="t",
             client_ip="testclient",  # TestClient's address
             info=get_match_info("m02"),
             events=events,
@@ -350,10 +350,15 @@ def test_pause_control_pauses_the_broadcast_delay() -> None:
         )
         session.replay.state = "running"  # control only needs the state, not a publisher
         app.state.sessions[session.replay_id] = session
-        paused = client.post("/api/replays/pause-replay/control", json={"action": "pause"})
+        token = {"X-Replay-Token": session.token}
+        paused = client.post(
+            "/api/replays/pause-replay/control", json={"action": "pause"}, headers=token
+        )
         assert paused.json()["state"] == "paused"
         assert session.delay.paused
-        resumed = client.post("/api/replays/pause-replay/control", json={"action": "resume"})
+        resumed = client.post(
+            "/api/replays/pause-replay/control", json={"action": "resume"}, headers=token
+        )
         assert resumed.json()["state"] == "running"
         assert not session.delay.paused
         app.state.sessions.pop(session.replay_id)

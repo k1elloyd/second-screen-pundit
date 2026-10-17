@@ -859,6 +859,12 @@ class PunditPipeline:
         self.credential = credential
         self.cache_dir = cache_dir
         self._clients: dict[tuple[str, float], FoundryChatClient] = {}
+        # Told about every model call before it's made (the spending guard counts them).
+        self.on_model_call: Callable[[], None] | None = None
+
+    def _count_model_call(self) -> None:
+        if self.on_model_call is not None:
+            self.on_model_call()
 
     def _client(self, role: AgentRole, time_budget: float) -> FoundryChatClient:
         """One client per deployment and budget: a new client costs seconds on its first call."""
@@ -1217,6 +1223,7 @@ class PunditPipeline:
             started = time.perf_counter()
             response: object | None = None
             try:
+                self._count_model_call()
                 response = await agent.run(prompt)
                 return response
             finally:
@@ -1833,6 +1840,7 @@ class PunditPipeline:
                         middleware=[capture],
                         time_budget=deadline,
                     )
+                    self._count_model_call()
                     response = await _run_single_agent(
                         explainer,
                         json.dumps({**prompt_base, "retry_feedback": feedback}),
@@ -2128,6 +2136,7 @@ class PunditPipeline:
                         middleware=[capture],
                         time_budget=deadline,
                     )
+                    self._count_model_call()
                     response = await _run_single_agent(
                         producer,
                         json.dumps({**prompt_base, "retry_feedback": feedback}),

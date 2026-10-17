@@ -38,6 +38,12 @@
     "minReplicas": {
       "value": "${MIN_REPLICAS=1}"
     },
+    "modelCallsPerDay": {
+      "value": "${MODEL_CALLS_PER_DAY=1500}"
+    },
+    "ttsCharactersPerDay": {
+      "value": "${TTS_CHARACTERS_PER_DAY=150000}"
+    },
     "apiImageName": {
       "value": "${SERVICE_API_IMAGE_NAME=}"
     }

@@ -36,6 +36,14 @@ param narrativeMode string = 'live'
 @description('1 keeps one replica warm for judging; 0 scales to zero when idle.')
 param minReplicas int = 1
 
+@minValue(0)
+@description('Global daily cap on model calls (UTC day). 0 sends every new viewer to cached mode.')
+param modelCallsPerDay int = 1500
+
+@minValue(0)
+@description('Global daily cap on text-to-speech characters (UTC day).')
+param ttsCharactersPerDay int = 150000
+
 @description('Image set by azd deploy (SERVICE_API_IMAGE_NAME); empty on the first provision.')
 param apiImageName string = ''
 
@@ -259,6 +267,8 @@ resource app 'Microsoft.App/containerApps@2025-01-01' = {
           // Plain settings only: no secrets, no keys. Access is by the managed identity.
           env: [
             { name: 'NARRATIVE_MODE', value: narrativeMode }
+            { name: 'MODEL_CALLS_PER_DAY', value: string(modelCallsPerDay) }
+            { name: 'TTS_CHARACTERS_PER_DAY', value: string(ttsCharactersPerDay) }
             {
               name: 'FOUNDRY_PROJECT_ENDPOINT'
               value: 'https://${foundryAccount.properties.customSubDomainName}.services.ai.azure.com/api/projects/${foundryProject.name}'

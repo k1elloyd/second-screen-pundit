@@ -32,6 +32,16 @@ def _non_negative_float(name: str, default: float) -> float:
     return value
 
 
+def _non_negative_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{name} must not be negative")
+    return value
+
+
 def _positive_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -75,6 +85,10 @@ class AgentSettings:
     stream_max_seconds: float = 200
     # A replay whose stream dropped is kept this long for the browser to reconnect.
     stream_reconnect_grace_seconds: float = 30
+    # Global daily caps (UTC). When either is reached, new viewers get cached mode with audio
+    # off. 0 trips the guard at once.
+    model_calls_per_day: int = 1500
+    tts_characters_per_day: int = 150_000
 
     @classmethod
     def from_environment(cls) -> AgentSettings:
@@ -129,6 +143,8 @@ class AgentSettings:
             stream_reconnect_grace_seconds=_positive_float(
                 "STREAM_RECONNECT_GRACE_SECONDS", 30
             ),
+            model_calls_per_day=_non_negative_int("MODEL_CALLS_PER_DAY", 1500),
+            tts_characters_per_day=_non_negative_int("TTS_CHARACTERS_PER_DAY", 150_000),
         )
 
     def require_foundry(self) -> tuple[str, str, str]:

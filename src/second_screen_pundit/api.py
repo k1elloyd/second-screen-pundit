@@ -5,12 +5,13 @@ import io
 import json
 import logging
 import math
+import secrets
 import time
 import wave
 from collections import defaultdict, deque
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
@@ -35,11 +36,15 @@ from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import team_name
 from second_screen_pundit.observability import record_result, tracer, turn_span
 from second_screen_pundit.outbox import ViewerOutbox
+from second_screen_pundit.spending import CACHED_NOTICE, SpendingGuard
 
 
 logger = logging.getLogger(__name__)
 MAX_QUESTION_AUDIO_BYTES = 1_000_000
 MAX_QUESTION_AUDIO_SECONDS = 15
+# Replays one network address may run at once, within the global cap: judges in one office
+# share an address.
+MAX_REPLAYS_PER_ADDRESS = 3
 _WEB_DIR = Path(__file__).with_name("web")
 SSE_HEARTBEAT_SECONDS = 15
 # How long the browser waits before reconnecting a stream that closed or dropped.
@@ -51,10 +56,16 @@ class QuestionRequest(BaseModel):
     question: str
 
 
+def _new_replay_token() -> str:
+    return secrets.token_urlsafe(24)  # 192 bits
+
+
 @dataclass
 class ReplaySession:
     replay_id: str
-    tab_id: str
+    # The page's own ID (sessionStorage): one replay per viewer, whatever their address.
+    client_id: str
+    # The address is for rate limits and the per-address cap only, never for access.
     client_ip: str
     info: MatchInfo
     events: list[Event]
@@ -81,6 +92,13 @@ class ReplaySession:
     dispatcher: LiveDispatcher | None = None
     dispatch_source: AsyncIterator[Event] | None = None
     viewer_source: AsyncIterator[Event] | None = None
+    # Returned by /start and required (X-Replay-Token) on every call about this replay.
+    token: str = field(default_factory=_new_replay_token)
+    # The pipeline this replay was started with: the live one, or the cached one when the
+    # spending guard had tripped. None means the app's pipeline.
+    pipeline: Any = None
+    # Off for replays started after the spending guard tripped: no speech at all.
+    audio_enabled: bool = True
 
 
 class QuestionRateLimiter:
@@ -263,8 +281,12 @@ def create_app(
         window_seconds=configured_settings.question_rate_window_seconds,
     )
     manager = ReplayManager(max_concurrent=configured_settings.max_concurrent_replays)
+    guard = SpendingGuard(
+        configured_settings.model_calls_per_day,
+        configured_settings.tts_characters_per_day,
+    )
     sessions: dict[str, ReplaySession] = {}
-    tab_sessions: dict[str, str] = {}
+    client_sessions: dict[str, str] = {}
     pipeline_override = pipeline
     credential_override = credential
     recognizer_override = speech_recognizer
@@ -283,10 +305,14 @@ def create_app(
         app.state.pipeline = pipeline_override or PunditPipeline(
             configured_settings, app.state.credential
         )
+        if isinstance(app.state.pipeline, PunditPipeline):
+            app.state.pipeline.on_model_call = guard.record_model_call
+        app.state.spending = guard
+        app.state.cached_pipeline = None
         app.state.speech_recognizer = recognizer_override
         app.state.speech_synthesizer = synthesizer_override
         app.state.sessions = sessions
-        app.state.tab_sessions = tab_sessions
+        app.state.client_sessions = client_sessions
         app.state.manager = manager
         app.state.rate_limiter = limiter
 
@@ -329,6 +355,17 @@ def create_app(
     app = FastAPI(title="Second Screen Pundit", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
 
+    def cached_pipeline() -> PunditPipeline:
+        """Pre-written lines and cached Q&A: no model calls."""
+        if app.state.cached_pipeline is None:
+            app.state.cached_pipeline = PunditPipeline(
+                replace(configured_settings, mode="cached"), None
+            )
+        return app.state.cached_pipeline
+
+    def session_pipeline(session: ReplaySession) -> Any:
+        return session.pipeline if session.pipeline is not None else app.state.pipeline
+
     def speech_services() -> tuple[SpeechRecognizer, SpeechSynthesizer]:
         if app.state.speech_recognizer is not None and app.state.speech_synthesizer is not None:
             return app.state.speech_recognizer, app.state.speech_synthesizer
@@ -361,6 +398,10 @@ def create_app(
         *,
         tier: DeliveryTier | None = None,
     ) -> str | None:
+        if not session.audio_enabled:
+            return None
+        if not guard.allow_speech(len(text)):
+            return None  # the guard logs when it trips; the text is still delivered
         try:
             _, synthesizer = speech_services()
             audio_id = uuid4().hex
@@ -396,7 +437,7 @@ def create_app(
     def prepare_line_audio(session: ReplaySession, outcome: WindowOutcome) -> None:
         """Start the line's TTS during the broadcast delay, so text and audio arrive together."""
         line = outcome.result.line if outcome.result is not None else None
-        if line is None or session.stopped:
+        if line is None or session.stopped or not session.audio_enabled:
             return
         session.line_audio_tasks[line.line_id] = asyncio.create_task(
             synthesize(session, line.text, tier=line.delivery_tier)
@@ -452,6 +493,19 @@ def create_app(
             "evidence": _evidence_payload(outcome.result.evidence),
         }
         audio_task = session.line_audio_tasks.pop(line.line_id, None)
+        if not session.audio_enabled:
+            await session.outbox.put(
+                (
+                    "commentary",
+                    {
+                        "line": public_line.model_dump(mode="json"),
+                        "audio_id": None,
+                        "audio_available": False,
+                        "audio_pending": False,
+                    },
+                )
+            )
+            return
         if audio_task is not None and audio_task.done() and not audio_task.cancelled():
             # The usual case: the audio was ready before the line's release.
             audio_id = audio_task.result()
@@ -495,7 +549,7 @@ def create_app(
         try:
             with turn_span("recap", session.info.match_id) as span:
                 span.set_attribute("app.as_of", as_of)
-                result = await app.state.pipeline.produce_recap(
+                result = await session_pipeline(session).produce_recap(
                     session.info,
                     session.events,
                     as_of=as_of,
@@ -505,10 +559,12 @@ def create_app(
                 "recap": result.recap.model_dump(mode="json"),
                 "audio_id": None,
                 "audio_available": False,
-                "audio_pending": True,
+                "audio_pending": session.audio_enabled,
                 "evidence": _evidence_payload(result.evidence),
             }
             await session.outbox.put(("recap", payload))
+            if not session.audio_enabled:
+                return
             audio_id = await synthesize(session, result.recap.audio_script)
             await session.outbox.put(
                 (
@@ -623,18 +679,24 @@ def create_app(
         await asyncio.gather(*audio_tasks, return_exceptions=True)
         session.audio.clear()
         sessions.pop(session.replay_id, None)
-        if tab_sessions.get(session.tab_id) == session.replay_id:
-            tab_sessions.pop(session.tab_id, None)
+        if client_sessions.get(session.client_id) == session.replay_id:
+            client_sessions.pop(session.client_id, None)
 
     def find_session(replay_id: str, request: Request) -> ReplaySession:
-        """The replay, if the caller is the client that started it.
+        """The replay, if the caller holds its token.
 
-        The ID is 128 random bits, but it shows up in URLs; a second check that the caller has
-        the starting client's address keeps another client off the stream, the controls and
-        the Q&A. Someone else's replay gets the same 404 as a missing one.
+        The replay ID shows up in URLs; the token (X-Replay-Token, 192 random bits) is only in
+        the /start response and the page's memory. It doesn't depend on the caller's address,
+        so a phone that changes network keeps its replay. A missing or wrong token gets the
+        same 404 as a missing replay.
         """
         session = sessions.get(replay_id)
-        if session is None or session.stopped or session.client_ip != _client_ip(request):
+        token = request.headers.get("x-replay-token", "")
+        if (
+            session is None
+            or session.stopped
+            or not secrets.compare_digest(token.encode(), session.token.encode())
+        ):
             raise HTTPException(status_code=404, detail="Replay not found or already stopped.")
         return session
 
@@ -675,7 +737,8 @@ def create_app(
         speed: int = 1,
     ) -> dict[str, Any]:
         warmup = app.state.warmup
-        if warmup["status"] != "ready":
+        limited = guard.tripped
+        if warmup["status"] != "ready" and not limited:
             message = (
                 "Pundit warm-up failed; check the server configuration and logs."
                 if warmup["status"] == "failed"
@@ -686,22 +749,39 @@ def create_app(
                 detail=message,
                 headers={"Retry-After": "5"},
             )
-        tab_id = request.headers.get("x-tab-id", "").strip()
-        if not tab_id or len(tab_id) > 80:
-            raise HTTPException(status_code=400, detail="A valid X-Tab-ID header is required.")
+        client_id = request.headers.get("x-client-id", "").strip()
+        if not client_id or len(client_id) > 80:
+            raise HTTPException(status_code=400, detail="A valid X-Client-ID header is required.")
         if not 1 <= speed <= 120:
             raise HTTPException(status_code=422, detail="Replay speed must be between 1 and 120.")
         client_ip = _client_ip(request)
-        tab_key = f"{client_ip}:{tab_id}"
-        # One replay per client: a new start replaces the client's earlier replay, so a lost
-        # stream or a closed tab never locks the client out and one client can't hold every slot.
+        # One replay per viewer: a new start replaces this viewer's earlier replay, so a lost
+        # stream or a reload never locks them out. Other viewers on the same network keep theirs.
         for previous in [
-            item for item in sessions.values() if item.client_ip == client_ip and not item.stopped
+            item for item in sessions.values() if item.client_id == client_id and not item.stopped
         ]:
             logger.info(
                 "replay_replaced replay_id=%s client_has_new_replay=true", previous.replay_id
             )
             await _stop_session(previous)
+        # Up to MAX_REPLAYS_PER_ADDRESS running replays per address, so one address can't take
+        # every slot by inventing client IDs. Finished replays (tab still open) don't count.
+        running_here = sum(
+            1
+            for item in sessions.values()
+            if item.client_ip == client_ip
+            and not item.stopped
+            and item.replay.state not in {"finished", "stopped"}
+        )
+        if running_here >= MAX_REPLAYS_PER_ADDRESS:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"{MAX_REPLAYS_PER_ADDRESS} replays are already running from your network. "
+                    "Try again when one has finished."
+                ),
+                headers={"Retry-After": "30"},
+            )
         try:
             info = get_match_info(match_id)
             events = generate_match(match_id)
@@ -724,15 +804,21 @@ def create_app(
         delay = BroadcastDelay(configured_settings.broadcast_delay_seconds)
         session = ReplaySession(
             replay_id=replay_id,
-            tab_id=tab_key,
+            client_id=client_id,
             client_ip=client_ip,
             info=info,
             events=events,
             replay=replay,
             delay=delay,
+            pipeline=cached_pipeline() if limited else None,
+            audio_enabled=not limited,
         )
+        if limited:
+            logger.warning(
+                "replay_started_limited replay_id=%s mode=cached audio=off", replay_id
+            )
         session.dispatcher = LiveDispatcher(
-            app.state.pipeline,
+            session_pipeline(session),
             info,
             events,
             configured_settings,
@@ -743,7 +829,7 @@ def create_app(
         session.dispatch_source = replay.subscribe()
         session.viewer_source = replay.subscribe()
         sessions[replay_id] = session
-        tab_sessions[tab_key] = replay_id
+        client_sessions[client_id] = replay_id
         replay.start()
         session.runner_task = asyncio.create_task(run_session(session))
         session.stream_deadline_task = asyncio.create_task(
@@ -751,9 +837,13 @@ def create_app(
         )
         return {
             "replay_id": replay_id,
+            "replay_token": session.token,
             "match_id": match_id,
             "speed": speed,
             "state": replay.state,
+            "mode": "cached" if limited else configured_settings.mode,
+            "audio": session.audio_enabled,
+            "notice": CACHED_NOTICE if limited else None,
         }
 
     @app.post("/api/replays/{replay_id}/control")
@@ -781,17 +871,20 @@ def create_app(
         started: float,
     ) -> dict[str, Any]:
         as_of = session.viewer_released_as_of
+        pipeline = session_pipeline(session)
+        if guard.models_exhausted and pipeline is app.state.pipeline:
+            pipeline = cached_pipeline()
         with turn_span("question", session.info.match_id) as span:
             span.set_attribute("app.as_of", as_of)
             span.set_attribute("app.question.characters", len(question))
-            result = await app.state.pipeline.answer_question(
+            result = await pipeline.answer_question(
                 session.info,
                 session.events,
                 question,
                 as_of=as_of,
             )
             explanation, blocked_reason = _safe_question_explanation(
-                app.state.pipeline,
+                pipeline,
                 result,
                 session.info,
                 session.events,
@@ -818,6 +911,8 @@ def create_app(
         session = check_question_access(payload.replay_id, request)
         question_id = uuid4().hex
         result = await answer(session, question_id, question, started)
+        if not session.audio_enabled:
+            return {**result, "audio_pending": False}
         # The text goes back at once; the spoken answer follows on the replay's SSE stream,
         # the same way as for a spoken question.
         task = asyncio.create_task(speak_answer(session, question_id, result["explanation"]["answer"]))
@@ -880,6 +975,11 @@ def create_app(
         """Transcribe, return the transcript at once, and answer over the replay's SSE stream."""
         started = time.perf_counter()
         session = check_question_access(replay_id, request)
+        if not session.audio_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="Spoken questions are off for this match. Please type your question.",
+            )
         audio_bytes = await audio.read(configured_settings.question_audio_max_bytes + 1)
         await audio.close()
         if len(audio_bytes) > configured_settings.question_audio_max_bytes:
@@ -979,8 +1079,10 @@ def create_app(
             {
                 "status": "ok",
                 "warmup": warmup["status"],
-                "ready": warmup["status"] == "ready",
+                "ready": warmup["status"] == "ready" or guard.tripped,
                 "error": warmup["error"],
+                # True once today's spending cap is reached: new replays are cached, audio off.
+                "limited": guard.tripped,
                 "limits": {
                     "question_characters": configured_settings.question_max_characters,
                     "question_audio_seconds": configured_settings.question_audio_max_seconds,

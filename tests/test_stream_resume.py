@@ -25,11 +25,25 @@ from tests.test_api import _settings, _SpeechStub, _SynthesisStub, _wav
 Message = tuple[int, str, dict[str, Any]]
 
 
-def _scope(path: str, ip: str, method: str = "POST") -> dict[str, Any]:
+# replay_id -> replay token, recorded as each test starts a replay (the page keeps it in memory).
+_TOKENS: dict[str, str] = {}
+
+
+def _scope(
+    path: str,
+    ip: str,
+    method: str = "POST",
+    *,
+    client_id: str = "resume-client",
+    token: str | None = None,
+) -> dict[str, Any]:
+    headers = [(b"x-client-id", client_id.encode())]
+    if token is not None:
+        headers.append((b"x-replay-token", token.encode()))
     return {
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
         "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
-        "query_string": b"", "headers": [(b"x-tab-id", b"resume-tab")],
+        "query_string": b"", "headers": headers,
         "client": (ip, 1234), "server": ("127.0.0.1", 8000),
     }
 
@@ -44,10 +58,12 @@ def _faster_clock(monkeypatch: pytest.MonkeyPatch, factor: float) -> None:
     monkeypatch.setattr(Replay, "_wait_interval", faster)
 
 
-async def _stream(routes, ip: str, replay_id: str, last_event_id: str | None = None):
-    return await routes["/api/replays/{replay_id}/stream"](
-        replay_id, Request(_scope(f"/api/replays/{replay_id}/stream", ip, "GET")), last_event_id
-    )
+async def _stream(
+    routes, ip: str, replay_id: str, last_event_id: str | None = None, *, token: str | None = None
+):
+    token = _TOKENS.get(replay_id) if token is None else token
+    request = Request(_scope(f"/api/replays/{replay_id}/stream", ip, "GET", token=token))
+    return await routes["/api/replays/{replay_id}/stream"](replay_id, request, last_event_id)
 
 
 class _Connection:
@@ -127,6 +143,7 @@ def test_reconnect_mid_match_resumes_with_no_duplicates_gaps_or_early_lines(
                 "m01", Request(_scope("/api/matches/m01/start", ip)), speed=120
             )
             replay_id = started["replay_id"]
+            _TOKENS[replay_id] = started["replay_token"]
             first = _Connection(await _stream(routes, ip, replay_id))
             before = await first.read(
                 lambda got: sum(name == "commentary" for _, name, _ in got) >= 2
@@ -179,15 +196,16 @@ def test_a_spoken_answer_pending_across_a_drop_arrives_once(
                 "m01", Request(_scope("/api/matches/m01/start", ip)), speed=120
             )
             replay_id = started["replay_id"]
+            _TOKENS[replay_id] = started["replay_token"]
             session = app.state.sessions[replay_id]
             first = _Connection(await _stream(routes, ip, replay_id))
             before = await first.read(lambda got: sum(n == "event" for _, n, _ in got) >= 20)
             await routes["/api/replays/{replay_id}/control"](
-                replay_id, _json_request({"action": "pause"}, ip)
+                replay_id, _json_request({"action": "pause"}, ip, replay_id)
             )
             viewer_cutoff = session.viewer_released_as_of
             accepted = await routes["/api/ask-audio"](
-                Request(_scope("/api/ask-audio", ip)),
+                Request(_scope("/api/ask-audio", ip, token=_TOKENS[replay_id])),
                 replay_id=replay_id,
                 audio=UploadFile(io.BytesIO(_wav()), filename="question.wav"),
             )
@@ -218,13 +236,14 @@ def test_a_spoken_answer_pending_across_a_drop_arrives_once(
     assert session.viewer_released_as_of == viewer_cutoff
 
 
-def _json_request(body: dict, ip: str) -> Request:
+def _json_request(body: dict, ip: str, replay_id: str, token: str | None = None) -> Request:
     payload = json.dumps(body).encode()
 
     async def receive() -> dict:
         return {"type": "http.request", "body": payload, "more_body": False}
 
-    return Request(_scope("/control", ip), receive)
+    token = _TOKENS.get(replay_id) if token is None else token
+    return Request(_scope("/control", ip, token=token), receive)
 
 
 def test_a_paused_replay_stays_paused_across_a_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -238,11 +257,12 @@ def test_a_paused_replay_stays_paused_across_a_reconnect(monkeypatch: pytest.Mon
                 "m01", Request(_scope("/api/matches/m01/start", ip)), speed=120
             )
             replay_id = started["replay_id"]
+            _TOKENS[replay_id] = started["replay_token"]
             session = app.state.sessions[replay_id]
             first = _Connection(await _stream(routes, ip, replay_id))
             before = await first.read(lambda got: sum(n == "event" for _, n, _ in got) >= 20)
             paused = await routes["/api/replays/{replay_id}/control"](
-                replay_id, _json_request({"action": "pause"}, ip)
+                replay_id, _json_request({"action": "pause"}, ip, replay_id)
             )
             assert paused["state"] == "paused"
             await asyncio.sleep(0.4)  # let anything already released drain into the outbox
@@ -266,7 +286,7 @@ def test_a_paused_replay_stays_paused_across_a_reconnect(monkeypatch: pytest.Mon
             assert session.viewer_released_as_of == released
             assert len(session.outbox) == sent
             resumed = await routes["/api/replays/{replay_id}/control"](
-                replay_id, _json_request({"action": "resume"}, ip)
+                replay_id, _json_request({"action": "resume"}, ip, replay_id)
             )
             assert resumed["state"] == "running"
             after = await second.read(lambda got: any(n == "event" for _, n, _ in got))
@@ -291,6 +311,7 @@ def test_each_stream_closes_itself_before_the_ingress_timeout_and_resumes(
                 "m01", Request(_scope("/api/matches/m01/start", ip)), speed=120
             )
             replay_id = started["replay_id"]
+            _TOKENS[replay_id] = started["replay_token"]
             received: list[Message] = []
             closes = 0
             for _ in range(3):
@@ -319,6 +340,7 @@ def test_a_new_connection_replaces_an_unnoticed_dead_one() -> None:
                 "m01", Request(_scope("/api/matches/m01/start", ip)), speed=1
             )
             replay_id = started["replay_id"]
+            _TOKENS[replay_id] = started["replay_token"]
             stale = (await _stream(routes, ip, replay_id)).body_iterator
             assert await stale.__anext__() == b"retry: 1000\n\n"
             # The stale stream is now waiting for a message (up to 15 s for a heartbeat).
@@ -335,45 +357,106 @@ def test_a_new_connection_replaces_an_unnoticed_dead_one() -> None:
     asyncio.run(asyncio.wait_for(run(), 10))
 
 
-def test_only_the_starting_client_can_attach_to_or_drive_a_replay() -> None:
+# ---- A replay belongs to whoever holds its token, not to an address ----
+
+
+def test_a_request_without_the_replay_token_is_refused() -> None:
     app, routes = _app(None)
 
     async def run() -> None:
         async with app.router.lifespan_context(app):
-            owner, other = "198.51.100.65", "203.0.113.9"
+            ip = "198.51.100.65"
             started = await routes["/api/matches/{match_id}/start"](
-                "m01", Request(_scope("/api/matches/m01/start", owner)), speed=1
+                "m01", Request(_scope("/api/matches/m01/start", ip)), speed=1
             )
-            replay_id = started["replay_id"]
-            # 128 random bits from uuid4, as 32 hex digits.
-            assert len(replay_id) == 32 and int(replay_id, 16) >= 0
-            # Ingress appends the caller's real address; a client-written prefix doesn't count.
-            spoofed = Request({
-                **_scope(f"/api/replays/{replay_id}/stream", other, "GET"),
-                "headers": [(b"x-forwarded-for", f"{owner}, {other}".encode())],
-            })
-            for attempt in (
-                lambda: _stream(routes, other, replay_id),
-                lambda: _stream(routes, other, replay_id, "5"),
-                lambda: routes["/api/replays/{replay_id}/stream"](replay_id, spoofed, None),
-                lambda: routes["/api/replays/{replay_id}/control"](
-                    replay_id, _json_request({"action": "pause"}, other)
-                ),
-                lambda: routes["/api/ask"](
-                    QuestionRequest(replay_id=replay_id, question="Who scored?"),
-                    Request(_scope("/api/ask", other)),
-                ),
-            ):
-                with pytest.raises(HTTPException) as refused:
-                    await attempt()
-                assert refused.value.status_code == 404  # same as a replay that doesn't exist
+            replay_id, token = started["replay_id"], started["replay_token"]
+            # At least 128 bits: 24 random bytes, URL-safe base64.
+            assert len(token) >= 32
+            for bad in (None, "", "not-the-token", token[:-1] + ("A" if token[-1] != "A" else "B")):
+                bad_token = "" if bad is None else bad
+                for attempt in (
+                    lambda: _stream(routes, ip, replay_id, token=bad_token),
+                    lambda: _stream(routes, ip, replay_id, "5", token=bad_token),
+                    lambda: routes["/api/replays/{replay_id}/control"](
+                        replay_id, _json_request({"action": "pause"}, ip, replay_id, bad_token)
+                    ),
+                    lambda: routes["/api/ask"](
+                        QuestionRequest(replay_id=replay_id, question="Who scored?"),
+                        Request(_scope("/api/ask", ip, token=bad_token)),
+                    ),
+                    lambda: routes["/api/ask-audio"](
+                        Request(_scope("/api/ask-audio", ip, token=bad_token)),
+                        replay_id=replay_id,
+                        audio=UploadFile(io.BytesIO(_wav()), filename="question.wav"),
+                    ),
+                ):
+                    with pytest.raises(HTTPException) as refused:
+                        await attempt()
+                    assert refused.value.status_code == 404  # same as a missing replay
             session = app.state.sessions[replay_id]
             assert session.replay.state == "running" and not session.stream_open
-            # The starting client can still connect, and reconnect.
-            first = await _stream(routes, owner, replay_id)
-            await first.body_iterator.aclose()
-            again = await _stream(routes, owner, replay_id, "0")
+            connected = await _stream(routes, ip, replay_id, token=token)
             assert session.stream_open
-            await again.body_iterator.aclose()
+            await connected.body_iterator.aclose()
 
     asyncio.run(asyncio.wait_for(run(), 10))
+
+
+def test_two_viewers_on_one_address_each_run_a_replay() -> None:
+    from fastapi.testclient import TestClient
+
+    settings = replace(_settings(), max_concurrent_replays=5)
+    app = create_app(settings=settings, pipeline=PunditPipeline(settings, None))
+    office = "203.0.113.50"
+
+    def start(client_id: str, ip: str = office):
+        return client.post(
+            "/api/matches/m01/start?speed=1",
+            headers={"X-Client-ID": client_id, "X-Forwarded-For": ip},
+        )
+
+    with TestClient(app) as client:
+        first, second = start("judge-a"), start("judge-b")
+        assert first.status_code == second.status_code == 200
+        alive = app.state.sessions
+        assert first.json()["replay_id"] in alive and second.json()["replay_id"] in alive
+        assert first.json()["replay_token"] != second.json()["replay_token"]
+        # A viewer's new Start replaces only their own replay.
+        again = start("judge-a")
+        assert again.status_code == 200
+        assert first.json()["replay_id"] not in alive and second.json()["replay_id"] in alive
+        # Up to 3 running replays per address, within the global cap.
+        assert start("judge-c").status_code == 200
+        capped = start("judge-d")
+        assert capped.status_code == 429
+        assert "3 replays" in capped.json()["detail"]
+        assert start("elsewhere", "198.51.100.66").status_code == 200
+
+
+def test_a_reconnect_from_a_new_address_with_the_token_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _faster_clock(monkeypatch, 30)
+    app, routes = _app(None)
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            wifi, mobile = "198.51.100.67", "203.0.113.67"
+            started = await routes["/api/matches/{match_id}/start"](
+                "m01", Request(_scope("/api/matches/m01/start", wifi)), speed=120
+            )
+            replay_id = started["replay_id"]
+            _TOKENS[replay_id] = started["replay_token"]
+            first = _Connection(await _stream(routes, wifi, replay_id))
+            before = await first.read(lambda got: sum(n == "event" for _, n, _ in got) >= 30)
+            await first.drop()
+            await asyncio.sleep(0.3)
+            # The phone is now on another network: a different address, the same token.
+            second = _Connection(await _stream(routes, mobile, replay_id, str(before[-1][0])))
+            after = await second.read(lambda got: sum(n == "event" for _, n, _ in got) >= 30)
+            await second.drop()
+            ids = [i for i, _, _ in before + after]
+            assert ids == list(range(1, len(ids) + 1))
+            assert list(app.state.sessions) == [replay_id]
+
+    asyncio.run(asyncio.wait_for(run(), 30))
