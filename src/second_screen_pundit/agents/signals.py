@@ -148,8 +148,8 @@ class SignalTracker:
         return sorted(signals, key=lambda signal: not signal.mandatory)
 
     def _name(self, team: Team) -> str:
-        """Short form, for prose summaries."""
-        return team_name(self.info, team).short
+        """The team's name for prose summaries; spoken lines shorten it themselves."""
+        return team_name(self.info, team).full
 
     def _label(self, team: Team) -> str:
         """Canonical full name, which every signal fact label starts with."""

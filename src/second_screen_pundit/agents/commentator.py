@@ -203,8 +203,9 @@ def console_tool_results(
 
 
 def team_display_name(info: MatchInfo, team: str) -> str:
-    """The accepted short form of a team's name, used in spoken text."""
-    return team_name(info, team).short
+    """The team's full name. A line names a team in full first and by its short form after
+    that; `agents/wording.name_teams` applies that to every finished line."""
+    return team_name(info, team).full
 
 
 def score_phrase(info: MatchInfo, score: str) -> str:

@@ -90,7 +90,17 @@ from second_screen_pundit.agents.tools.analytics import (
 )
 from second_screen_pundit.agents.tools.parameters import KeyMomentsParams, MatchStateParams
 from second_screen_pundit.agents.tools.runtime import build_analytics_tools
+from second_screen_pundit.agents.wording import (
+    CLOCK_TIERS,
+    apply_clock_rules,
+    back_line_failures,
+    back_line_note,
+    banned_phrase_hits,
+    mentions_clock,
+    name_teams,
+)
 from second_screen_pundit.engine.schema import Event, MatchInfo
+from second_screen_pundit.engine.teams import label_side, short_form_variants, team_name
 
 
 logger = logging.getLogger(__name__)
@@ -120,6 +130,8 @@ class LiveWindowResult:
     timings: tuple[AgentCallTiming, ...] = ()
     # "role: fields | reply excerpt" for each structured-output failure in this window.
     output_failures: tuple[str, ...] = ()
+    # "group: phrase" for each banned phrase that sent a model line to the fallback.
+    banned_phrases: tuple[str, ...] = ()
 
 
 AnswerSource = Literal["agent", "fallback", "out_of_scope", "cached"]
@@ -175,8 +187,51 @@ def score_phrase_allowed(
     """The score is said on goals and red cards, or when none of the last 3 lines said it."""
     if goal_or_red_card:
         return True
-    folded = phrase.casefold()
-    return not any(folded in line.casefold() for line in recent_lines[-RECENT_LINES_FOR_SCORE:])
+    # A line names a team in full only the first time, so the phrase may carry the short form.
+    forms = [form.casefold() for form in short_form_variants(phrase)]
+    return not any(
+        form in line.casefold()
+        for line in recent_lines[-RECENT_LINES_FOR_SCORE:]
+        for form in forms
+    )
+
+
+def formation_changes(info: MatchInfo, facts: Sequence[Fact]) -> list[tuple[str, str]]:
+    """(previous, new) formation pairs the facts give, one per team."""
+    previous: dict[str, str] = {}
+    new: dict[str, str] = {}
+    for fact in facts:
+        side = label_side(fact.label, info)
+        if side is None or not isinstance(fact.value, str):
+            continue
+        label = fact.label.casefold()
+        if fact.fact_id.endswith("previous_formation"):
+            previous[side] = fact.value
+        elif "new formation" in label or (
+            fact.fact_id.startswith("formation_at:") and " formation at " in label
+        ):
+            new[side] = fact.value
+    return [(previous[side], new[side]) for side in previous if side in new]
+
+
+def name_teams_in_recap(recap: Recap, info: MatchInfo) -> Recap:
+    """Each recap text names a team in full once, then by its short form."""
+    return recap.model_copy(
+        update={
+            "headline": name_teams(recap.headline, info),
+            "summary": name_teams(recap.summary, info),
+            "audio_script": name_teams(recap.audio_script, info),
+            "key_moments": [
+                moment.model_copy(update={"text": name_teams(moment.text, info)})
+                for moment in recap.key_moments
+            ],
+        }
+    )
+
+
+def polish_line_text(text: str, info: MatchInfo, *, clock_allowed: bool) -> str:
+    """The deterministic wording rules (agents/wording.py), applied before the evidence check."""
+    return name_teams(apply_clock_rules(tidy_spoken_text(text), clock_allowed=clock_allowed), info)
 
 
 _MUST_SAY_FALLBACK_KINDS = {
@@ -952,7 +1007,10 @@ class PunditPipeline:
         signals: Sequence[TacticalSignal] = (),
         is_stale: Callable[[], bool] | None = None,
         recent_lines: Sequence[str] = (),
+        clock_allowed: bool = True,
     ) -> LiveWindowResult:
+        """``clock_allowed`` is the dispatcher's clock budget (agents/wording.py); routine
+        tiers never mention the clock whatever the budget."""
         if not window:
             raise ValueError("A live window must contain at least one event")
         if self.settings.mode == "off":
@@ -1035,6 +1093,7 @@ class PunditPipeline:
             recent_lines,
             goal_or_red_card=delivery_tier in _SCORE_TIERS,
         )
+        line_clock_allowed = clock_allowed and delivery_tier in CLOCK_TIERS
         output_failures: list[str] = []
 
         def record_invalid(role: AgentRole, attempt: int) -> Callable[[str], None]:
@@ -1089,20 +1148,25 @@ class PunditPipeline:
                     ),
                     None,
                 )
+                previous_formation = next(
+                    (
+                        str(fact.value)
+                        for fact_id, fact in facts_by_id.items()
+                        if fact_id.endswith(f":{PREVIOUS_FORMATION_SUFFIX}")
+                    ),
+                    None,
+                )
+                formation = detail.get("formation")
                 values.update(
                     team=team_display_name(info, event.team) if event.team else None,
                     player_name=context.get("player_name"),
                     colour=detail.get("colour"),
                     player_on_name=detail.get("player_on_name"),
                     player_off_name=detail.get("player_off_name"),
-                    formation=detail.get("formation"),
-                    previous_formation=next(
-                        (
-                            str(fact.value)
-                            for fact_id, fact in facts_by_id.items()
-                            if fact_id.endswith(f":{PREVIOUS_FORMATION_SUFFIX}")
-                        ),
-                        None,
+                    formation=formation,
+                    previous_formation=previous_formation,
+                    back_line=back_line_note(
+                        previous_formation, str(formation) if formation else None
                     ),
                     chance_descriptor=descriptor,
                     chance_descriptor_title=(
@@ -1143,6 +1207,10 @@ class PunditPipeline:
                         values[name] = (
                             fact.spoken_value if fact.spoken_value is not None else fact.value
                         )
+            values["back_line"] = back_line_note(
+                values.get("previous_formation"),  # type: ignore[arg-type]
+                values.get("new_formation"),  # type: ignore[arg-type]
+            )
             fact_ids = list(
                 dict.fromkeys(
                     [
@@ -1179,7 +1247,7 @@ class PunditPipeline:
             for text in fallback_lines(kind, values, line_id=line_id):
                 line = CommentaryLine(
                     line_id=line_id,
-                    text=tidy_spoken_text(text),
+                    text=polish_line_text(text, info, clock_allowed=line_clock_allowed),
                     insight_id=insight.insight_id,
                     fact_ids=list(dict.fromkeys(fact_ids)),
                     event_ids=insight.event_ids,
@@ -1197,6 +1265,7 @@ class PunditPipeline:
                     lane=lane,
                     allow_fallback=True,
                     score_allowed=score_allowed,
+                    clock_allowed=line_clock_allowed,
                 )
                 if report.passed:
                     return LiveWindowResult(
@@ -1302,9 +1371,12 @@ class PunditPipeline:
                         "id": info.match_id,
                         "home": info.home.name,
                         "away": info.away.name,
+                        "home_short": team_name(info, "home").short,
+                        "away_short": team_name(info, "away").short,
                     },
                     "must_say": must_say,
                     "minute": clock,
+                    "clock_allowed": line_clock_allowed,
                     "score_phrase": deterministic_score_phrase if score_allowed else None,
                     "signals": signal_prompts,
                     "retry_feedback": feedback,
@@ -1463,7 +1535,16 @@ class PunditPipeline:
                         "insight": insight.model_dump(
                             mode="json", include={"headline", "fact_ids", "event_ids"}
                         ),
-                        "facts": insight_facts,
+                        # Without a clock budget the clock facts are left out, so the model
+                        # has no minute to say; any it says anyway is removed below.
+                        "facts": [
+                            fact
+                            for fact in insight_facts
+                            if line_clock_allowed
+                            or not str(fact.get("label", "")).casefold().startswith(
+                                ("match-level clock", "match-level minutes remaining")
+                            )
+                        ],
                         "recent_lines": list(recent_lines)[-3:],
                     }
                 )
@@ -1484,7 +1565,31 @@ class PunditPipeline:
                     invalid_output_roles.add("commentator")
                     feedback = _invalid_output("CommentaryReply")
                     continue
-                text = tidy_spoken_text(reply.text)
+                text = polish_line_text(reply.text, info, clock_allowed=line_clock_allowed)
+                hits = banned_phrase_hits(
+                    text, info, [str(event.team) for event in visible if event.type == "goal"]
+                )
+                if hits:
+                    logger.warning(
+                        "banned_phrase_rejected match_id=%s as_of=%d attempt=%d phrases=%s",
+                        info.match_id,
+                        as_of,
+                        attempt,
+                        "|".join(hits),
+                    )
+                    reason = "Banned phrase (" + ", ".join(hits) + "); deterministic line used."
+                    if fallback_plan() is not None:
+                        return replace(fallback_result(reason), banned_phrases=tuple(hits))
+                    return LiveWindowResult(
+                        "rejected",
+                        None,
+                        None,
+                        tuple(accumulated_results),
+                        EvidenceReport(False, tuple(f"banned phrase {hit}" for hit in hits)),
+                        reason,
+                        tuple(timings),
+                        banned_phrases=tuple(hits),
+                    )
                 if len(text) > MAX_LINE_CHARS:
                     feedback = (
                         f"text is {len(text)} characters; the limit is {MAX_LINE_CHARS}"
@@ -1509,6 +1614,7 @@ class PunditPipeline:
                     tool_results=accumulated_results,
                     lane=lane,
                     score_allowed=score_allowed,
+                    clock_allowed=line_clock_allowed,
                 )
                 if report.passed:
                     return LiveWindowResult(
@@ -1669,6 +1775,7 @@ class PunditPipeline:
         lane: str,
         allow_fallback: bool = False,
         score_allowed: bool = True,
+        clock_allowed: bool = True,
     ) -> EvidenceReport:
         report = check_evidence(
             insight, events=events, as_of=as_of, tool_results=tool_results, info=info
@@ -1684,6 +1791,19 @@ class PunditPipeline:
                 False,
                 ("score_phrase was null, so this line must not state the score",),
             )
+        if not clock_allowed and mentions_clock(line.text):
+            return EvidenceReport(
+                False,
+                ("clock_allowed was false, so this line must not give the minute or the time left",),
+            )
+        back_line = back_line_failures(
+            line.text,
+            formation_changes(
+                info, [fact for result in tool_results for fact in result.facts]
+            ),
+        )
+        if back_line:
+            return EvidenceReport(False, tuple(back_line))
         if line.line_id != live_line_id(info.match_id, as_of, lane):
             return EvidenceReport(
                 False,
@@ -1746,6 +1866,7 @@ class PunditPipeline:
                 None,
                 "No pre-generated line covers this event window.",
             )
+        line = line.model_copy(update={"text": name_teams(line.text, info)})
         results = _cached_tool_results(events, as_of=as_of, fact_ids=line.fact_ids)
         report = check_evidence(
             line,
@@ -1803,6 +1924,8 @@ class PunditPipeline:
             "match": {
                 "home": info.home.name,
                 "away": info.away.name,
+                "home_short": team_name(info, "home").short,
+                "away_short": team_name(info, "away").short,
                 "stadium": info.stadium,
             },
             "viewer_clock": "full time" if finished else f"{latest.minute + latest.added_minute}'",
@@ -2104,6 +2227,8 @@ class PunditPipeline:
             "match": {
                 "home": info.home.name,
                 "away": info.away.name,
+                "home_short": team_name(info, "home").short,
+                "away_short": team_name(info, "away").short,
                 "stadium": info.stadium,
             },
             "score_phrase": recap_score_phrase,
@@ -2177,7 +2302,12 @@ class PunditPipeline:
                     as_of=as_of,
                     given_fact_ids=given_fact_ids,
                 )
-                if recap is not None and recap_score_phrase.casefold() not in recap.headline.casefold():
+                if recap is not None:
+                    recap = name_teams_in_recap(recap, info)
+                if recap is not None and not any(
+                    form.casefold() in recap.headline.casefold()
+                    for form in short_form_variants(recap_score_phrase)
+                ):
                     recap, problems = None, [
                         f"the headline must contain score_phrase word for word: "
                         f"{recap_score_phrase!r}"
@@ -2232,6 +2362,7 @@ class PunditPipeline:
         attempts: int,
     ) -> RecapResult:
         recap, results = _fallback_recap(info, events, as_of, notice=notice)
+        recap = name_teams_in_recap(recap, info)
         report = check_evidence(
             recap,
             events=events,
@@ -2253,7 +2384,7 @@ class PunditPipeline:
         as_of: int,
     ) -> RecapResult:
         cached: CachedMatchOutput = load_cached_match(info.match_id, cache_dir=self.cache_dir)
-        recap = cached.recap
+        recap = name_teams_in_recap(cached.recap, info)
         results = _cached_tool_results(
             events,
             as_of=as_of,

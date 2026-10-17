@@ -331,8 +331,8 @@ def test_full_time_score_phrase_puts_the_winner_first() -> None:
     info = get_match_info("m02")
 
     assert full_time_score_phrase(info, "1-2") == "Merehaven Athletic win 2-1"
-    assert full_time_score_phrase(info, "2-0") == "Port Calder win 2-0"
-    assert full_time_score_phrase(info, "1-1") == "Port Calder and Merehaven Athletic draw 1-1"
+    assert full_time_score_phrase(info, "2-0") == "Port Calder FC win 2-0"
+    assert full_time_score_phrase(info, "1-1") == "Port Calder FC and Merehaven Athletic draw 1-1"
 
 
 def _ordinal(minute: int) -> str:

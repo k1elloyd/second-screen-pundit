@@ -207,13 +207,40 @@ def _team_name(events: list[Event], team: Team) -> str:
     return team_name(get_match_info(events[0].match_id), team).full
 
 
-def _possession(events: list[Event], team: Team) -> tuple[float, list[Event]]:
+def possession_pair(home_share: float) -> dict[Team, tuple[float, int]]:
+    """Both teams' possession, exact (one decimal) and spoken (whole), each pair summing to 100.
+
+    Home is rounded half up; away is what is left, so "61% to 39%", never "61% to 40%".
+    """
+    home = Decimal(str(home_share)).quantize(Decimal("0.1"), ROUND_HALF_UP)
+    home_whole = int(home.quantize(Decimal("1"), ROUND_HALF_UP))
+    return {
+        "home": (float(home), home_whole),
+        "away": (float(Decimal(100) - home), 100 - home_whole),
+    }
+
+
+def _possession_split(events: list[Event]) -> tuple[dict[Team, tuple[float, int]], list[Event]]:
     successful = [
         event for event in events if event.type == "pass" and event.outcome == "success"
     ]
-    team_passes = [event for event in successful if event.team == team]
-    value = (len(team_passes) / len(successful) * 100) if successful else 0.0
-    return round(value, 1), successful
+    if not successful:
+        return {"home": (0.0, 0), "away": (0.0, 0)}, successful
+    home = sum(event.team == "home" for event in successful) / len(successful) * 100
+    return possession_pair(home), successful
+
+
+def _possession(events: list[Event], team: Team) -> tuple[float, list[Event]]:
+    split, successful = _possession_split(events)
+    return split[team][0], successful
+
+
+def _possession_fact(tool: str, label: str, events: list[Event], team: Team) -> Fact:
+    """A possession fact whose spoken value pairs with the other team's to make 100."""
+    split, successful = _possession_split(events)
+    exact, whole = split[team]
+    fact = _fact(tool, label, exact, "%", successful)
+    return fact.model_copy(update={"spoken_value": None if whole == exact else whole})
 
 
 def _formation_at(events: list[Event], team: Team, minute: int) -> tuple[str, list[Event]]:
@@ -252,13 +279,12 @@ def match_state(
     home_name, away_name = _team_name(visible, "home"), _team_name(visible, "away")
     home_goals = [event for event in goals if event.team == "home"]
     away_goals = [event for event in goals if event.team == "away"]
-    home_possession, home_pass_evidence = _possession(relevant, "home")
     home_formation, home_formation_events = _formation_at(relevant, "home", minute)
     away_formation, away_formation_events = _formation_at(relevant, "away", minute)
     score_evidence = goals
     facts = [
         _fact("match_state", f"Match-level score through {minute}'", f"{len(home_goals)}-{len(away_goals)}", None, score_evidence),
-        _fact("match_state", f"{home_name} possession through {minute}'", home_possession, "%", home_pass_evidence),
+        _possession_fact("match_state", f"{home_name} possession through {minute}'", relevant, "home"),
         *[
             _fact(
                 "match_state",
@@ -290,19 +316,9 @@ def possession_window(
     caveats: list[str] = []
     start, end = _clamp_window(params.start, params.end, visible, caveats, "window")
     window = [event for event in visible if _in_window(event, start, end)]
-    successful = [
-        event for event in window if event.type == "pass" and event.outcome == "success"
-    ]
-    denominator = len(successful)
     facts = [
-        _fact(
-            "possession_window",
-            f"{_team_name(visible, team)} possession, {start}-{end}'",
-            round(sum(event.team == team for event in successful) / denominator * 100, 1)
-            if denominator
-            else 0.0,
-            "%",
-            successful,
+        _possession_fact(
+            "possession_window", f"{_team_name(visible, team)} possession, {start}-{end}'", window, team
         )
         for team in ("home", "away")
     ]
@@ -646,6 +662,19 @@ def compare_windows(
             [*before_events, *after_events],
         ),
     ]
+    if params.metric == "possession":
+        # The same pair rounding as everywhere else, so a spoken value never disagrees.
+        facts[:2] = [
+            _possession_fact(
+                "compare_windows",
+                facts[index].label,
+                [event for event in visible if _in_window(event, start, end)],
+                params.team,
+            )
+            for index, (start, end) in enumerate(
+                ((before_start, before_end), (after_start, after_end))
+            )
+        ]
     return ToolResult(tool="compare_windows", facts=facts, caveats=caveats)
 
 
@@ -764,11 +793,9 @@ def match_snapshot(
         on_target = [event for event in team_shots if event.outcome == "success"]
         team_cards = [event for event in cards if event.team == team]
         reds = [event for event in team_cards if event.detail.get("colour") == "red"]
-        possession, possession_events = _possession(visible, team)
-        recent_possession, recent_events = _possession(recent, team)
         facts.extend([
-            _fact("match_snapshot", f"{name} possession through {clock}'", possession, "%", possession_events),
-            _fact("match_snapshot", f"{name} possession, {recent_start}-{clock + 1}'", recent_possession, "%", recent_events),
+            _possession_fact("match_snapshot", f"{name} possession through {clock}'", visible, team),
+            _possession_fact("match_snapshot", f"{name} possession, {recent_start}-{clock + 1}'", recent, team),
             _fact("match_snapshot", f"{name} shots through {clock}'", len(team_shots), "shots", team_shots),
             _fact("match_snapshot", f"{name} shots on target through {clock}'", len(on_target), "shots", on_target),
             _fact("match_snapshot", f"{name} xG through {clock}'", round(sum(event.xg or 0 for event in team_shots), 3), "xG", team_shots),
@@ -793,7 +820,7 @@ def match_snapshot(
     for event in chosen:
         minute = event.minute + event.added_minute
         name = names[event.team] if event.team in names else "Match-level"
-        short = team_name(info, event.team).short if event.team else ""
+        team = team_name(info, event.team).full if event.team else ""
         player = _player(info, event.team, event.player_id) or "a player"
         moment_facts: list[Fact] = []
         if event.type == "goal":
@@ -815,11 +842,11 @@ def match_snapshot(
             if home_so_far == away_so_far:
                 running = f"level at {home_so_far}-{away_so_far}"
             elif home_so_far > away_so_far:
-                running = f"{team_name(info, 'home').short} lead {home_so_far}-{away_so_far}"
+                running = f"{team_name(info, 'home').full} lead {home_so_far}-{away_so_far}"
             else:
-                running = f"{team_name(info, 'away').short} lead {away_so_far}-{home_so_far}"
+                running = f"{team_name(info, 'away').full} lead {away_so_far}-{home_so_far}"
             description = (
-                f"{player} scores for {short}{own_goal}: the {context}"
+                f"{player} scores for {team}{own_goal}: the {context}"
                 + (f", converting {chance}" if chance else "")
                 + f"; {running}"
             )
@@ -827,23 +854,23 @@ def match_snapshot(
             colour = str(event.detail.get("colour", "yellow"))
             moment_facts.append(_fact("match_snapshot", f"{name} {colour} card at {minute}'", f"{colour} card", None, [event]))
             description = (
-                f"{player} of {short} is sent off" if colour == "red" else f"{player} of {short} is booked"
+                f"{player} of {team} is sent off" if colour == "red" else f"{player} of {team} is booked"
             )
         elif event.type == "formation_change":
             before, _ = _formation_at([item for item in visible if item.seq < event.seq], event.team, minute)  # type: ignore[arg-type]
             after = str(event.detail.get("formation"))
             moment_facts.append(_fact("match_snapshot", f"{name} formation change at {minute}'", after, None, [event]))
             moment_facts.append(_fact("match_snapshot", f"{name} formation before the change at {minute}'", before, None, [event]))
-            description = f"{short} change shape from {before} to {after}"
+            description = f"{team} change shape from {before} to {after}"
         elif event.type == "substitution":
             player_on = _player(info, event.team, event.detail.get("player_on")) or "a substitute"
             player_off = _player(info, event.team, event.detail.get("player_off")) or "a player"
             moment_facts.append(_fact("match_snapshot", f"{name} substitution at {minute}'", "substitution", None, [event]))
-            description = f"{player_on} replaces {player_off} for {short}"
+            description = f"{player_on} replaces {player_off} for {team}"
         else:
             on_target = "on target" if event.outcome == "success" else "off target"
             moment_facts.append(_fact("match_snapshot", f"{name} big chance at {minute}'", "big chance", None, [event]))
-            description = f"{player} has a big chance for {short}, {on_target}"
+            description = f"{player} has a big chance for {team}, {on_target}"
         results.append(
             ToolResult(
                 tool="match_snapshot",

@@ -10,6 +10,7 @@ from typing import Literal
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.pipeline import LiveWindowResult, PunditPipeline, is_must_say
 from second_screen_pundit.agents.signals import SignalTracker, TacticalSignal, formation_key
+from second_screen_pundit.agents.wording import apply_clock_rules, clock_budget_allows
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.observability import record_result, turn_span
@@ -90,6 +91,14 @@ class LiveDispatcher:
         # Formation changes the fast path has announced; the tactical lane skips their signal,
         # so each change is heard once.
         self._announced_formations: set[str] = set()
+        # Red cards reach both lanes (the card on the fast path, the red-card signal in the
+        # tactical lane) about 0.3 s apart; the first published line citing the card wins.
+        self._red_card_ids = {
+            event.event_id
+            for event in self.events
+            if event.type == "card" and event.detail.get("colour") == "red"
+        }
+        self._announced_red_cards: set[str] = set()
 
     async def run(
         self,
@@ -256,9 +265,11 @@ class LiveDispatcher:
                     signals=signals,
                     is_stale=is_stale,
                     recent_lines=tuple(self._recent_lines[-RECENT_LINES_FOR_COMMENTATOR:]),
+                    clock_allowed=clock_budget_allows(self._recent_lines),
                 )
                 record_result(span, outcome.result)
             line = outcome.result.line if _has_line(outcome.result) else None
+            red_cards = self._red_card_ids.intersection(line.event_ids) if line else set()
             if line is not None and line.line_id in self._published_line_ids:
                 outcome.result = replace(
                     outcome.result,
@@ -266,7 +277,29 @@ class LiveDispatcher:
                     line=None,
                     notice="This line was already published for an earlier window.",
                 )
+            elif line is not None and red_cards & self._announced_red_cards:
+                logger.info(
+                    "red_card_line_deduplicated match_id=%s line_id=%s path=%s",
+                    self.info.match_id,
+                    line.line_id,
+                    outcome.path,
+                )
+                outcome.result = replace(
+                    outcome.result,
+                    status="skipped",
+                    line=None,
+                    notice="This red card was already announced by the other lane.",
+                )
             elif line is not None:
+                self._announced_red_cards.update(red_cards)
+                # Both lanes run at once, so two lines can be written against the same
+                # budget; whichever is published second loses its clock words.
+                text = apply_clock_rules(
+                    line.text, clock_allowed=clock_budget_allows(self._recent_lines)
+                )
+                if text != line.text:
+                    line = line.model_copy(update={"text": text})
+                    outcome.result = replace(outcome.result, line=line)
                 self._published_line_ids.add(line.line_id)
                 self._recent_lines.append(line.text)
         except Exception as exc:  # noqa: BLE001 - one failed window must not stop the replay

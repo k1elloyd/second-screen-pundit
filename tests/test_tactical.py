@@ -134,6 +134,7 @@ class _StubPipeline:
         signals: Sequence[TacticalSignal] = (),
         is_stale: Callable[[], bool] | None = None,
         recent_lines: Sequence[str] = (),
+        clock_allowed: bool = True,
     ) -> LiveWindowResult:
         self.calls.append((as_of, tuple(signals)))
         self.recent_lines.append(tuple(recent_lines))

@@ -32,6 +32,7 @@ from second_screen_pundit.agents.models import CommentaryLine, CommentaryReply
 from second_screen_pundit.agents.pipeline import PunditPipeline, is_must_say
 from second_screen_pundit.agents.signals import SIGNAL_TOOL, SignalTracker, signals_tool_result
 from second_screen_pundit.agents.speech import build_ssml
+from second_screen_pundit.agents.wording import back_line_note, name_teams
 from second_screen_pundit.agents.tools.analytics import (
     ToolResult,
     chance_descriptor,
@@ -174,11 +175,17 @@ def test_m02_red_card_and_four_four_one_beats_are_produced_even_when_agents_fail
     asyncio.run(dispatcher.run(feed()))
 
     assert not [outcome.error for outcome in dispatcher.outcomes if outcome.error]
+    # The card reaches both lanes; the first published line citing it is the only one
+    # (polish session: duplicate red-card line, review 2 finding 14).
+    red_event = next(
+        event for event in events if event.type == "card" and event.detail.get("colour") == "red"
+    )
     red_card = [
         outcome
         for outcome in dispatcher.outcomes
-        if outcome.path == "tactical"
-        and any(signal.kind == "red_card" for signal in outcome.signals)
+        if outcome.result is not None
+        and outcome.result.line is not None
+        and red_event.event_id in outcome.result.line.event_ids
     ]
     reshape = [
         outcome
@@ -211,6 +218,7 @@ def test_every_combined_red_card_and_reshape_variant_passes_for_port_calder() ->
         "team": "Port Calder",
         "score_phrase": score_phrase(info, str(score.value)),
     }
+    values["back_line"] = back_line_note(values["previous_formation"], values["new_formation"])
     fact_ids = [fact.fact_id for result in results for fact in result.facts]
     for template in FALLBACK_VARIANTS["signal_red_card_formation"]:
         text = template.format(**values)
@@ -456,9 +464,13 @@ def test_every_signal_fallback_variant_passes_for_every_team() -> None:
                     "team": team_display_name(info, signal.team),
                     "score_phrase": score_phrase(info, str(score.value)),
                 }
+                values["back_line"] = back_line_note(
+                    values.get("previous_formation"), values.get("new_formation")
+                )
                 fact_ids = [fact.fact_id for result in results for fact in result.facts]
                 for template in FALLBACK_VARIANTS[kind]:
-                    text = template.format(**values)
+                    # The line as it ships: full name first, short form after.
+                    text = name_teams(template.format(**values), info)
                     validate_plain_spoken_text(text)
                     assert len(text) <= 200, text
                     report = check_evidence(

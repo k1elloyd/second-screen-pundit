@@ -35,11 +35,13 @@ FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
         "{team} turn to their bench: {player_on_name} on, {player_off_name} off. {score_phrase}.",
         "Fresh legs for {team}: {player_on_name} on for {player_off_name}. {score_phrase}.",
     ),
+    # {back_line} is ", a back three now" when the first number of the formation changes and
+    # empty otherwise (agents/wording.back_line_note).
     "formation_change": (
-        "{team} move from a {previous_formation} to a {formation}. {score_phrase}.",
-        "{team} have changed to a {formation} shape. {score_phrase}.",
-        "{team} reorganise into a {formation}. {score_phrase}.",
-        "A change of shape from {team}, now set up in a {formation}. {score_phrase}.",
+        "{team} move from a {previous_formation} to a {formation}{back_line}. {score_phrase}.",
+        "{team} have changed to a {formation} shape{back_line}. {score_phrase}.",
+        "{team} reorganise into a {formation}{back_line}. {score_phrase}.",
+        "A change of shape from {team}, now set up in a {formation}{back_line}. {score_phrase}.",
     ),
     "big_chance": (
         "{chance_descriptor_title} for {team}. {score_phrase}.",
@@ -53,17 +55,18 @@ FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
     # A red card and the reshape it forces often reach the same tactical window; one line
     # then carries both beats.
     "signal_red_card_formation": (
-        "{team} are down to {players_on_pitch} players and reorganise into a {new_formation}. "
-        "{score_phrase}.",
-        "A player short, {team} switch from a {previous_formation} to a {new_formation}. "
-        "{score_phrase}.",
-        "{team} must reorganise a player short, and they settle into a {new_formation}. "
-        "{score_phrase}.",
+        "{team} are down to {players_on_pitch} players and reorganise into a {new_formation}"
+        "{back_line}. {score_phrase}.",
+        "A player short, {team} switch from a {previous_formation} to a {new_formation}"
+        "{back_line}. {score_phrase}.",
+        "{team} must reorganise a player short, and they settle into a {new_formation}"
+        "{back_line}. {score_phrase}.",
     ),
     "signal_formation_change": (
-        "{team} move from a {previous_formation} to a {new_formation}. {score_phrase}.",
-        "{team} abandon the {previous_formation} and settle into a {new_formation}. {score_phrase}.",
-        "{team} have changed to a {new_formation} shape. {score_phrase}.",
+        "{team} move from a {previous_formation} to a {new_formation}{back_line}. {score_phrase}.",
+        "{team} abandon the {previous_formation} and settle into a {new_formation}{back_line}. "
+        "{score_phrase}.",
+        "{team} have changed to a {new_formation} shape{back_line}. {score_phrase}.",
     ),
     "possession_swing": (
         "{team} have had {after}% of the possession over the last {window} minutes. {score_phrase}.",
@@ -87,6 +90,8 @@ FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
 
 
 _SCORE_SENTENCE = " {score_phrase}."
+# Placeholders that may be empty: the variant is still usable without them.
+_OPTIONAL = {"back_line": ""}
 
 
 def _placeholders(template: str) -> set[str]:
@@ -105,7 +110,10 @@ def fallback_lines(
     score_phrase, the line isn't meant to state the score, so the closing score sentence is
     dropped rather than the variant.
     """
-    available = {key: value for key, value in values.items() if value not in (None, "")}
+    available = {
+        **_OPTIONAL,
+        **{key: value for key, value in values.items() if value not in (None, "")},
+    }
     templates = FALLBACK_VARIANTS[kind]
     if "score_phrase" not in available:
         templates = tuple(template.replace(_SCORE_SENTENCE, "") for template in templates)

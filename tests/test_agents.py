@@ -626,7 +626,7 @@ def test_must_say_window_uses_deterministic_insight_and_one_commentator_call(
 
     assert result.status == "commentary"
     assert roles == ["commentator"]
-    assert supplied[0]["score_phrase"] == "Port Calder lead 1-0"
+    assert supplied[0]["score_phrase"] == "Port Calder FC lead 1-0"
     assert [timing.role for timing in result.timings] == ["commentator"]
     assert result.evidence is not None and result.evidence.passed
 

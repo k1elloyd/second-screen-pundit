@@ -117,7 +117,7 @@ def test_server_sets_line_id_insight_tone_and_tier(monkeypatch: pytest.MonkeyPat
     result = asyncio.run(pipeline.comment_on_window(info, events, [goal], as_of=goal.seq))
 
     assert result.line is not None and result.line.source == "agent"
-    assert result.line.text == "Brio Fallowmere strikes first. Port Calder lead 1-0."
+    assert result.line.text == "Brio Fallowmere strikes first. Port Calder FC lead 1-0."
     assert result.line.line_id == live_line_id("m01", goal.seq, "fast_path")
     assert result.line.tone == "urgent" and result.line.delivery_tier == "goal"
     assert "required_line_id" not in supplied[0]

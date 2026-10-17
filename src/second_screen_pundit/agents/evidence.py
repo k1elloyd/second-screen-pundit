@@ -187,10 +187,9 @@ def _is_score_fact(fact: Fact) -> bool:
     return fact.label.casefold().startswith("match-level score")
 
 
-def _team_name_mentioned(name: str, text: str) -> bool:
-    variants = (name, re.sub(r"\s+FC$", "", name, flags=re.IGNORECASE))
-    folded = text.casefold()
-    return any(variant and variant.casefold() in folded for variant in variants)
+def _team_name_mentioned(info: MatchInfo, side: str, text: str) -> bool:
+    """Full name or the short form defined in engine/teams.py."""
+    return name_mentioned(team_name(info, side), text)
 
 
 def _label_team_mentioned(fact: Fact, text: str, info: MatchInfo | None) -> bool:
@@ -276,8 +275,8 @@ def _grounding_facts(
             and not (
                 info is not None
                 and any(
-                    _team_name_mentioned(name, sentence)
-                    for name in (info.home.name, info.away.name)
+                    _team_name_mentioned(info, side, sentence)
+                    for side in ("home", "away")
                 )
             )
             and re.search(r"\b(match|overall|total)\b", sentence, re.I)
@@ -338,7 +337,7 @@ def _score_matches(
                 found == expected[::-1]
                 and info is not None
                 and expected[1] > expected[0]
-                and _team_name_mentioned(info.away.name, text)
+                and _team_name_mentioned(info, "away", text)
             ):
                 accepted = True
                 break
@@ -346,7 +345,7 @@ def _score_matches(
                 found == expected[::-1]
                 and info is not None
                 and expected[0] > expected[1]
-                and _team_name_mentioned(info.home.name, text)
+                and _team_name_mentioned(info, "home", text)
             ):
                 accepted = True
                 break
@@ -467,7 +466,7 @@ def check_evidence(
             )
             if (
                 fact.fact_id not in output.fact_ids
-                or not _team_name_mentioned(info.away.name, output.text)
+                or not _team_name_mentioned(info, "away", output.text)
                 or not mentions_expected_score
             ):
                 failures.append(

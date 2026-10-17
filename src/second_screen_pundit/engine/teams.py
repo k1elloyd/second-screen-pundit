@@ -1,12 +1,12 @@
 """Canonical team names: one full name per team, plus one accepted short form.
 
-Fact and signal labels always start with the full name. Spoken text may use either form,
-so the evidence check accepts both when it looks for a team in a sentence or a label.
+Fact and signal labels always start with the full name. Spoken text names a team in full the
+first time in a line and by its short form after that (`agents/wording.py`), so the evidence
+check accepts both when it looks for a team in a sentence or a label.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -27,8 +27,28 @@ class TeamName:
         return tuple(dict.fromkeys(sorted((self.full, self.short), key=len, reverse=True)))
 
 
+# Each team's short form, written out rather than derived. A short form may be more than one
+# word. Every team in engine/squads.yaml must have one (tests check it).
+SHORT_NAMES: dict[str, str] = {
+    "Ashbridge Rovers": "Ashbridge",
+    "Port Calder FC": "Port Calder",
+    "Merehaven Athletic": "Merehaven",
+}
+
+
 def short_name(full: str) -> str:
-    return re.sub(r"\s+FC$", "", full, flags=re.IGNORECASE)
+    try:
+        return SHORT_NAMES[full]
+    except KeyError:
+        raise KeyError(f"No short form is defined for {full!r} in engine/teams.py") from None
+
+
+def short_form_variants(text: str) -> tuple[str, ...]:
+    """The text as written, and with every known full name replaced by its short form."""
+    shortened = text
+    for full, short in SHORT_NAMES.items():
+        shortened = shortened.replace(full, short)
+    return tuple(dict.fromkeys((text, shortened)))
 
 
 def team_name(info: MatchInfo, side: str) -> TeamName:
