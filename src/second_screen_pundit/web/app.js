@@ -44,8 +44,14 @@ function showMessage(target, text, isError = false) {
 async function responseJson(response) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const message = typeof body.detail === "string" ? body.detail : `Request failed (${response.status}).`;
-    throw new Error(message);
+    const detail = body.detail;
+    const message = typeof detail === "string" ? detail
+      : typeof detail?.message === "string" ? detail.message
+      : `Request failed (${response.status}).`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.code = detail?.code || null;
+    throw error;
   }
   return body;
 }
@@ -815,8 +821,32 @@ async function startReplay() {
       }
     });
   } catch (error) {
+    if (error.code === "busy") {
+      showBusy(error.message);
+      return;
+    }
     showMessage(el("ask-message"), error.message, true);
   }
+}
+
+// Every replay slot is in use: a friendly card with a retry button, not an error.
+function showBusy(message) {
+  state.replayId = null;
+  state.replayToken = null;
+  const card = make("article", "feed-card answer-card busy-card");
+  card.append(make("p", "", message));
+  const retry = make("button", "button button-primary", "Try again");
+  retry.type = "button";
+  retry.addEventListener("click", () => {
+    audioQueue.unlock(); // a click, so autoplay stays allowed
+    card.remove();
+    startReplay();
+  });
+  card.append(retry);
+  placeInFeed(card, { forceScroll: true });
+  el("connection-state").textContent = "The pundit is busy";
+  el("start-button").disabled = false;
+  el("match-picker").disabled = false;
 }
 
 async function controlReplay(action) {

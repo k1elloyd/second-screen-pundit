@@ -73,7 +73,7 @@ class AgentSettings:
     question_audio_max_bytes: int = 1_000_000
     questions_per_minute: int = 6
     question_rate_window_seconds: int = 60
-    max_concurrent_replays: int = 3
+    max_concurrent_replays: int = 6
     ask_audio_timeout_seconds: float = 30
     speech_synthesis_timeout_seconds: float = 8
     speech_voice: str = DEFAULT_SPEECH_VOICE
@@ -87,8 +87,8 @@ class AgentSettings:
     stream_reconnect_grace_seconds: float = 30
     # Global daily caps (UTC). When either is reached, new viewers get cached mode with audio
     # off. 0 trips the guard at once.
-    model_calls_per_day: int = 1500
-    tts_characters_per_day: int = 150_000
+    model_calls_per_day: int = 900
+    tts_characters_per_day: int = 45_000
 
     @classmethod
     def from_environment(cls) -> AgentSettings:
@@ -127,7 +127,7 @@ class AgentSettings:
             question_audio_max_bytes=_positive_int("QUESTION_AUDIO_MAX_BYTES", 1_000_000),
             questions_per_minute=_positive_int("QUESTIONS_PER_MINUTE", 6),
             question_rate_window_seconds=_positive_int("QUESTION_RATE_WINDOW_SECONDS", 60),
-            max_concurrent_replays=_positive_int("MAX_CONCURRENT_REPLAYS", 3),
+            max_concurrent_replays=_positive_int("MAX_CONCURRENT_REPLAYS", 6),
             ask_audio_timeout_seconds=_positive_float("ASK_AUDIO_TIMEOUT_SECONDS", 30),
             speech_synthesis_timeout_seconds=_positive_float(
                 "SPEECH_SYNTHESIS_TIMEOUT_SECONDS", 8
@@ -143,8 +143,8 @@ class AgentSettings:
             stream_reconnect_grace_seconds=_positive_float(
                 "STREAM_RECONNECT_GRACE_SECONDS", 30
             ),
-            model_calls_per_day=_non_negative_int("MODEL_CALLS_PER_DAY", 1500),
-            tts_characters_per_day=_non_negative_int("TTS_CHARACTERS_PER_DAY", 150_000),
+            model_calls_per_day=_non_negative_int("MODEL_CALLS_PER_DAY", 900),
+            tts_characters_per_day=_non_negative_int("TTS_CHARACTERS_PER_DAY", 45_000),
         )
 
     def require_foundry(self) -> tuple[str, str, str]:

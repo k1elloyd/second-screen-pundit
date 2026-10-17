@@ -69,7 +69,7 @@ def test_the_per_address_cap_holds_whatever_the_spoofed_prefix() -> None:
 
 
 def test_a_replay_with_no_stream_frees_its_slot_after_the_deadline() -> None:
-    settings = replace(_settings(), stream_connect_deadline_seconds=1.5)
+    settings = replace(_settings(), stream_connect_deadline_seconds=1.5, max_concurrent_replays=3)
     app = create_app(settings=settings, pipeline=PunditPipeline(settings, None))
     with TestClient(app) as client:
         for index in range(3):

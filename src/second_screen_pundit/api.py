@@ -42,6 +42,7 @@ from second_screen_pundit.spending import CACHED_NOTICE, SpendingGuard
 logger = logging.getLogger(__name__)
 MAX_QUESTION_AUDIO_BYTES = 1_000_000
 MAX_QUESTION_AUDIO_SECONDS = 15
+BUSY_MESSAGE = "The pundit is busy, try again in a minute."
 # Replays one network address may run at once, within the global cap: judges in one office
 # share an address.
 MAX_REPLAYS_PER_ADDRESS = 3
@@ -790,13 +791,14 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
             if "Maximum concurrent replays" in str(exc):
+                # Every slot is taken: a friendly "busy" the page shows with a retry button.
+                logger.info(
+                    "replay_refused_busy slots=%s", configured_settings.max_concurrent_replays
+                )
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        f"All {configured_settings.max_concurrent_replays} replay slots are in use. "
-                        "Try again when a match has finished."
-                    ),
-                    headers={"Retry-After": "10"},
+                    detail={"code": "busy", "message": BUSY_MESSAGE},
+                    headers={"Retry-After": "60"},
                 ) from exc
             raise
 

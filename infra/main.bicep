@@ -38,11 +38,11 @@ param minReplicas int = 1
 
 @minValue(0)
 @description('Global daily cap on model calls (UTC day). 0 sends every new viewer to cached mode.')
-param modelCallsPerDay int = 1500
+param modelCallsPerDay int = 900
 
 @minValue(0)
 @description('Global daily cap on text-to-speech characters (UTC day).')
-param ttsCharactersPerDay int = 150000
+param ttsCharactersPerDay int = 45000
 
 @description('Image set by azd deploy (SERVICE_API_IMAGE_NAME); empty on the first provision.')
 param apiImageName string = ''
@@ -282,6 +282,9 @@ resource app 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
             { name: 'OTEL_SERVICE_NAME', value: 'second-screen-pundit' }
+            // Keep every span: tens per match. The distro default samples at 5 traces a second
+            // and dropped a quarter of the model-call spans in bursts.
+            { name: 'OTEL_TRACES_SAMPLER', value: 'always_on' }
             { name: 'ENABLE_SENSITIVE_DATA', value: 'false' }
             // No request spans for probes, audio downloads or the SSE stream: the stream would
             // add one "http send" span per message, about 1,500 per match.

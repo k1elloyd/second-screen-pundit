@@ -136,10 +136,12 @@ class SpeechSynthesizer:
             )
         style = voice_profile(artifact.voice).style_for(tier)
         logger.info(
-            "speech_synthesized voice=%s tier=%s style=%s",
+            "speech_synthesized voice=%s tier=%s style=%s characters=%d seconds=%.1f",
             artifact.voice,
             tier,
             style.style if style is not None else "none",
+            len(text),
+            artifact.duration_seconds,
         )
         return artifact
 

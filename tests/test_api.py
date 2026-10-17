@@ -471,10 +471,11 @@ def test_wav_duration_enforces_the_audio_limit_and_rejects_invalid_data() -> Non
         raise AssertionError("An over-length recording was accepted")
 
 
-def test_match_start_gives_each_client_one_replay_and_caps_at_three() -> None:
-    # Session B: one replay per client IP (a new start replaces the old one) instead of one
-    # per client-chosen tab ID, which never limited anything. The cap of 3 is unchanged.
-    app = create_app(settings=_settings(), pipeline=PunditPipeline(_settings(), None))
+def test_match_start_gives_each_client_one_replay_and_caps_the_total() -> None:
+    # One replay per viewer (a new start replaces the old one). The global cap is a setting
+    # (6 by default since Phase 4); here 3, from different addresses.
+    settings = replace(_settings(), max_concurrent_replays=3)
+    app = create_app(settings=settings, pipeline=PunditPipeline(settings, None))
     with TestClient(app) as client:
         def start(match: str, ip: str, tab: str):
             return client.post(
@@ -491,8 +492,30 @@ def test_match_start_gives_each_client_one_replay_and_caps_at_three() -> None:
         assert start("m03", "198.51.100.3", "tab-three").status_code == 200
         capped = start("m01", "198.51.100.4", "tab-four")
 
+    # A full app is "busy", with a retry hint, not an error.
     assert capped.status_code == 503
-    assert "3 replay slots" in capped.json()["detail"]
+    assert capped.json()["detail"] == {
+        "code": "busy",
+        "message": "The pundit is busy, try again in a minute.",
+    }
+    assert capped.headers["Retry-After"] == "60"
+
+
+def test_the_default_global_cap_is_six_with_three_per_address() -> None:
+    app = create_app(settings=_settings(), pipeline=PunditPipeline(_settings(), None))
+    with TestClient(app) as client:
+        def start(viewer: int, ip: str):
+            return client.post(
+                "/api/matches/m01/start?speed=1",
+                headers={"X-Client-ID": f"viewer-{viewer}", "X-Forwarded-For": ip},
+            )
+
+        first_office = [start(i, "203.0.113.10").status_code for i in range(4)]
+        second_office = [start(10 + i, "203.0.113.20").status_code for i in range(3)]
+        full = start(99, "198.51.100.99")
+    assert first_office == [200, 200, 200, 429]  # 3 per address
+    assert second_office == [200, 200, 200]  # 6 in all
+    assert full.status_code == 503 and full.json()["detail"]["code"] == "busy"
 
 
 def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:

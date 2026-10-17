@@ -572,7 +572,7 @@ Mutation checks: with the server ignoring `Last-Event-ID`, the first four fail. 
 - **A replay belongs to whoever holds its token** (replaced an IP-match check from earlier in group 2, which broke viewers sharing an office address and phones that change network).
   - `/start` returns `replay_token` (`secrets.token_urlsafe(24)`, 192 bits) with the replay ID. The page keeps it in memory only and sends it as `X-Replay-Token` on the stream, `/control`, `/api/ask` and `/api/ask-audio`. A missing or wrong token gets the same 404 as a missing replay (constant-time compare). The caller's address plays no part, so a reconnect from a new network resumes.
   - **One replay per viewer**, keyed on `X-Client-ID`: an ID the page makes once and keeps in `sessionStorage` (it replaces `X-Tab-ID`). A viewer's new Start stops only their own earlier replay; two people on one network keep theirs.
-  - **The address is for limits only:** the question rate limit, and at most 3 *running* replays per address (`429` beyond that), inside the global cap of 3. Rotating the client ID or a spoofed `X-Forwarded-For` prefix doesn't escape the per-address cap, since the address is the right-most entry.
+  - **The address is for limits only:** the question rate limit, and at most 3 *running* replays per address (`429` beyond that), inside the global cap (3 then; 6 since the gate prep below). Rotating the client ID or a spoofed `X-Forwarded-For` prefix doesn't escape the per-address cap, since the address is the right-most entry.
   - Tests: without or with a wrong token, every replay call is refused (fails with the check removed); two client IDs on one address each run a replay and a third is allowed, a fourth gets 429; a reconnect from a different address with the token resumes with contiguous message IDs.
 - **Memory.** When a replay is stopped (a new Start from the same client, or no reconnect within the grace period) its session is removed, its audio cleared and its outbox emptied. A replay that has reached full time is kept while its tab stays open, so audio Replay and Why? still work; it holds no replay slot. Measured for m01 in cached mode: 1,567 outbox messages, 623 KB of JSON, about 4.5 MB of Python heap with stub audio. Real audio is 160 kbit/s MP3, about 20 KB per spoken second: about 2–3 MB of line audio and 1 MB of recap for a 20x match. Spoken answers add about 200 KB each, so the worst case is set by the question limit (6 a minute) times the match length; the group 3 TTS cap bounds it.
 
@@ -643,14 +643,14 @@ Plain container environment variables, no secrets and no keys: `NARRATIVE_MODE`,
 
 ### Spending guard
 
-- **Caps.** `MODEL_CALLS_PER_DAY` (default 1,500) and `TTS_CHARACTERS_PER_DAY` (default 150,000), per UTC day, for the whole app. Both are Bicep parameters, so `azd env set MODEL_CALLS_PER_DAY 0` then `azd provision` forces cached mode. 0 trips the guard at once.
+- **Caps.** `MODEL_CALLS_PER_DAY` (default 900) and `TTS_CHARACTERS_PER_DAY` (default 45,000; set from the measurements below), per UTC day, for the whole app. Both are Bicep parameters, so `azd env set MODEL_CALLS_PER_DAY 0` then `azd provision` forces cached mode. 0 trips the guard at once.
 - **Counting.** `PunditPipeline` reports every model call *before* making it (live windows, questions and the recap, retries included), so a failed call still counts. TTS characters are counted before each synthesis. Counts are in memory: one replica; they reset at midnight UTC and on a restart.
 - **When either cap is reached:**
   - A new viewer's `/start` returns `mode: "cached"`, `audio: false` and a short notice: "The pundit has reached today's limit, so this match uses pre-written commentary with audio off. Live commentary is back tomorrow." The page shows it as a card in the feed and disables the mic. That replay uses the cached pipeline: pre-written lines, cached Q&A, the deterministic recap, no model calls and no speech. Lines arrive with `audio_pending: false`, so no card waits for audio.
   - Start works even if the model warm-up failed, since cached mode doesn't need the model; `/healthz` reports `ready: true` and `limited: true`.
   - Questions on a replay that was already running live are answered from the cache once the model-call cap is reached.
   - Speech stops everywhere once the TTS cap is reached: the text is still delivered, and the audio event says "unavailable", as for any TTS failure.
-  - Live windows of replays already running continue until they end. At most 3 replays run, so the overshoot is bounded by those matches.
+  - Live windows of replays already running continue until they end. At most 6 replays run, so the overshoot is bounded by those matches (about 34 calls each).
   - Spoken questions on a limited replay get a polite 409 ("Spoken questions are off for this match. Please type your question.").
 - **Logging.** `spending_guard_tripped kind=model_calls|tts_characters used=… cap=…` once per cap per day (WARNING, so it reaches App Insights), and `replay_started_limited` for each limited replay.
 - **Tests** (`tests/test_spending.py`): counting, a single log per trip, the daily reset; with the cap at 0, a whole m01 in cached mode with no live-pipeline call and no speech, the notice, a typed answer from the cache and the spoken-question refusal; a TTS cap reached mid-replay gives `answer_audio_unavailable` with the text delivered.
@@ -680,3 +680,57 @@ Plain container environment variables, no secrets and no keys: `NARRATIVE_MODE`,
 | Cost guardrails | Done | Findings 7 and 12 fixed in Session B group 3 (stream deadline, replay slots, right-most `X-Forwarded-For`); per-replay token and per-address cap (group 3); the daily spending guard. |
 | Speech role (added in Session B) | Done | Cognitive Services Speech User on `pundit-speech-swc-kl`, scoped to the resource (group 2). |
 | Ingress request timeout (added in Session B) | Done | Group 1. |
+
+## Phase 4, before the gate
+
+### What one live match costs (measured on the deployed app, 17 Oct 2026)
+
+m01 at 20x, `NARRATIVE_MODE=live`, Harry voice, one replay at a time from a script (`Last-Event-ID` resume across the 200 s close in every run). Model calls are the app's `agent_call` logs, which are never sampled; tokens are the Agent Framework `chat` spans; TTS characters are `speech_synthesized ... characters=` (the text sent to `synthesize_mp3`, which is what the guard counts).
+
+| Run | Model calls | Input tokens (cached) | Output tokens | TTS calls | TTS characters |
+| :-- | --: | --: | --: | --: | --: |
+| No questions | 34 | 52,275 (5,632) | 9,029 | 14 (13 lines, recap) | 1,522 |
+| 3 typed questions | 34 (3 explainer) | 53,526 (9,728) | 8,497 | 17 (13 lines, recap, 3 answers) | 1,777 |
+| Earlier pair, from logs only | 32 / 36 | — | — | 14 / 18 | — |
+
+Live commentary varies by a few calls from run to run (director and commentator calls depend on which windows the tactical check sends), which is as much as three questions add. Typed answers' text came back in 2.28, 3.44 and 2.77 s from the script (4.36, 6.27 and 3.61 s in the earlier run).
+
+**Caps:** 20 matches a day with questions at the highest observed use (36 calls, 1,800 characters), plus 25%: **900 model calls** and **45,000 TTS characters** a day (UTC). At list prices (below) a capped day costs at most about $2.50 of model use and $0.70–1.00 of speech.
+
+**Spans were being sampled.** The first pair of runs showed 24 `chat` spans for 32 logged calls: `azure-monitor-opentelemetry` defaults to a rate-limited sampler (5 traces a second), which drops spans in bursts. `OTEL_TRACES_SAMPLER=always_on` is now set in Bicep; in the second pair, spans and logs agree exactly (34 = 34 calls, 14 and 17 syntheses with the same characters). The volume is tens of spans per match.
+
+### Replay cap 6, and a friendly "busy"
+
+- `MAX_CONCURRENT_REPLAYS` defaults to **6** (was 3; the build prompt's non-negotiable 7 and the Copilot instructions still say 3 and need updating). The per-address limit stays at 3, so one office can't take every slot.
+- When every slot is in use, `/start` returns 503 with `Retry-After: 60` and `{"detail": {"code": "busy", "message": "The pundit is busy, try again in a minute."}}`. The page shows that message as a card in the feed with a **Try again** button (a click, so autoplay stays unlocked), re-enables Start, and shows nothing in red. Checked in a browser against a one-slot local server.
+- Tests: the default cap is 6 with 3 per address (two offices of 3; a seventh viewer gets "busy"); the busy body and `Retry-After`.
+
+## Phase 4 gate, 17 Oct 2026 (deployed URL)
+
+`https://ca-pundit-bcd5v7aw3xhmg.salmonbeach-9f471d5c.uksouth.azurecontainerapps.io/`
+
+| Check | Result |
+| :-- | :-- |
+| `azd up` from a clean terminal | A new `pwsh -NoProfile` process: SUCCESS in 2 min 18 s (provision 1 min 4 s, deploy 1 min 14 s), into `rg-pundit`; still no other `pundit` resource group. The live revision has the new settings (caps 900 / 45,000, `OTEL_TRACES_SAMPLER=always_on`, 6 slots). |
+| m01 in full at 20x, Harry, autoplay, across a reconnect | Playwright Chromium, Start clicked. 313 s across 2 connections; the page reconnected after the 200 s close with `Last-Event-ID: 1075`. 1,548 events, seq 1–1548, each once and in order; 13 lines, none repeated, **none before an event it cites**; final score 3-2; 0 `error` messages; the "Enable audio" button never appeared. 13 line clips queued, 11 played with no click after Start; the 2 not played were in a burst of 5 lines in 25 s and expired after 12 s in the audio queue (Session B design: the voice never falls more than one line behind). 3 answer clips and the recap clip played. |
+| Typed question: spoken answer, text in under 6 s | Browser, timed from the form's submit event to the answer card: **2.87 s** and **3.28 s**; a first question timed from before the key press took 6.24 s (server turn 5.67 s: the evidence check rejected attempt 1 for an ungrounded "57" and the retry passed). Each answer was then spoken. Script runs: 2.28, 3.44, 2.77, 4.36, 6.27 and 3.61 s. **2 of 9 answers over 6 s**, both on an evidence-check retry. |
+| Traces in Application Insights | For the gate run: 35 `chat gpt-5.4-mini`, `invoke_agent` Commentator 14, Analyst 8, Director 7, Explainer 4, Recap 2; `pundit.turn` live 15, question 3, recap 1; `pundit.speech.synthesize` 17; `GET /msi/token`. One question's operation: `pundit.turn` → Explainer → `chat` → TTS. `genAIContent` (50 rows a day) has empty input, output, system-instruction and tool-call fields; only tool schemas are stored, so no prompt or answer text reaches telemetry. |
+| Spending cap forced to 0 | `azd env set MODEL_CALLS_PER_DAY 0`, `azd provision`: `/healthz` `ready: true, limited: true`, chip "Pundit ready · cached". Start in the browser: the notice card, "pre-written commentary" in the status line, mic disabled, cached lines with no audio events and nothing played, no errors. Restored with `azd env set MODEL_CALLS_PER_DAY 900` (`azd env unset` didn't remove the value) and `azd provision`: `limited: false`. |
+| No keys in the repo, the image or the deployed settings | Repo: a pattern scan (account keys, SAS, private keys, instrumentation keys, API-key and secret assignments, common token prefixes) of every tracked file and of `git log -p --all` found nothing; no `.env`, `.azure/`, `.pem` or `.pfx` was ever committed. Image (an `az acr run` of the deployed tag): `/app` holds `LICENSE`, `README.md`, `build`, `data`, `pyproject.toml`, `src`, `third_party`; no `.env`, `.azure`, `.git`, `.venv`, screenshots or key files (only the public CA bundle); no key patterns under `/app`; the image environment has no secrets; runs as `pundit` (uid 10001). Deployed: `secrets` null, no registry password, no key-like setting values, App Insights local auth disabled. |
+
+**Open:** the existing Speech resource `pundit-speech-swc-kl` still has local (key) auth enabled, and the Foundry account doesn't report the flag. The app never uses keys; disabling local auth on both would close that door.
+
+### Monthly cost estimate (USD list prices, 30 days)
+
+Prices from the Azure Retail Prices API, 17 Oct 2026: Container Apps UK South $0.000034 per vCPU-second active, $0.000004 idle, $0.000004 per GiB-second; free grant 180,000 vCPU-s and 360,000 GiB-s per subscription per month; no environment fee without a Dedicated profile (Learn). ACR Basic $0.1666 a day. Log Analytics $2.88 per GB. `gpt-5.4-mini` Data Zone, Australia East: $0.90 per 1M input, $0.09 cached input, $5.40 output. Speech: Neural TTS $15 and Neural HD $22 per 1M characters; **the MAI voice has no retail price listed, so $15–22 is an assumption**. STT $1 an hour.
+
+| | `minReplicas: 1` | `minReplicas: 0` |
+| :-- | --: | --: |
+| Container Apps compute | $13.40 idle floor (0.5 vCPU, 1 GiB, all month, after the free grant); about **$19** with 20 matches a day (an open stream counts as active); $47 if a tab is open all month | $0 for light use (inside the free grant); about $4 at 20 matches a day (including the 5-minute scale-in) |
+| Container Registry, Basic | $5.00 | $5.00 |
+| Log Analytics / App Insights | ≤ $3 (measured 0.66 MB per match, about 3.6 MB a day idle) | ≤ $3 |
+| **Fixed** | **about $27** | **about $8** |
+| Per match with 3 questions (measured) | model $0.086 + speech $0.027–0.039 = **$0.11–0.13** | same |
+| 20 matches a day (600 a month) | +$68–75 → **about $95–100** | +$68–75 → **about $77–83** |
+| 5 matches a day | +$17–19 → **about $45** | +$17–19 → **about $26** |
+| Ceiling set by the daily caps | usage ≤ $3.30 a day (900 calls ≈ $2.28, 45,000 characters ≤ $0.99) → ≤ $98 a month + fixed | same |
