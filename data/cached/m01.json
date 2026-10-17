@@ -44,7 +44,7 @@
     },
     {
       "line_id": "m01-l006",
-      "text": "The home side first reshape their structure, asking the midfield to offer a steadier platform while the search for a route back continues.",
+      "text": "Ashbridge Rovers first reshape their structure, asking the midfield to offer a steadier platform while the search for a route back continues.",
       "insight_id": "m01-i1149",
       "fact_ids": ["formation_at:home_formation"],
       "event_ids": ["m01-e1149"],
@@ -60,7 +60,7 @@
     },
     {
       "line_id": "m01-l008",
-      "text": "The home side have their goal, and a difficult afternoon now has a fresh edge as Ashbridge Rovers begin to believe in the recovery.",
+      "text": "Ashbridge Rovers have their goal, and the match now has a fresh edge as they begin to believe in the recovery.",
       "insight_id": "m01-i1271",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m01-e1270", "m01-e1271"],
@@ -92,7 +92,7 @@
     },
     {
       "line_id": "m01-l012",
-      "text": "The home side keep pushing and find another goal, completing a remarkable swing in momentum after the visitors had controlled the earlier scoring.",
+      "text": "Ashbridge Rovers keep pushing and find another goal, completing a remarkable swing in momentum after the visitors had controlled the earlier scoring.",
       "insight_id": "m01-i1513",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m01-e1512", "m01-e1513"],
@@ -100,7 +100,7 @@
     },
     {
       "line_id": "m01-l013",
-      "text": "Ashbridge Rovers have turned persistence into a lead, and Port Calder must now find composure while the home supporters celebrate the late change.",
+      "text": "Ashbridge Rovers have turned persistence into a lead, and Port Calder must now find composure after the late change.",
       "insight_id": "m01-i1513",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m01-e1512", "m01-e1513"],
@@ -132,18 +132,18 @@
     },
     {
       "question": "How did Port Calder take control early?",
-      "answer": "The logged away goals put Port Calder in front before Ashbridge Rovers reshaped their approach.",
+      "answer": "The logged away goals put Port Calder FC in front before Ashbridge Rovers reshaped their approach.",
       "fact_ids": ["match_state:score", "formation_at:home_formation"],
       "event_ids": ["m01-e0395", "m01-e1045", "m01-e1235"]
     }
   ],
   "recap": {
     "headline": "Ashbridge Rovers win 3-2 with a late comeback",
-    "summary": "Port Calder established an early lead before Ashbridge Rovers changed their shape and replied with a late scoring surge.",
+    "summary": "Port Calder FC established an early lead before Ashbridge Rovers changed their shape and replied with a late scoring surge.",
     "key_moments": [
       {
         "minute": 23,
-        "text": "Port Calder open the scoring and set the contest on a different course.",
+        "text": "Port Calder FC open the scoring and set the contest on a different course.",
         "event_ids": ["m01-e0395"]
       },
       {
@@ -153,11 +153,11 @@
       },
       {
         "minute": 88,
-        "text": "The home side complete the turnaround with a late goal.",
+        "text": "Ashbridge Rovers complete the turnaround with a late goal.",
         "event_ids": ["m01-e1513"]
       }
     ],
-    "audio_script": "Port Calder struck first and added another goal, putting Ashbridge Rovers under pressure. The home side changed their shape and gradually found a route back into the match. Their response gathered pace, and the late scoring moments completed a memorable turnaround. Every cited moment is tied to the synthetic event log.",
+    "audio_script": "Port Calder FC struck first and added another goal, putting Ashbridge Rovers under pressure. Ashbridge changed their shape and gradually found a route back into the match. Their response gathered pace, and the late scoring moments completed a memorable turnaround. Every cited moment is tied to the synthetic event log.",
     "fact_ids": ["match_state:score", "formation_at:home_formation"],
     "event_ids": ["m01-e0395", "m01-e1045", "m01-e1235", "m01-e1271", "m01-e1392", "m01-e1513"]
   }

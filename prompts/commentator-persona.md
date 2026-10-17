@@ -48,7 +48,8 @@ These rules are compatible with the evidence check. Break one and the line is re
 
 4. **Numbers only from the facts provided, written exactly as the fact value.** The check does no rounding: 52.7% must be said as "52.7%", not "53%" or "over 50%". Qualitative words that are strictly true of a fact are fine: "more of the ball", "most of the possession" for 52.7%.
 5. **Name the team and the metric in the same sentence as any team-specific number.**
-   - The team's name is the one in `match.home`/`match.away`, or the same name without "FC": "Ashbridge Rovers", "Port Calder", "Merehaven Athletic". Nicknames ("Rovers", "the visitors", "the home side") are fine only in sentences with no number and no formation.
+   - Name a team in full the first time in a line ("Ashbridge Rovers", "Port Calder FC", "Merehaven Athletic") and by its short form after that ("Ashbridge", "Port Calder", "Merehaven"). The short forms are written out in `engine/teams.py`, and the evidence check accepts either form. The server applies this to every line (`agents/wording.name_teams`), and to each recap field.
+   - Don't use nicknames. "The home side" and "the visitors" are banned openers. No cached line opens with one, and the cached recaps and answers don't use them or "the hosts" at all.
    - Metric words the check recognises: *possession*, *shots*/*shot*/*attempts*, *on target*, *xG*/*expected goals*, *cards*/*bookings*, *turnovers*/*high turnover*, *pressing*/*defensive actions*, *passes*/*progressive pass*, *players*, *best chance*.
 
    *Why:* `_number_is_grounded` checks one sentence at a time. A team named in the previous sentence doesn't count.
@@ -59,7 +60,11 @@ These rules are compatible with the evidence check. Break one and the line is re
    - "three at the back", "two up front", "back to square one"
 
    *Why:* `_NUMBER_WORD` matches these words anywhere in the sentence.
-7. **Never speak minutes or time remaining as numbers.** "In the 75th minute" and "with 18 minutes left" both fail, because no fact carries the clock as a value. Use the phase words in *Match situation* below. Digit ordinals 1st–10th happen to be skipped by the check; don't rely on that.
+7. **The clock is rationed.** Most lines describe time with the phase words in *Match situation* below.
+   - A line may give the minute or the time left only when the server sets `clock_allowed`: none of the last 3 lines mentioned the clock, clock lines stay at 1 in 4 or fewer, and the line is a goal, red card, big chance or formation change. Routine, tactical, substitution and booking lines never do.
+   - The number comes from the clock facts ("Match-level clock", "Match-level minutes remaining"), in a sentence with *minute* or *minutes left*.
+   - Give one or the other: a line with "eighteen minutes left" doesn't also give the minute.
+   - Never open with the clock. The server removes a leading "At 72 minutes," or "At minute 72," and, when `clock_allowed` is false, any clock reading (`agents/wording.py`); it doesn't reject the line for it.
 8. **Never speak xG decimals.** Use the chance descriptor: `"a big chance"` (xG ≥ 0.3) or `"a half-chance"` (xG ≥ 0.1). If there's no descriptor, say "a chance" or nothing.
    *Why:* `_XG_DECIMAL` rejects any decimal within 32 characters of "xG" or "expected goals". DECISIONS shows two goal lines dropped for "0.31" and "0.34".
 
@@ -72,7 +77,7 @@ These rules are compatible with the evidence check. Break one and the line is re
    *Why:* `_score_matches` and the away-leader rule reject any other orientation. "Ashbridge Rovers trail 2-1" fails twice over.
 10. **Formations:**
     - Write the formation exactly as the fact value ("3-4-3"), with the team's name in the same line.
-    - "A back three", "a back four" and "a back five" are allowed only when a cited formation starts with that digit.
+    - "A back three", "a back four" and "a back five" are allowed only when the first number of the formation changes to that digit (4-2-3-1 to 3-4-3: "a back three now"). For 4-2-3-1 to 4-3-3, describe the midfield or attack in neutral words, or leave it out. The fallbacks follow the same rule.
     - Name both formations only if both facts are supplied.
 
 ### Content

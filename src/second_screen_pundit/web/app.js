@@ -343,8 +343,13 @@ function silentAudioUrl() {
 }
 
 // One <audio> element plays everything in turn, so lines never overlap. Lines wait in order;
-// at most one waits behind the line that is playing. Answers, the recap and replays go to the
-// front without cutting off the line that is playing.
+// normally at most one waits behind the line that is playing. Answers, the recap and replays
+// go to the front without cutting off the line that is playing.
+// A goal, red card or late-drama clip is never dropped and never goes stale: in a burst the
+// oldest routine clip is dropped first, and a stale routine clip is skipped.
+const PRIORITY_AUDIO_TIERS = new Set(["goal_peak", "goal_equaliser", "goal", "red_card", "big_chance"]);
+const MAX_WAITING_LINES = 1;
+
 class AudioQueue {
   constructor() {
     this.el = new Audio();
@@ -369,19 +374,32 @@ class AudioQueue {
       .finally(() => URL.revokeObjectURL(url));
   }
 
-  enqueue({ id, kind, lineId = null, expiresAt = null }) {
+  enqueue({ id, kind, lineId = null, expiresAt = null, tier = null }) {
     if (!id || this.muted) return;
-    const item = { url: audioUrl(id), kind, lineId, expiresAt };
+    const priority = kind === "line" && PRIORITY_AUDIO_TIERS.has(tier);
+    const item = { url: audioUrl(id), kind, lineId, expiresAt, priority };
     if (kind === "line") {
-      this.items = this.items
-        .filter((queued) => queued.kind !== "line" || queued.expiresAt > Date.now())
-        .filter((queued, index, all) => queued.kind !== "line" ||
-          index === all.findLastIndex((other) => other.kind === "line"));
       this.items.push(item);
+      this.trimLines();
     } else {
       this.items.unshift(item);
     }
     if (!this.playing && !this.paused) this.next();
+  }
+
+  static stale(item) {
+    return !item.priority && item.expiresAt != null && item.expiresAt < Date.now();
+  }
+
+  // Stale routine clips go; then, while too many lines wait, the oldest routine clip goes.
+  trimLines() {
+    this.items = this.items.filter((queued) => !AudioQueue.stale(queued));
+    const waitingLines = () => this.items.filter((queued) => queued.kind === "line");
+    while (waitingLines().length > MAX_WAITING_LINES) {
+      const oldestRoutine = waitingLines().find((queued) => !queued.priority);
+      if (!oldestRoutine) break;
+      this.items.splice(this.items.indexOf(oldestRoutine), 1);
+    }
   }
 
   next() {
@@ -390,7 +408,7 @@ class AudioQueue {
     if (this.paused) return;
     const item = this.items.shift();
     if (!item) return;
-    if (this.muted || (item.expiresAt && item.expiresAt < Date.now())) {
+    if (this.muted || AudioQueue.stale(item)) {
       this.next();
       return;
     }
@@ -536,12 +554,13 @@ function renderCommentary(payload) {
   actions.append(whyButton(() => showEvidence(line)));
   card.append(top, make("p", "", line.text), actions);
   card.dataset.lineId = line.line_id;
+  card.dataset.tier = line.delivery_tier || "routine";
   card.dataset.arrivedAt = String(Date.now());
   if (payload.audio_id) {
     attachLineAudio(card, line.line_id, payload.audio_id);
   } else {
     actions.append(make("span", "line-clock audio-status",
-      payload.audio_pending ? "Preparing audio…" : "Audio unavailable · text only"));
+      payload.audio_pending ? "Preparing audio…" : "Audio off"));
   }
   placeInFeed(card);
   if (payload.audio_id) {
@@ -549,6 +568,7 @@ function renderCommentary(payload) {
       id: payload.audio_id,
       kind: "line",
       lineId: line.line_id,
+      tier: card.dataset.tier,
       expiresAt: Date.now() + LINE_AUDIO_STALE_MS,
     });
   }
@@ -564,6 +584,7 @@ function updateCommentaryAudio(payload) {
     id: payload.audio_id,
     kind: "line",
     lineId: payload.line_id,
+    tier: card.dataset.tier,
     expiresAt: Number(card.dataset.arrivedAt) + LINE_AUDIO_STALE_MS,
   });
 }
@@ -574,6 +595,19 @@ function questionCard(text) {
   const card = make("article", "feed-card question-card");
   card.append(make("span", "eyebrow", "YOU ASKED"), make("p", "question-text", text));
   return card;
+}
+
+function newQuestionId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID().replaceAll("-", "");
+  return `q${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+}
+
+// The first answer failed the evidence check and a second attempt is running.
+function showCheckingFacts(card) {
+  if (!card?.classList.contains("thinking")) return; // the answer is already showing
+  const body = card.querySelector("p");
+  body.textContent = "Checking the facts";
+  body.append(make("span", "thinking-dots"));
 }
 
 function thinkingCard(text = "Thinking") {
@@ -673,7 +707,7 @@ function handleSse(name, payload) {
     const card = [...document.querySelectorAll(".commentary-card")]
       .find((item) => item.dataset.lineId === payload.line_id);
     const notice = card?.querySelector(".audio-status");
-    if (notice) notice.textContent = "Audio unavailable · text only";
+    if (notice) notice.textContent = "Audio off";
   }
   if (name === "recap") renderRecap(payload);
   if (name === "recap_audio") setRecapAudio(payload.audio_id);
@@ -900,17 +934,23 @@ async function askTyped(event) {
   placeInFeed(questionCard(question), { forceScroll: true });
   const waiting = thinkingCard();
   placeInFeed(waiting, { forceScroll: true });
+  // The page picks the question ID, so an "answer_checking" event on the stream can find
+  // this card while the request is still waiting.
+  const questionId = newQuestionId();
+  state.pendingAnswers.set(questionId, waiting);
   try {
     const result = await responseJson(await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Replay-Token": state.replayToken },
-      body: JSON.stringify({ replay_id: state.replayId, question }),
+      body: JSON.stringify({ replay_id: state.replayId, question, question_id: questionId }),
     }));
     const answered = answerCard(result);
     placeInFeed(answered, { replace: waiting });
     // Its audio follows on the SSE stream as "answer_audio", as for a spoken question.
     if (result.audio_pending) state.pendingAnswers.set(result.question_id, answered);
+    else state.pendingAnswers.delete(questionId);
   } catch (error) {
+    state.pendingAnswers.delete(questionId);
     placeInFeed(errorCard(error.message), { replace: waiting });
   } finally {
     button.disabled = false;
@@ -993,6 +1033,7 @@ async function sendSpokenQuestion(blob) {
 function handleAnswerEvent(name, payload) {
   const card = state.pendingAnswers.get(payload.question_id);
   if (!card) return;
+  if (name === "answer_checking") showCheckingFacts(card);
   if (name === "answer") {
     const answered = answerCard(payload);
     placeInFeed(answered, { replace: card });

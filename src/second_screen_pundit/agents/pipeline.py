@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TypeVar
@@ -33,6 +33,7 @@ from second_screen_pundit.agents.clients import (
     AgentRole,
     AgentTool,
     _MAX_TOKENS,
+    capture_usage,
     create_foundry_agent,
     create_foundry_chat_client,
     deployment_for_role,
@@ -51,7 +52,12 @@ from second_screen_pundit.agents.commentator import (
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.content_filter import OUT_OF_SCOPE_ANSWER, question_scope_reason
 from second_screen_pundit.agents.delivery import TIER_TONES, tier_for_event, tier_for_signals
-from second_screen_pundit.agents.evidence import EvidenceReport, check_evidence, mentions_score
+from second_screen_pundit.agents.evidence import (
+    EvidenceReport,
+    check_evidence,
+    classify_failure,
+    mentions_score,
+)
 from second_screen_pundit.agents.fallbacks import fallback_lines
 from second_screen_pundit.agents.models import (
     Claim,
@@ -132,6 +138,8 @@ class LiveWindowResult:
     output_failures: tuple[str, ...] = ()
     # "group: phrase" for each banned phrase that sent a model line to the fallback.
     banned_phrases: tuple[str, ...] = ()
+    # "role: rule: subject" for each failed check on any attempt in this window.
+    evidence_failures: tuple[str, ...] = ()
 
 
 AnswerSource = Literal["agent", "fallback", "out_of_scope", "cached"]
@@ -212,6 +220,22 @@ def formation_changes(info: MatchInfo, facts: Sequence[Fact]) -> list[tuple[str,
         ):
             new[side] = fact.value
     return [(previous[side], new[side]) for side in previous if side in new]
+
+
+def _log_failure_reasons(
+    route: str, match_id: str, as_of: int, attempt: int, failures: Sequence[str]
+) -> None:
+    for failure in failures:
+        reason = classify_failure(failure)
+        logger.warning(
+            "evidence_check_failed match_id=%s as_of=%d role=%s attempt=%d rule=%r subject=%r",
+            match_id,
+            as_of,
+            route,
+            attempt,
+            reason.rule,
+            reason.subject,
+        )
 
 
 def name_teams_in_recap(recap: Recap, info: MatchInfo) -> Recap:
@@ -561,40 +585,63 @@ async def _run_single_agent(
     started = time.perf_counter()
     response: object | None = None
     finish_reason: str | None = "error"
-    try:
-        run_result = await workflow.run(Message(role="user", contents=prompt))
-        response = _workflow_response(run_result)
-        finish_reason = _finish_reason(response) or ("no_response" if response is None else None)
-        return response
-    except Exception as exc:
-        if _failure_detail(exc)[1]:
-            finish_reason = "length"
-        raise
-    finally:
-        usage = getattr(response, "usage_details", None) or {}
-        timing = AgentCallTiming(
-            role=role,
-            attempt=attempt,
-            duration_ms=round((time.perf_counter() - started) * 1000),
-            input_tokens=usage.get("input_token_count"),
-            output_tokens=usage.get("output_token_count"),
-            reasoning_tokens=usage.get("reasoning_output_token_count"),
-            finish_reason=finish_reason,
-        )
-        timings.append(timing)
-        logger.info(
-            "agent_call role=%s match_id=%s as_of=%d attempt=%d duration_ms=%d "
-            "input_tokens=%s output_tokens=%s reasoning_tokens=%s finish_reason=%s",
-            role,
-            match_id,
-            as_of,
-            attempt,
-            timing.duration_ms,
-            timing.input_tokens,
-            timing.output_tokens,
-            timing.reasoning_tokens,
-            finish_reason,
-        )
+    with capture_usage() as captured:
+        try:
+            run_result = await workflow.run(Message(role="user", contents=prompt))
+            response = _workflow_response(run_result)
+            finish_reason = _finish_reason(response) or (
+                "no_response" if response is None else None
+            )
+        except Exception as exc:
+            if _failure_detail(exc)[1]:
+                finish_reason = "length"
+            raise
+        finally:
+            usage = _call_usage(response, captured)
+            _record_call(
+                role, attempt, started, usage, finish_reason, timings, match_id, as_of
+            )
+    return response
+
+
+def _call_usage(response: object | None, captured: dict[str, int]) -> dict[str, int]:
+    """The chat responses' token counts, or the agent response's when it has them."""
+    return captured or dict(getattr(response, "usage_details", None) or {})
+
+
+def _record_call(
+    role: AgentRole,
+    attempt: int,
+    started: float,
+    usage: dict[str, int],
+    finish_reason: str | None,
+    timings: list[AgentCallTiming],
+    match_id: str,
+    as_of: int,
+) -> None:
+    timing = AgentCallTiming(
+        role=role,
+        attempt=attempt,
+        duration_ms=round((time.perf_counter() - started) * 1000),
+        input_tokens=usage.get("input_token_count"),
+        output_tokens=usage.get("output_token_count"),
+        reasoning_tokens=usage.get("reasoning_output_token_count"),
+        finish_reason=finish_reason,
+    )
+    timings.append(timing)
+    logger.info(
+        "agent_call role=%s match_id=%s as_of=%d attempt=%d duration_ms=%d "
+        "input_tokens=%s output_tokens=%s reasoning_tokens=%s finish_reason=%s",
+        role,
+        match_id,
+        as_of,
+        attempt,
+        timing.duration_ms,
+        timing.input_tokens,
+        timing.output_tokens,
+        timing.reasoning_tokens,
+        finish_reason,
+    )
 
 
 def _fallback_explanation(
@@ -1109,6 +1156,25 @@ class PunditPipeline:
 
             return record
 
+        evidence_failures: list[str] = []
+
+        def record_evidence(role: AgentRole, attempt: int, failures: Sequence[str]) -> None:
+            """Each failed check, with the rule it broke and the number, name or ID behind it."""
+            for failure in failures:
+                reason = classify_failure(failure)
+                evidence_failures.append(f"{role}: {reason.rule}: {reason.subject or '-'}")
+                logger.warning(
+                    "evidence_check_failed match_id=%s as_of=%d role=%s attempt=%d rule=%r "
+                    "subject=%r detail=%r",
+                    info.match_id,
+                    as_of,
+                    role,
+                    attempt,
+                    reason.rule,
+                    reason.subject,
+                    failure,
+                )
+
         def stale_result() -> LiveWindowResult:
             return LiveWindowResult(
                 "skipped",
@@ -1277,6 +1343,7 @@ class PunditPipeline:
                         reason or "Agent output failed; deterministic fallback was used.",
                         tuple(timings),
                         tuple(output_failures),
+                        evidence_failures=tuple(evidence_failures),
                     )
                 failures = report.failures
             raise RuntimeError(
@@ -1291,52 +1358,54 @@ class PunditPipeline:
         ) -> object:
             started = time.perf_counter()
             response: object | None = None
-            try:
-                self._count_model_call()
-                response = await agent.run(prompt)
-                return response
-            finally:
-                finish_reason = getattr(response, "finish_reason", None)
-                finish_reason = getattr(finish_reason, "value", finish_reason)
-                normalized_finish_reason = (
-                    str(finish_reason).casefold()
-                    if finish_reason is not None
-                    else None
-                )
-                if normalized_finish_reason in {"length", "max_tokens"}:
-                    truncated_output_roles.add(role)
-                    logger.warning(
-                        "agent_output_truncated role=%s as_of=%d attempt=%d max_tokens=%d",
+            with capture_usage() as captured:
+                try:
+                    self._count_model_call()
+                    response = await agent.run(prompt)
+                    return response
+                finally:
+                    finish_reason = getattr(response, "finish_reason", None)
+                    finish_reason = getattr(finish_reason, "value", finish_reason)
+                    normalized_finish_reason = (
+                        str(finish_reason).casefold()
+                        if finish_reason is not None
+                        else None
+                    )
+                    if normalized_finish_reason in {"length", "max_tokens"}:
+                        truncated_output_roles.add(role)
+                        logger.warning(
+                            "agent_output_truncated role=%s as_of=%d attempt=%d max_tokens=%d",
+                            role,
+                            as_of,
+                            attempt,
+                            _MAX_TOKENS[role],
+                        )
+                    usage = _call_usage(response, captured)
+                    timing = AgentCallTiming(
+                        role=role,
+                        attempt=attempt,
+                        duration_ms=round((time.perf_counter() - started) * 1000),
+                        input_tokens=usage.get("input_token_count"),
+                        output_tokens=usage.get("output_token_count"),
+                        reasoning_tokens=usage.get("reasoning_output_token_count"),
+                        finish_reason=(
+                            normalized_finish_reason if response is not None else "no_response"
+                        ),
+                    )
+                    timings.append(timing)
+                    logger.info(
+                        "agent_call role=%s match_id=%s as_of=%d attempt=%d duration_ms=%d "
+                        "input_tokens=%s output_tokens=%s reasoning_tokens=%s finish_reason=%s",
                         role,
+                        info.match_id,
                         as_of,
                         attempt,
-                        _MAX_TOKENS[role],
+                        timing.duration_ms,
+                        timing.input_tokens,
+                        timing.output_tokens,
+                        timing.reasoning_tokens,
+                        normalized_finish_reason,
                     )
-                usage = getattr(response, "usage_details", None) or {}
-                timing = AgentCallTiming(
-                    role=role,
-                    attempt=attempt,
-                    duration_ms=round((time.perf_counter() - started) * 1000),
-                    input_tokens=usage.get("input_token_count"),
-                    output_tokens=usage.get("output_token_count"),
-                    reasoning_tokens=usage.get("reasoning_output_token_count"),
-                    finish_reason=(
-                        normalized_finish_reason if response is not None else "no_response"
-                    ),
-                )
-                timings.append(timing)
-                logger.info(
-                    "agent_call role=%s as_of=%d attempt=%d duration_ms=%d "
-                    "input_tokens=%s output_tokens=%s reasoning_tokens=%s finish_reason=%s",
-                    role,
-                    as_of,
-                    attempt,
-                    timing.duration_ms,
-                    timing.input_tokens,
-                    timing.output_tokens,
-                    timing.reasoning_tokens,
-                    normalized_finish_reason,
-                )
 
         async def call(
             role: AgentRole,
@@ -1415,6 +1484,7 @@ class PunditPipeline:
                         ],
                     )
                     if not decision_report.passed:
+                        record_evidence("director", attempt, decision_report.failures)
                         feedback = "; ".join(decision_report.failures)
                         continue
                     if not (
@@ -1496,6 +1566,7 @@ class PunditPipeline:
                             ),
                         )
                     if not insight_report.passed:
+                        record_evidence("analyst", attempt, insight_report.failures)
                         feedback = "; ".join(insight_report.failures)
                         continue
                     insight = candidate
@@ -1577,6 +1648,9 @@ class PunditPipeline:
                         attempt,
                         "|".join(hits),
                     )
+                    record_evidence(
+                        "commentator", attempt, [f"banned phrase {hit}" for hit in hits]
+                    )
                     reason = "Banned phrase (" + ", ".join(hits) + "); deterministic line used."
                     if fallback_plan() is not None:
                         return replace(fallback_result(reason), banned_phrases=tuple(hits))
@@ -1594,6 +1668,7 @@ class PunditPipeline:
                     feedback = (
                         f"text is {len(text)} characters; the limit is {MAX_LINE_CHARS}"
                     )
+                    record_evidence("commentator", attempt, (feedback,))
                     continue
                 line = CommentaryLine(
                     line_id=live_line_id(info.match_id, as_of, lane),
@@ -1625,6 +1700,7 @@ class PunditPipeline:
                         report,
                         timings=tuple(timings),
                     )
+                record_evidence("commentator", attempt, report.failures)
                 feedback = "; ".join(report.failures)
             roles = ", ".join(
                 f"{role}{' (finish_reason=length)' if role in truncated_output_roles else ''}"
@@ -1719,7 +1795,11 @@ class PunditPipeline:
             )
             if result is None:
                 raise RuntimeError("Live workflow returned no window result")
-            return replace(result, output_failures=tuple(output_failures))
+            return replace(
+                result,
+                output_failures=tuple(output_failures),
+                evidence_failures=tuple(evidence_failures),
+            )
         except TimeoutError:
             if is_tactical_stale():
                 return stale_result()
@@ -1894,7 +1974,10 @@ class PunditPipeline:
         question: str,
         *,
         as_of: int,
+        on_retry: Callable[[], Awaitable[None]] | None = None,
     ) -> QuestionResult:
+        """``on_retry`` is awaited when the first answer fails the evidence check and a second
+        attempt starts, so the page can say it is checking the facts."""
         if len(question) > 300:
             raise ValueError("Question must not exceed 300 characters")
         if question_scope_reason(question) is not None:
@@ -2040,7 +2123,10 @@ class PunditPipeline:
                     attempt,
                     "; ".join(report.failures),
                 )
+                _log_failure_reasons("question", info.match_id, as_of, attempt, report.failures)
                 feedback = _retry_feedback(report.failures)
+                if attempt == 1 and on_retry is not None:
+                    await on_retry()
             return None
 
         try:
@@ -2337,6 +2423,7 @@ class PunditPipeline:
                     attempt,
                     "; ".join(report.failures),
                 )
+                _log_failure_reasons("recap", info.match_id, as_of, attempt, report.failures)
                 feedback = _retry_feedback(report.failures)
             return None
 

@@ -20,7 +20,7 @@ from azure.identity import DefaultAzureCredential
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.content_filter import viewer_output_block_reason
@@ -55,6 +55,9 @@ SSE_RETRY_MILLISECONDS = 1000
 class QuestionRequest(BaseModel):
     replay_id: str
     question: str
+    # Chosen by the page, so an "answer_checking" event on the stream can find its card
+    # before the answer comes back.
+    question_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,64}$")
 
 
 def _new_replay_token() -> str:
@@ -879,11 +882,17 @@ def create_app(
         with turn_span("question", session.info.match_id) as span:
             span.set_attribute("app.as_of", as_of)
             span.set_attribute("app.question.characters", len(question))
+            async def checking() -> None:
+                # The first answer failed the evidence check; the page shows
+                # "Checking the facts…" until the second attempt's answer arrives.
+                await session.outbox.put(("answer_checking", {"question_id": question_id}))
+
             result = await pipeline.answer_question(
                 session.info,
                 session.events,
                 question,
                 as_of=as_of,
+                on_retry=checking,
             )
             explanation, blocked_reason = _safe_question_explanation(
                 pipeline,
@@ -911,7 +920,7 @@ def create_app(
                 ),
             )
         session = check_question_access(payload.replay_id, request)
-        question_id = uuid4().hex
+        question_id = payload.question_id or uuid4().hex
         result = await answer(session, question_id, question, started)
         if not session.audio_enabled:
             return {**result, "audio_pending": False}

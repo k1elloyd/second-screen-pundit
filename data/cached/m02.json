@@ -54,32 +54,32 @@
   "questions": [
     {
       "question": "What followed the red card?",
-      "answer": "The home side changed formation shortly after the dismissal, and the later match-state entries record how the contest unfolded.",
+      "answer": "Port Calder FC changed formation shortly after the dismissal, and the later match-state entries record how the contest unfolded.",
       "fact_ids": ["match_state:score", "formation_at:home_formation"],
       "event_ids": ["m02-e0651", "m02-e0669", "m02-e0928"]
     }
   ],
   "recap": {
     "headline": "Merehaven Athletic win 2-1 in a reshaped contest",
-    "summary": "An early Port Calder goal was followed by a red card for the home side. Merehaven Athletic changed the score after Port Calder altered their formation.",
+    "summary": "An early Port Calder FC goal was followed by a red card for Port Calder. Merehaven Athletic changed the score after Port Calder altered their formation.",
     "key_moments": [
       {
         "minute": 27,
-        "text": "Port Calder open the scoring.",
+        "text": "Port Calder FC open the scoring.",
         "event_ids": ["m02-e0463"]
       },
       {
         "minute": 38,
-        "text": "A red card forces Port Calder to adjust.",
+        "text": "A red card forces Port Calder FC to adjust.",
         "event_ids": ["m02-e0651"]
       },
       {
         "minute": 39,
-        "text": "Port Calder change their formation.",
+        "text": "Port Calder FC change their formation.",
         "event_ids": ["m02-e0669"]
       }
     ],
-    "audio_script": "Port Calder scored before the match shifted with a red card for the home side. The hosts changed formation to meet the new challenge, but Merehaven Athletic found further openings. The event log records each cited moment and the verified score.",
+    "audio_script": "Port Calder FC scored before the match shifted with a red card for Port Calder. Port Calder changed formation to meet the new challenge, but Merehaven Athletic found further openings. The event log records each cited moment and the verified score.",
     "fact_ids": ["match_state:score", "formation_at:home_formation"],
     "event_ids": ["m02-e0463", "m02-e0651", "m02-e0669", "m02-e0928", "m02-e1418"]
   }

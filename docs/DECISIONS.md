@@ -734,3 +734,48 @@ Prices from the Azure Retail Prices API, 17 Oct 2026: Container Apps UK South $0
 | 20 matches a day (600 a month) | +$68–75 → **about $95–100** | +$68–75 → **about $77–83** |
 | 5 matches a day | +$17–19 → **about $45** | +$17–19 → **about $26** |
 | Ceiling set by the daily caps | usage ≤ $3.30 a day (900 calls ≈ $2.28, 45,000 characters ≤ $0.99) → ≤ $98 a month + fixed | same |
+
+## Polish session, 17 Oct 2026
+
+Wording and small fixes only; the pipeline structure, timing, evidence rules, streaming and infrastructure are unchanged. The wording rules live in `agents/wording.py` and run on every line before the evidence check; they only remove words or swap one accepted team name for another, so a grounded line stays grounded.
+
+### How lines are worded
+
+- **Clock.** A line may give the minute or the time left only with a clock budget: none of the last 3 lines mentioned the clock and clock lines stay at 1 in 4 or fewer (`clock_budget_allows`), and only for goal, red-card, big-chance and formation tiers. The model gets `clock_allowed` and, without it, no clock facts. A leading "At 72 minutes," / "At minute 72," is removed rather than rejected; a line with the time left loses its minute; without a budget every clock reading ("with 18 minutes left", "67 minutes gone") is removed. The dispatcher applies the same rules when it publishes, so the two lanes can't both spend one budget.
+- **Formations.** "A back three" only when the first number of the formation changes. The fallbacks add ", a back three now" in that case and nothing otherwise; a model line that names an unchanged back line is retried, then falls back.
+- **Team names.** Full name first in a line, short form after, from an explicit table in `engine/teams.py` (Ashbridge, Port Calder, Merehaven). `team_display_name` and the score phrases now carry the full name, so a line that opens with the score says "Port Calder FC lead 1-0". Each recap field follows the same rule. The evidence check takes both forms from the table instead of stripping "FC".
+- **Banned phrases** (model lines only; a hit goes straight to the deterministic line): hype words, betting words, invented detail (the crowd, the home supporters, atmosphere, this afternoon, tonight, VAR, injury, injured), "the winner", and the openers And, What a, There it is, Here we go, The home side, The visitors. Whole-word and case-insensitive. "Comeback" and "turnaround" are allowed only for a team that trailed earlier and is now level or ahead. "The referee", "It's" and "It is" are not banned.
+- **Cached content.** The cached lines, recaps and answers were reworded to the same standard (no nickname openers, no "home supporters" or "afternoon", nicknames replaced in recaps and answers, full name then short), and a test runs every cached line through the banned-phrase and evidence checks.
+
+### Numbers and duplicates
+
+- **Possession pairs sum to 100.** `possession_pair` rounds home half up and gives away the rest, for the one-decimal value and the whole-number spoken value, in `match_state`, `possession_window`, `match_snapshot` and `compare_windows`. "61% to 40%" now fails the evidence check. The stats panel has no possession figure; that comes in a later UI session.
+- **One line per red card.** The card reaches the fast path and the tactical lane about 0.3 s apart (review 2 finding 14); the dispatcher publishes the first line citing the card's event ID and skips the other.
+
+### Audio and the interface
+
+- **Audio queue.** Goal, equaliser, late go-ahead, red-card and big-chance clips are never dropped and never go stale; in a burst the oldest routine clip goes first. Tested by running the shipped `AudioQueue` class under Node.
+- **"Checking the facts…"** When an answer fails the evidence check and is retried, the API sends `answer_checking` on the replay's stream. Typed questions now send a page-chosen `question_id` (validated) so the event can find the waiting card.
+- The line label for missing audio is now "Audio off".
+
+### Diagnostics
+
+- Every failed check is logged as `evidence_check_failed … rule=… subject=…` (the number, name or ID and the rule broken) and kept on the window result. `--live-latency` prints a summary by reason, token totals, and the gate's wording checks.
+- **Token counts.** The workflow's `AgentResponse` arrives with `usage_details` None; each `ChatResponse` has the counts. A chat middleware (`UsageCapture`) now adds them up per agent call, so `agent_call` logs, `turn_tokens` logs and the `pundit.turn` totals carry real numbers.
+
+### Gate, 17 Oct 2026 (local, live models, 20x)
+
+| Check | m01 | m02 |
+| :-- | :-- | :-- |
+| Lines (agent) | 13 (9) | 11 (9) |
+| A minute and "minutes left" in one line | 0 | 0 |
+| Clock lines | 0 of 13 | 0 of 11 |
+| "FC" after a team's first mention | 0 | 0 |
+| Red-card lines | — | 1 |
+| Banned-phrase rejections | 0 of 15 commentator calls | 0 of 13 |
+| Evidence-check failures by reason | 13: event not supplied to the agent 5, ungrounded number 3 ("10" twice, "18"), away leader's score 2, score mismatch 2, xG decimal 1 | 7: event not supplied 2, away leader's score 2, score mismatch 2, score with no score_phrase 1 |
+| Tokens (input / output) | 46,347 / 5,849, every call counted | 40,869 / 5,262, every call counted |
+
+- **Browser** (Playwright Chromium, m02 then m01 at 20x, live): every queued clip played. m02: 11 line clips (goal, red card, equaliser, late go-ahead), the answer and the recap. m01: 13 line clips (all five goals) and the recap. With the first answer's evidence check forced to fail by a gate-only launcher, the answer card showed "Checking the facts…" and the answer then replaced it: "Port Calder FC have 60% possession and Merehaven Athletic 40%", with facts of 59.7% and 40.3%.
+- No line in either latency run spoke a possession pair; the browser answer above is the pair seen live. The pairs are covered by tests for every window and snapshot in m01–m03.
+- The browser m01 run had one clock line, "… 67 minutes gone." on the 67' formation line (within the budget). "Minutes gone/played" wasn't recognised as a clock reading; it is now.

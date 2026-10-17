@@ -181,10 +181,10 @@ def test_a_spoken_answer_pending_across_a_drop_arrives_once(
     class _HeldPipeline(PunditPipeline):
         """Holds the answer until the stream has dropped."""
 
-        async def answer_question(self, info, events, question, *, as_of):
+        async def answer_question(self, info, events, question, *, as_of, **kwargs):
             self.as_of = as_of
             await gate.wait()
-            return await super().answer_question(info, events, question, as_of=as_of)
+            return await super().answer_question(info, events, question, as_of=as_of, **kwargs)
 
     pipeline = _HeldPipeline(settings, None)
     app, routes = _app(settings, pipeline)

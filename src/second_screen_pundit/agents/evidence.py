@@ -395,6 +395,60 @@ def _formation_matches(
     return failures
 
 
+@dataclass(frozen=True)
+class FailureReason:
+    """Why one check failed: the rule broken and what broke it (a number, name or ID)."""
+
+    rule: str
+    subject: str | None
+    detail: str
+
+
+# Most specific first. Each pattern's "subject" group is the offending number, name or ID.
+_FAILURE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (rule, re.compile(pattern, re.IGNORECASE))
+    for rule, pattern in (
+        ("number not grounded by a cited fact for the named team and metric",
+         r"ungrounded number '(?P<subject>[^']+)'"),
+        ("percentage without % or per cent", r"percentage '(?P<subject>[^']+)' must be spoken"),
+        ("away leader's score not stated from their side", r"away-leading commentary"),
+        ("score does not match the score fact", r"score '(?P<subject>[^']+)' does not match"),
+        ("formation does not match a cited formation for the named team",
+         r"formation '(?P<subject>[^']+)' does not match"),
+        ("back line mentioned without a change in its number",
+         r"'(?P<subject>[^']*back[^']*)': describe the back line"),
+        ("back line does not match a cited formation",
+         r"'(?P<subject>[^']*back[^']*)' does not match a cited formation"),
+        ("xG decimal spoken", r"xG (?:or expected-goals )?decimals"),
+        ("score stated when score_phrase was null", r"score_phrase was null"),
+        ("clock stated when clock_allowed was false", r"clock_allowed was false"),
+        ("headline missing the score phrase", r"headline must contain score_phrase"),
+        ("recap minute not from a cited event", r"recap minute (?P<subject>\d+)"),
+        ("future event cited", r"future event_id: (?P<subject>\S+)"),
+        ("unknown event cited", r"unknown event_id: (?P<subject>\S+)"),
+        ("unknown fact cited", r"unknown fact_id: (?P<subject>\S+)"),
+        ("event not supplied to the agent",
+         r"event_id (?P<subject>\S+) was not (?:present|returned)"),
+        ("fact cited that was not in the Insight", r"cites a fact that was not in the Insight"),
+        ("event cited that was not in the Insight", r"cites an event that was not in the Insight"),
+        ("no event cited", r"must cite an event"),
+        ("IDs or brackets in spoken text", r"must be plain spoken English"),
+        ("line too long", r"text is (?P<subject>\d+) characters"),
+        ("banned phrase", r"banned phrase (?P<subject>.+)"),
+        ("duplicate fact ID", r"duplicate fact_id within run: (?P<subject>\S+)"),
+    )
+)
+
+
+def classify_failure(failure: str) -> FailureReason:
+    for rule, pattern in _FAILURE_RULES:
+        match = pattern.search(failure)
+        if match is not None:
+            subject = match.groupdict().get("subject")
+            return FailureReason(rule, subject, failure)
+    return FailureReason("other", None, failure)
+
+
 def check_evidence(
     output: Narrative,
     *,

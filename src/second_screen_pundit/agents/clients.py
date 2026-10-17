@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Literal
 
-from agent_framework import Agent, FunctionInvocationConfiguration, FunctionMiddleware
+from agent_framework import (
+    Agent,
+    ChatContext,
+    ChatMiddleware,
+    FunctionInvocationConfiguration,
+    FunctionMiddleware,
+)
 from agent_framework.foundry import FoundryChatClient
 from azure.core.credentials import TokenCredential
 from pydantic import BaseModel
@@ -18,6 +26,36 @@ from second_screen_pundit.agents.models import (
 
 
 AgentRole = Literal["director", "analyst", "commentator", "explainer", "recap"]
+
+# Token usage for the agent call in progress, filled from every chat response it makes. The
+# workflow's AgentResponse arrives with usage_details None; each ChatResponse carries the
+# counts, which is where the Agent Framework "chat" spans read them too.
+_USAGE_KEYS = ("input_token_count", "output_token_count", "reasoning_output_token_count")
+_CALL_USAGE: ContextVar[dict[str, int] | None] = ContextVar("pundit_call_usage", default=None)
+
+
+class UsageCapture(ChatMiddleware):
+    async def process(self, context: ChatContext, call_next: Callable[[], Awaitable[None]]) -> None:
+        await call_next()
+        totals = _CALL_USAGE.get()
+        usage = getattr(context.result, "usage_details", None)
+        if totals is None or not usage:
+            return
+        for key in _USAGE_KEYS:
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] = totals.get(key, 0) + value
+
+
+@contextmanager
+def capture_usage() -> Iterator[dict[str, int]]:
+    """Collect the chat responses' token counts for the agent call made inside the block."""
+    totals: dict[str, int] = {}
+    token = _CALL_USAGE.set(totals)
+    try:
+        yield totals
+    finally:
+        _CALL_USAGE.reset(token)
 ReasoningEffort = Literal["none", "low"]
 AgentTool = Callable[..., str]
 
@@ -114,6 +152,6 @@ def create_foundry_agent(
         name=role.replace("_", " ").title(),
         instructions=instructions,
         tools=list(tools),
-        middleware=list(middleware),
+        middleware=[*middleware, UsageCapture()],
         default_options=default_options,
     )

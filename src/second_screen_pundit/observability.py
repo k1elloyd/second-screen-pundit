@@ -16,6 +16,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
 
 tracer = trace.get_tracer("second_screen_pundit")
+logger = logging.getLogger(__name__)
 _configured = False
 
 
@@ -74,9 +75,21 @@ def record_result(span: Span, result: Any) -> None:
     if status:
         span.set_attribute("app.outcome", str(status))
     timings = getattr(result, "timings", ()) or ()
+    input_tokens = sum(t.input_tokens or 0 for t in timings)
+    output_tokens = sum(t.output_tokens or 0 for t in timings)
     span.set_attribute("app.agent_calls", len(timings))
-    span.set_attribute("app.input_tokens", sum(t.input_tokens or 0 for t in timings))
-    span.set_attribute("app.output_tokens", sum(t.output_tokens or 0 for t in timings))
+    span.set_attribute("app.input_tokens", input_tokens)
+    span.set_attribute("app.output_tokens", output_tokens)
+    if timings:
+        attributes = getattr(span, "attributes", None) or {}
+        logger.info(
+            "turn_tokens route=%s match_id=%s calls=%d input_tokens=%d output_tokens=%d",
+            attributes.get("app.route", "-"),
+            attributes.get("app.match_id", "-"),
+            len(timings),
+            input_tokens,
+            output_tokens,
+        )
 
 
 @contextmanager

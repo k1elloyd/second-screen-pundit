@@ -57,7 +57,7 @@ class _GoalCutoffPipeline:
         self.goal_seq = goal_seq
         self.received_as_of: int | None = None
 
-    async def answer_question(self, _info, _events, _question, *, as_of: int):
+    async def answer_question(self, _info, _events, _question, *, as_of: int, **_kwargs):
         self.received_as_of = as_of
         answer = (
             f"The goal is visible at m02-e{self.goal_seq:04d}."

@@ -118,6 +118,9 @@ def test_without_a_clock_budget_every_clock_reading_is_removed() -> None:
         "With 24 minutes left, Port Calder sit deep.",
         "Port Calder sit deep at 66 minutes.",
         "Eighteen minutes left, and Ashbridge Rovers push on.",
+        # Seen in the live gate: a formation line ending "67 minutes gone."
+        "Ashbridge Rovers switch to a 4-2-3-1, as they look for a way back. 67 minutes gone.",
+        "Ashbridge Rovers switch to a 4-2-3-1, 67 minutes played.",
     ):
         assert not mentions_clock(apply_clock_rules(text, clock_allowed=False)), text
 
@@ -493,3 +496,62 @@ def test_a_banned_model_line_falls_back_to_the_deterministic_line(
     assert result.line is not None and result.line.source == "fallback"
     assert "incredible" not in result.line.text.casefold()
     assert result.banned_phrases == ("hype: incredible",)
+
+
+@pytest.mark.parametrize("match_id", ["m01", "m02", "m03"])
+def test_every_cached_line_passes_the_banned_phrase_and_evidence_checks(match_id: str) -> None:
+    from second_screen_pundit.agents.cache import load_cached_match
+    from second_screen_pundit.agents.pipeline import _cached_tool_results
+
+    info, events = get_match_info(match_id), generate_match(match_id)
+    seq = {event.event_id: event.seq for event in events}
+    cached = load_cached_match(match_id, cache_dir=Path("data/cached"))
+    for line in cached.commentary:
+        as_of = max(seq[event_id] for event_id in line.event_ids)
+        published = line.model_copy(update={"text": name_teams(line.text, info)})
+        assert banned_phrase_hits(published.text, info, _goal_sides(events, as_of)) == [], (
+            published.text
+        )
+        report = check_evidence(
+            published,
+            events=events,
+            as_of=as_of,
+            tool_results=_cached_tool_results(events, as_of=as_of, fact_ids=line.fact_ids),
+            info=info,
+            input_event_ids=line.event_ids,
+        )
+        assert report.passed, (published.text, report.failures)
+    recap = cached.recap
+    for text in (recap.headline, recap.summary, recap.audio_script):
+        assert banned_phrase_hits(text, info, _goal_sides(events, events[-1].seq)) == [], text
+
+
+_NICKNAMES = re.compile(r"\b(?:the home side|the visitors|the hosts|the home team)\b", re.IGNORECASE)
+
+
+@pytest.mark.parametrize("match_id", ["m01", "m02", "m03"])
+def test_cached_recaps_and_answers_use_team_names_full_then_short(match_id: str) -> None:
+    from second_screen_pundit.agents.cache import load_cached_match
+
+    info, events = get_match_info(match_id), generate_match(match_id)
+    cached = load_cached_match(match_id, cache_dir=Path("data/cached"))
+    recap = cached.recap
+    texts = [
+        recap.headline,
+        recap.summary,
+        recap.audio_script,
+        *(moment.text for moment in recap.key_moments),
+        *(question.answer for question in cached.questions),
+    ]
+    for text in texts:
+        assert not _NICKNAMES.search(text), text
+        assert banned_phrase_hits(text, info, _goal_sides(events, events[-1].seq)) == [], text
+        _assert_full_then_short(text, info)
+
+    pipeline = PunditPipeline(replace(_settings(), mode="cached"), None)
+    as_of = events[-1].seq
+    assert asyncio.run(pipeline.produce_recap(info, events, as_of=as_of)).source == "cached"
+    for question in cached.questions:
+        result = asyncio.run(pipeline.answer_question(info, events, question.question, as_of=as_of))
+        assert result.source == "cached", (question.question, result.evidence.failures)
+        assert result.explanation.answer == question.answer

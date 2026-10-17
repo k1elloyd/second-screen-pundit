@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import Counter, defaultdict
 from statistics import median
 from time import perf_counter
@@ -16,6 +17,13 @@ from second_screen_pundit.agents.pipeline import PunditPipeline
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.generate import generate_match, get_match_info
 from second_screen_pundit.engine.replay import Replay
+from second_screen_pundit.engine.schema import Event, MatchInfo
+from second_screen_pundit.engine.teams import team_name
+from second_screen_pundit.agents.wording import (
+    mentions_clock,
+    mentions_minute,
+    mentions_minutes_left,
+)
 
 
 def _stats(values: list[int]) -> dict[str, float | int | None]:
@@ -113,6 +121,116 @@ def summarize_calls(outcomes: list[WindowOutcome]) -> dict[str, dict[str, object
             ),
         }
         for role, timings in sorted(by_role.items())
+    }
+
+
+def summarize_failures(outcomes: list[WindowOutcome]) -> dict[str, object]:
+    """Every failed check in the run, counted by the rule it broke, with what broke it."""
+    entries = [
+        entry
+        for outcome in outcomes
+        if outcome.result is not None
+        for entry in outcome.result.evidence_failures
+    ]
+    by_reason: Counter[str] = Counter()
+    subjects: dict[str, Counter[str]] = defaultdict(Counter)
+    for entry in entries:
+        role, rule, subject = (entry.split(": ", 2) + ["-", "-"])[:3]
+        by_reason[rule] += 1
+        subjects[rule][f"{role}: {subject}"] += 1
+    return {
+        "total": len(entries),
+        "by_reason": dict(by_reason.most_common()),
+        "subjects": {rule: dict(counter.most_common()) for rule, counter in subjects.items()},
+    }
+
+
+def summarize_tokens(outcomes: list[WindowOutcome]) -> dict[str, object]:
+    turns = [
+        {
+            "path": outcome.path,
+            "minute": outcome.minute,
+            "calls": len(outcome.result.timings),
+            "input_tokens": sum(t.input_tokens or 0 for t in outcome.result.timings),
+            "output_tokens": sum(t.output_tokens or 0 for t in outcome.result.timings),
+            "missing_usage": sum(t.input_tokens is None for t in outcome.result.timings),
+        }
+        for outcome in sorted(outcomes, key=lambda item: item.event.seq)
+        if outcome.result is not None and outcome.result.timings
+    ]
+    return {
+        "input_tokens": sum(turn["input_tokens"] for turn in turns),  # type: ignore[misc]
+        "output_tokens": sum(turn["output_tokens"] for turn in turns),  # type: ignore[misc]
+        "calls_without_usage": sum(turn["missing_usage"] for turn in turns),  # type: ignore[misc]
+        "turns": turns,
+    }
+
+
+_POSSESSION_PAIR = re.compile(r"(\d+(?:\.\d+)?)\s*%[^.%]{0,40}?\b(?:to|and|against|,)\s+(\d+(?:\.\d+)?)\s*%")
+
+
+def wording_checks(
+    info: MatchInfo, events: list[Event], outcomes: list[WindowOutcome]
+) -> dict[str, object]:
+    """The polish-session gate checks on the published lines."""
+    lines = [
+        outcome.result.line
+        for outcome in sorted(outcomes, key=lambda item: item.event.seq)
+        if outcome.result is not None
+        and outcome.result.status in {"commentary", "cached"}
+        and outcome.result.line is not None
+    ]
+    texts = [line.text for line in lines]
+    clock = [text for text in texts if mentions_clock(text)]
+    both = [text for text in texts if mentions_minute(text) and mentions_minutes_left(text)]
+    late_fc = []
+    for text in texts:
+        for side in ("home", "away"):
+            name = team_name(info, side)
+            mentions = re.findall(
+                rf"(?<!\w)(?:{re.escape(name.full)}|{re.escape(name.short)})(?!\w)", text
+            )
+            if " FC" in name.full and name.full in mentions[1:]:
+                late_fc.append(text)
+    red_ids = {
+        event.event_id
+        for event in events
+        if event.type == "card" and event.detail.get("colour") == "red"
+    }
+    pairs = [
+        (text, float(a), float(b))
+        for text in texts
+        for a, b in _POSSESSION_PAIR.findall(text)
+    ]
+    commentator_calls = sum(
+        1
+        for outcome in outcomes
+        if outcome.result is not None
+        for timing in outcome.result.timings
+        if timing.role == "commentator"
+    )
+    banned = [
+        {"minute": outcome.minute, "phrases": list(outcome.result.banned_phrases)}
+        for outcome in outcomes
+        if outcome.result is not None and outcome.result.banned_phrases
+    ]
+    return {
+        "lines": len(texts),
+        "minute_and_minutes_left": both,
+        "clock_lines": len(clock),
+        "clock_share": round(len(clock) / len(texts), 3) if texts else 0.0,
+        "fc_after_first_mention": late_fc,
+        "red_card_lines": sum(1 for line in lines if red_ids.intersection(line.event_ids)),
+        "possession_pairs": [
+            {"text": text, "pair": [a, b], "sums_to_100": round(a + b, 6) == 100}
+            for text, a, b in pairs
+        ],
+        "banned_phrase_rejections": {
+            "rejected": len(banned),
+            "commentator_calls": commentator_calls,
+            "share": round(len(banned) / commentator_calls, 3) if commentator_calls else 0.0,
+            "hits": banned,
+        },
     }
 
 
@@ -246,6 +364,9 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
             for failure in outcome.result.output_failures
         ],
         "agent_calls_by_role": summarize_calls(outcomes),
+        "evidence_failures": summarize_failures(outcomes),
+        "tokens": summarize_tokens(outcomes),
+        "wording_checks": wording_checks(info, events, outcomes),
         "viewer_stream": {
             "configured_delay_s": settings.broadcast_delay_seconds,
             "events_released": viewer_count,
@@ -262,4 +383,16 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
         },
     }
     print("Full-match latency gate: " + json.dumps(report), flush=True)
+    failures = report["evidence_failures"]
+    print("Evidence-check failures by reason:", flush=True)
+    for rule, count in failures["by_reason"].items():  # type: ignore[index, union-attr]
+        print(f"  {count:3d}  {rule}", flush=True)
+    if not failures["by_reason"]:  # type: ignore[index]
+        print("  none", flush=True)
+    tokens = report["tokens"]
+    print(
+        f"Tokens: input {tokens['input_tokens']}, output {tokens['output_tokens']}, "  # type: ignore[index]
+        f"calls without usage {tokens['calls_without_usage']}",  # type: ignore[index]
+        flush=True,
+    )
     return report

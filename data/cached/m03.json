@@ -12,7 +12,7 @@
     },
     {
       "line_id": "m03-l002",
-      "text": "The home side score again, turning a promising spell into a clear attacking moment against Merehaven Athletic.",
+      "text": "Ashbridge Rovers score again, turning a promising spell into a clear attacking moment against Merehaven Athletic.",
       "insight_id": "m03-i0878",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m03-e0877", "m03-e0878"],
@@ -38,7 +38,7 @@
   "questions": [
     {
       "question": "Did the high press create scoring moments?",
-      "answer": "The logged home goals provide the decisive moments, and the event IDs make each scoring sequence traceable.",
+      "answer": "The logged Ashbridge Rovers goals provide the decisive moments, and the event IDs make each scoring sequence traceable.",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m03-e0379", "m03-e0878", "m03-e1325"]
     }
@@ -54,7 +54,7 @@
       },
       {
         "minute": 51,
-        "text": "The home side add another goal.",
+        "text": "Ashbridge Rovers add another goal.",
         "event_ids": ["m03-e0878"]
       },
       {
@@ -63,7 +63,7 @@
         "event_ids": ["m03-e1325"]
       }
     ],
-    "audio_script": "Ashbridge Rovers made their pressing approach count by turning high regains into attacking moments. The home side scored across the match and kept Merehaven Athletic under pressure. Each moment in this recap is linked to the synthetic event log and the verified score.",
+    "audio_script": "Ashbridge Rovers made their pressing approach count by turning high regains into attacking moments. Ashbridge scored across the match and kept Merehaven Athletic under pressure. Each moment in this recap is linked to the synthetic event log and the verified score.",
     "fact_ids": ["match_state:score"],
     "event_ids": ["m03-e0379", "m03-e0878", "m03-e1325"]
   }

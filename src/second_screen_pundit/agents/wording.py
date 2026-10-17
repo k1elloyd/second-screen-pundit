@@ -45,7 +45,13 @@ _MINUTE = re.compile(
     rf"\bminute\s+\d{{1,3}}\b"
     rf"|\b{_ORDINAL}\s+minute\b"
     rf"|\b(?:at|after|on|by|in)\s+\d{{1,3}}\s+minutes\b(?!\s+{_LEFT})"
+    r"|\b\d{1,3}\s+minutes?\s+(?:gone|played|on the clock)\b"
     r"|\b\d{1,3}['’]",
+    re.IGNORECASE,
+)
+# "67 minutes gone": as its own sentence or a trailing clause.
+_ELAPSED = re.compile(
+    r"(?:(?<=[.!?])\s+|,\s*|^)(?:with\s+)?\d{1,3}\s+minutes?\s+(?:gone|played|on the clock)\b[.!]?",
     re.IGNORECASE,
 )
 _MINUTES_LEFT = re.compile(
@@ -109,13 +115,28 @@ def strip_leading_clock(text: str) -> str:
     return _tidy(_LEADING_MINUTE.sub(_restart, text))
 
 
+_ELAPSED_AND = re.compile(
+    r"\bwith\s+\d{1,3}\s+minutes?\s+(?:gone|played)\s+and\s+", re.IGNORECASE
+)
+
+
+def _keep_end(original: str, text: str) -> str:
+    """A removal at the end of a line must not take its full stop with it."""
+    if text and original.rstrip()[-1:] in ".!?" and text[-1] not in ".!?":
+        return text + original.rstrip()[-1]
+    return text
+
+
 def remove_minute(text: str) -> str:
-    return _tidy(_INNER_MINUTE.sub("", strip_leading_clock(text)))
+    removed = _ELAPSED_AND.sub("with ", text)
+    removed = _ELAPSED.sub("", _INNER_MINUTE.sub("", strip_leading_clock(removed)))
+    return _keep_end(text, _tidy(removed))
 
 
 def remove_clock(text: str) -> str:
     """Remove every clock reading: the minute and the time left."""
-    return _tidy(_INNER_LEFT.sub("", _LEADING_LEFT.sub(_restart, remove_minute(text))))
+    removed = _INNER_LEFT.sub("", _LEADING_LEFT.sub(_restart, remove_minute(text)))
+    return _keep_end(text, _tidy(removed))
 
 
 def clock_budget_allows(lines: Sequence[str]) -> bool:
