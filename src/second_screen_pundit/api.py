@@ -12,11 +12,11 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 from azure.identity import DefaultAzureCredential
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -33,12 +33,16 @@ from second_screen_pundit.engine.generate import generate_match, get_match_info
 from second_screen_pundit.engine.replay import Replay, ReplayManager
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import team_name
+from second_screen_pundit.outbox import ViewerOutbox
 
 
 logger = logging.getLogger(__name__)
 MAX_QUESTION_AUDIO_BYTES = 1_000_000
 MAX_QUESTION_AUDIO_SECONDS = 15
 _WEB_DIR = Path(__file__).with_name("web")
+SSE_HEARTBEAT_SECONDS = 15
+# How long the browser waits before reconnecting a stream that closed or dropped.
+SSE_RETRY_MILLISECONDS = 1000
 
 
 class QuestionRequest(BaseModel):
@@ -55,21 +59,21 @@ class ReplaySession:
     events: list[Event]
     replay: Replay
     delay: BroadcastDelay
-    queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = field(
-        default_factory=asyncio.Queue
-    )
+    outbox: ViewerOutbox = field(default_factory=ViewerOutbox)
     release_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     released_events: list[Event] = field(default_factory=list)
     viewer_released_as_of: int = 0
     lines: dict[str, dict[str, Any]] = field(default_factory=dict)
     audio: dict[str, bytes] = field(default_factory=dict)
     stream_open: bool = False
+    # Each stream connection takes the next number; an older connection ends when replaced.
+    stream_generation: int = 0
     complete: bool = False
     stopped: bool = False
     recap_task: asyncio.Task[None] | None = None
     runner_task: asyncio.Task[None] | None = None
     question_tasks: set[asyncio.Task[None]] = field(default_factory=set)
-    # Stops the replay if no stream connects in time; cancelled when the stream opens.
+    # Stops the replay if no stream connects (or reconnects) in time; cancelled when one does.
     stream_deadline_task: asyncio.Task[None] | None = None
     # Line audio started while the line waits for release, keyed by the internal line ID.
     line_audio_tasks: dict[str, asyncio.Task[str | None]] = field(default_factory=dict)
@@ -225,8 +229,23 @@ def _read_wav_duration(audio_bytes: bytes, *, max_seconds: int = MAX_QUESTION_AU
     return duration
 
 
-def _encode_sse(event: str, payload: dict[str, Any]) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+def _encode_sse(event: str, payload: dict[str, Any], message_id: int | None = None) -> bytes:
+    data = json.dumps(payload, separators=(",", ":"))
+    prefix = f"id: {message_id}\n" if message_id is not None else ""
+    return f"{prefix}event: {event}\ndata: {data}\n\n".encode()
+
+
+def _resume_position(last_event_id: str | None, sent: int) -> int:
+    """The outbox position after the browser's Last-Event-ID; 0 for a first connection."""
+    if last_event_id is None or not last_event_id.strip():
+        return 0
+    try:
+        position = int(last_event_id.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Last-Event-ID must be a message number.") from exc
+    if position < 0:
+        raise HTTPException(status_code=400, detail="Last-Event-ID must be a message number.")
+    return min(position, sent)
 
 
 def create_app(
@@ -381,7 +400,7 @@ def create_app(
         if outcome.result is None:
             return
         if outcome.result.insight is not None:
-            await session.queue.put(
+            await session.outbox.put(
                 (
                     "insight",
                     {
@@ -430,7 +449,7 @@ def create_app(
         if audio_task is not None and audio_task.done() and not audio_task.cancelled():
             # The usual case: the audio was ready before the line's release.
             audio_id = audio_task.result()
-            await session.queue.put(
+            await session.outbox.put(
                 (
                     "commentary",
                     {
@@ -443,7 +462,7 @@ def create_app(
             )
             return
         # The text never waits for its audio.
-        await session.queue.put(
+        await session.outbox.put(
             (
                 "commentary",
                 {
@@ -459,7 +478,7 @@ def create_app(
             if audio_task is not None
             else await synthesize(session, line.text, tier=line.delivery_tier)
         )
-        await session.queue.put(
+        await session.outbox.put(
             (
                 "commentary_audio" if audio_id is not None else "commentary_audio_unavailable",
                 {"line_id": public_line_id, "audio_id": audio_id},
@@ -480,9 +499,9 @@ def create_app(
                 "audio_pending": True,
                 "evidence": _evidence_payload(result.evidence),
             }
-            await session.queue.put(("recap", payload))
+            await session.outbox.put(("recap", payload))
             audio_id = await synthesize(session, result.recap.audio_script)
-            await session.queue.put(
+            await session.outbox.put(
                 (
                     "recap_audio" if audio_id is not None else "recap_audio_unavailable",
                     {"audio_id": audio_id},
@@ -492,7 +511,7 @@ def create_app(
             raise
         except Exception as exc:
             logger.exception("recap_failed match_id=%s", session.info.match_id)
-            await session.queue.put(
+            await session.outbox.put(
                 (
                     "error",
                     {"message": "The full-time recap is unavailable."},
@@ -504,7 +523,7 @@ def create_app(
             async with session.release_condition:
                 session.viewer_released_as_of = session.delay.released_as_of
                 session.released_events.append(event)
-                await session.queue.put(("event", _event_payload(event, session.info)))
+                await session.outbox.put(("event", _event_payload(event, session.info)))
                 session.release_condition.notify_all()
             if event.type == "full_time":
                 session.recap_task = asyncio.create_task(make_recap(session, event.seq))
@@ -539,7 +558,7 @@ def create_app(
                     session.replay_id,
                     type(failure).__name__,
                 )
-                await session.queue.put(
+                await session.outbox.put(
                     (
                         "error",
                         {
@@ -550,7 +569,7 @@ def create_app(
                     )
                 )
             session.complete = True
-            await session.queue.put(("complete", {"replay_id": session.replay_id}))
+            await session.outbox.put(("complete", {"replay_id": session.replay_id}))
         except asyncio.CancelledError:
             raise
         finally:
@@ -559,15 +578,13 @@ def create_app(
                     task.cancel()
             await asyncio.gather(*children, return_exceptions=True)
 
-    async def stop_without_stream(session: ReplaySession) -> None:
+    async def stop_without_stream(
+        session: ReplaySession, seconds: float, reason: str = "replay_stream_deadline"
+    ) -> None:
         """A replay nobody is watching frees its slot instead of spending model calls."""
-        await asyncio.sleep(configured_settings.stream_connect_deadline_seconds)
+        await asyncio.sleep(seconds)
         if not session.stream_open and not session.stopped:
-            logger.warning(
-                "replay_stream_deadline replay_id=%s seconds=%s",
-                session.replay_id,
-                configured_settings.stream_connect_deadline_seconds,
-            )
+            logger.warning("%s replay_id=%s seconds=%s", reason, session.replay_id, seconds)
             session.stream_deadline_task = None  # don't cancel the task that is stopping it
             await _stop_session(session)
 
@@ -579,6 +596,7 @@ def create_app(
         session.stream_deadline_task = None
         if deadline is not None and not deadline.done():
             deadline.cancel()
+        session.outbox.close()
         await session.replay.stop()
         if session.runner_task is not None and not session.runner_task.done():
             session.runner_task.cancel()
@@ -713,7 +731,9 @@ def create_app(
         tab_sessions[tab_key] = replay_id
         replay.start()
         session.runner_task = asyncio.create_task(run_session(session))
-        session.stream_deadline_task = asyncio.create_task(stop_without_stream(session))
+        session.stream_deadline_task = asyncio.create_task(
+            stop_without_stream(session, configured_settings.stream_connect_deadline_seconds)
+        )
         return {
             "replay_id": replay_id,
             "match_id": match_id,
@@ -787,7 +807,7 @@ def create_app(
 
     async def speak_answer(session: ReplaySession, question_id: str, text: str) -> None:
         audio_id = await synthesize(session, text)
-        await session.queue.put(
+        await session.outbox.put(
             (
                 "answer_audio" if audio_id is not None else "answer_audio_unavailable",
                 {"question_id": question_id, "audio_id": audio_id},
@@ -806,7 +826,7 @@ def create_app(
             async with asyncio.timeout(budget):
                 payload = await answer(session, question_id, transcript, started)
         except TimeoutError:
-            await session.queue.put(
+            await session.outbox.put(
                 (
                     "answer_error",
                     {
@@ -818,7 +838,7 @@ def create_app(
             return
         except Exception:
             logger.exception("spoken_question_failed question_id=%s", question_id)
-            await session.queue.put(
+            await session.outbox.put(
                 (
                     "answer_error",
                     {
@@ -828,7 +848,7 @@ def create_app(
                 )
             )
             return
-        await session.queue.put(("answer", {**payload, "audio_pending": True}))
+        await session.outbox.put(("answer", {**payload, "audio_pending": True}))
         await speak_answer(session, question_id, payload["explanation"]["answer"])
 
     @app.post("/api/ask-audio", status_code=202)
@@ -948,39 +968,61 @@ def create_app(
         )
 
     @app.get("/api/replays/{replay_id}/stream")
-    async def stream(replay_id: str) -> StreamingResponse:
+    async def stream(
+        replay_id: str,
+        last_event_id: Annotated[str | None, Header()] = None,
+    ) -> StreamingResponse:
+        """The replay's viewer stream; a reconnect with Last-Event-ID resumes after it.
+
+        Every message has an `id:` (its outbox position). A dropped stream doesn't stop the
+        replay: it keeps running, paused or not, for STREAM_RECONNECT_GRACE_SECONDS. Each
+        connection closes itself after STREAM_MAX_SECONDS, inside the ingress request timeout.
+        """
         session = find_session(replay_id)
-        if session.stream_open:
-            raise HTTPException(status_code=409, detail="This replay already has an SSE client.")
+        position = _resume_position(last_event_id, len(session.outbox))
+        # The newest connection wins: an older one (often a dead socket nobody has noticed
+        # yet) ends instead of blocking the reconnect.
+        session.stream_generation += 1
+        generation = session.stream_generation
+        session.outbox.wake()
         session.stream_open = True
         if session.stream_deadline_task is not None:
             session.stream_deadline_task.cancel()
             session.stream_deadline_task = None
+        if position:
+            logger.info("stream_resumed replay_id=%s after=%s", replay_id, position)
 
         async def events() -> AsyncIterator[bytes]:
-            complete_sent = False
+            nonlocal position
+            closes_at = time.monotonic() + configured_settings.stream_max_seconds
             try:
-                while True:
-                    try:
-                        item = await asyncio.wait_for(session.queue.get(), timeout=15)
-                    except TimeoutError:
-                        yield b": heartbeat\n\n"
-                        continue
-                    if item is None:
+                yield f"retry: {SSE_RETRY_MILLISECONDS}\n\n".encode()
+                while session.stream_generation == generation and not session.outbox.closed:
+                    remaining = closes_at - time.monotonic()
+                    if remaining <= 0:
+                        # Close cleanly before ingress cuts the request; the browser reconnects.
                         return
-                    name, payload = item
-                    yield _encode_sse(name, payload)
-                    if name == "complete":
-                        complete_sent = True
-                        while True:
-                            await asyncio.sleep(15)
+                    try:
+                        messages = await session.outbox.read(
+                            position, timeout=min(SSE_HEARTBEAT_SECONDS, remaining)
+                        )
+                    except TimeoutError:
+                        if time.monotonic() < closes_at:
                             yield b": heartbeat\n\n"
+                        continue
+                    for message_id, name, payload in messages:
+                        yield _encode_sse(name, payload, message_id)
+                        position = message_id
             finally:
-                session.stream_open = False
-                if not complete_sent:
-                    await _stop_session(session)
-                elif not session.stopped:
-                    await _stop_session(session)
+                if session.stream_generation == generation and not session.stopped:
+                    session.stream_open = False
+                    session.stream_deadline_task = asyncio.create_task(
+                        stop_without_stream(
+                            session,
+                            configured_settings.stream_reconnect_grace_seconds,
+                            "replay_stream_not_reconnected",
+                        )
+                    )
 
         return StreamingResponse(
             events(),

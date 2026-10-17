@@ -536,3 +536,33 @@ Cached mode is what viewers get when the spending guard switches the site to `NA
 - **Cause.** For each window, cached mode picks the first pre-generated line that cites any event in the window. Two windows can match one line: a goal's fast-path window, and the next tactical window, which holds the goal's linked shot (the shot is not must-say, so it falls into the tactical window). Nothing recorded which lines had gone out, so the line was published twice under one `line_id`. A dry run published 11 lines for 8 distinct in m01 (3 repeated), 7 for 5 in m02 (2 repeated) and 4 for 3 in m03 (1 repeated).
 - **Second problem.** The dispatcher treated only status `"commentary"` as a line, and cached results have status `"cached"`. Cached lines therefore skipped early audio, the broadcast-delay bookkeeping and the recent-lines memory. With both copies sharing one ID, the page attached audio to the first card only, so the second stayed on "Preparing audio…".
 - **Fix.** The dispatcher counts both statuses as lines, and keeps the set of published `line_id`s; a repeat becomes `skipped`. `tests/test_cached_mode.py` checks that each line is published once on all three matches, and that every cached line gets early audio. Both checks failed before the fix.
+
+## Phase 4, group 1: the stream survives the ingress timeout
+
+### The limit
+
+Learn's ingress page ("Ingress in Azure Container Apps", HTTP protocol) says "Request time out is 240 seconds", and the default ingress idle timeout is 4 minutes. It doesn't exempt streaming responses, so the design assumes ingress cuts any request at 240 s, heartbeats or not. A 20x stream lasts about 5 minutes, so one long request can't carry a match.
+
+### Resume, not restart (changes B3 and "Out of scope")
+
+The spec said a replay stops when its SSE client disconnects, with no resume, and listed resuming as out of scope. Phase 4 needs resume, so that changes:
+- **Outbox.** Everything a replay sends its viewer goes into an append-only `ViewerOutbox` (`outbox.py`), kept for the life of the replay. A message's SSE `id:` is its 1-based position. Each connection starts with `retry: 1000`.
+- **Reconnect.** `GET /api/replays/{id}/stream` reads `Last-Event-ID` and sends every message after it, in order: nothing the page already has, nothing skipped. A spoken answer or line audio that was still being made when the stream dropped lands in the outbox when ready, so the reconnected stream sends it once.
+- **A drop doesn't stop the replay.** It keeps running (or stays paused) for `STREAM_RECONNECT_GRACE_SECONDS` (default 30). If no stream reconnects in that time, it is stopped and its slot freed, as before (`replay_stream_not_reconnected` is logged). The first-connect deadline is unchanged.
+- **Unchanged by a reconnect:** pause state and the broadcast delay (both live on the replay, not the connection), the viewer cut-off for Q&A (`viewer_released_as_of`), the one-replay-per-client rule (reconnect isn't `/start`), and the page's audio queue (the page isn't reloaded; only the stream reader reconnects).
+- **Newest connection wins.** A reconnect often arrives before the server has noticed the old socket is dead. The old stream ends at once instead of the new one getting a 409.
+- **Safety net.** Each connection closes itself cleanly after `STREAM_MAX_SECONDS` (default 200), inside the 240 s limit, and the page reconnects with `Last-Event-ID` a second later. Heartbeats stay at 15 s.
+- **Page.** The stream reader is `fetch`-based, not `EventSource`, so it does the reconnect itself: it records each message's `id` after handling it, honours `retry`, sends `Last-Event-ID`, and stops on a 4xx (for example 404 once the replay has gone). After full time it keeps reconnecting, so line audio and evidence stay available while the tab is open, as before; a finished replay holds no slot.
+
+### Tests
+
+`tests/test_stream_resume.py`, all simulated in-process (closing the response body is the drop):
+- m01 in cached mode, dropped after two lines and reconnected 0.5 s later: message IDs run 1..N with no gap or repeat, every event arrives once in order, every line once, and no line before an event it cites. Messages were sent while the page was away, so the resume is real.
+- Dropped while a spoken question's answer is held: the `answer` and its `answer_audio` arrive once, after the reconnect, and the answer used the viewer cut-off from before the drop.
+- Dropped while paused: after reconnecting nothing new arrives, the replay and the delay are still paused and the cut-off hasn't moved; Resume continues the IDs with no gap.
+- `STREAM_MAX_SECONDS=0.5`: three connections each closed by the server, the replay running throughout, IDs contiguous across all three.
+- A new connection ends a stale one that is waiting for its next message.
+
+Mutation checks: with the server ignoring `Last-Event-ID`, the first four fail. With no reconnect grace (a drop stops the replay, as before), the mid-match, spoken-answer and paused tests fail.
+
+**The page's reconnect, in a browser.** Local server, cached mode, `STREAM_MAX_SECONDS=15`, m01 at 60x in Playwright Chromium, Start clicked. The page opened 9 connections; each reconnect sent `Last-Event-ID` (60, 291, 511, …, 1413). It received 1,548 events, each once and in order; 8 lines, 8 cards and 8 line clips queued, none twice; then one recap and one recap clip, and "Replay complete". That's the client code the unit tests can't reach. The deployed gate repeats this at 20x across the real 200 s close.

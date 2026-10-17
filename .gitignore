@@ -225,3 +225,5 @@ __marimo__/
 /data/matches/*.jsonl
 /data/audio/*.mp3
 /data/audio/voice-trials/
+
+.playwright-mcp/

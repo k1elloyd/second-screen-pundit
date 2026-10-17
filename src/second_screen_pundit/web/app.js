@@ -639,9 +639,18 @@ function handleSse(name, payload) {
   if (name.startsWith("answer")) handleAnswerEvent(name, payload);
 }
 
-async function consumeStream(url, controller) {
-  const response = await fetch(url, { signal: controller.signal, headers: { Accept: "text/event-stream" } });
-  if (!response.ok) throw new Error((await responseJson(response)).detail || "Could not open match stream.");
+// Reads one connection of the replay's stream. Returns normally when the server closes it
+// (it does so every few minutes, inside the ingress request timeout).
+async function readStream(url, controller, stream) {
+  const headers = { Accept: "text/event-stream" };
+  if (stream.lastEventId) headers["Last-Event-ID"] = stream.lastEventId;
+  const response = await fetch(url, { signal: controller.signal, headers, cache: "no-store" });
+  if (!response.ok) {
+    const error = new Error((await responseJson(response)).detail || "Could not open match stream.");
+    error.status = response.status;
+    throw error;
+  }
+  if (el("connection-state").textContent === "Reconnecting…") el("connection-state").textContent = "Reconnected";
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -655,12 +664,38 @@ async function consumeStream(url, controller) {
       buffer = buffer.slice(boundary + 2);
       let name = "message";
       let data = "";
+      let id = null;
       for (const line of block.split("\n")) {
         if (line.startsWith("event:")) name = line.slice(6).trim();
         if (line.startsWith("data:")) data += line.slice(5).trim();
+        if (line.startsWith("id:")) id = line.slice(3).trim();
+        if (line.startsWith("retry:")) stream.retryMs = Number(line.slice(6).trim()) || stream.retryMs;
       }
       if (data) handleSse(name, JSON.parse(data));
+      // Only after the message is handled, so a drop mid-message resends it.
+      if (id !== null) stream.lastEventId = id;
     }
+  }
+}
+
+// Keeps the replay's stream open: on a clean close or a dropped connection it reconnects
+// with Last-Event-ID, and the server resumes after the last message this page handled.
+async function consumeStream(url, controller) {
+  const stream = { lastEventId: null, retryMs: 1000 };
+  let failures = 0;
+  while (!controller.signal.aborted) {
+    try {
+      await readStream(url, controller, stream);
+      failures = 0;
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      // 404: the replay has gone (stopped, or not reconnected in time). 400/409: don't retry.
+      if (error.status && error.status < 500) throw error;
+      failures += 1;
+      el("connection-state").textContent = "Reconnecting…";
+    }
+    if (controller.signal.aborted) return;
+    await new Promise((resolve) => setTimeout(resolve, stream.retryMs * Math.min(failures + 1, 5)));
   }
 }
 

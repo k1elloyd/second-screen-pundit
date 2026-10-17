@@ -70,6 +70,11 @@ class AgentSettings:
     # A replay whose stream hasn't connected this long after /start is stopped.
     stream_connect_deadline_seconds: float = 10
     speech_fallback_voice: str = DEFAULT_SPEECH_FALLBACK_VOICE
+    # Container Apps ingress ends a request after 240 s, so each stream closes itself sooner
+    # and the browser reconnects with Last-Event-ID.
+    stream_max_seconds: float = 200
+    # A replay whose stream dropped is kept this long for the browser to reconnect.
+    stream_reconnect_grace_seconds: float = 30
 
     @classmethod
     def from_environment(cls) -> AgentSettings:
@@ -119,6 +124,10 @@ class AgentSettings:
             ),
             speech_fallback_voice=(
                 os.getenv("SPEECH_FALLBACK_VOICE", "").strip() or DEFAULT_SPEECH_FALLBACK_VOICE
+            ),
+            stream_max_seconds=_positive_float("STREAM_MAX_SECONDS", 200),
+            stream_reconnect_grace_seconds=_positive_float(
+                "STREAM_RECONNECT_GRACE_SECONDS", 30
             ),
         )
 

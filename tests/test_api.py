@@ -152,10 +152,12 @@ def test_spoken_question_uses_the_same_viewer_cutoff_and_returns_server_audio() 
         )
         body = response.json()
 
+        read = 0
+
         async def next_item() -> tuple[str, dict]:
-            item = await asyncio.wait_for(session.queue.get(), timeout=5)
-            assert item is not None
-            return item
+            nonlocal read
+            ((read, name, payload), *_) = await session.outbox.read(read, timeout=5)
+            return name, payload
 
         answer_name, answer = client.portal.call(next_item)
         audio_name, audio_event = client.portal.call(next_item)
@@ -198,10 +200,12 @@ def test_typed_answer_text_returns_at_once_and_its_audio_follows_on_sse() -> Non
         )
         body = response.json()
 
+        read = 0
+
         async def next_item() -> tuple[str, dict]:
-            item = await asyncio.wait_for(session.queue.get(), timeout=5)
-            assert item is not None
-            return item
+            nonlocal read
+            ((read, name, payload), *_) = await session.outbox.read(read, timeout=5)
+            return name, payload
 
         audio_name, audio_event = client.portal.call(next_item)
         audio = client.get(f"/api/audio/{audio_event['audio_id']}")
@@ -464,8 +468,11 @@ def test_match_start_gives_each_client_one_replay_and_caps_at_three() -> None:
     assert "3 replay slots" in capped.json()["detail"]
 
 
-def test_sse_disconnect_stops_the_replay_and_removes_its_session() -> None:
-    app = create_app(settings=_settings(), pipeline=PunditPipeline(_settings(), None))
+def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:
+    # Phase 4: a dropped stream no longer stops the replay at once; the browser has
+    # STREAM_RECONNECT_GRACE_SECONDS to reconnect before the replay and its session go.
+    settings = replace(_settings(), stream_reconnect_grace_seconds=0.2)
+    app = create_app(settings=settings, pipeline=PunditPipeline(settings, None))
 
     async def run_disconnect() -> tuple[ReplaySession, bool]:
         async with app.router.lifespan_context(app):
@@ -485,16 +492,18 @@ def test_sse_disconnect_stops_the_replay_and_removes_its_session() -> None:
             replay.start()
             worker = asyncio.create_task(asyncio.sleep(30))
             session.runner_task = worker
-            session.queue.put_nowait(("event", {"event_id": "m02-e0001"}))
+            session.outbox.put_nowait(("event", {"event_id": "m02-e0001"}))
             route = next(
                 route
                 for route in app.routes
                 if getattr(route, "path", None) == "/api/replays/{replay_id}/stream"
             )
             response = await route.endpoint(session.replay_id)
-            chunk = await response.body_iterator.__anext__()
+            chunks = [await response.body_iterator.__anext__() for _ in range(2)]
             await response.body_iterator.aclose()
-            return session, b"event: event" in chunk
+            assert not session.stopped  # still inside the grace period
+            await asyncio.sleep(0.4)
+            return session, b"event: event" in b"".join(chunks)
 
     session, got_event = asyncio.run(run_disconnect())
 
