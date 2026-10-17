@@ -89,7 +89,7 @@ class LiveDispatcher:
     ) -> None:
         try:
             async for event in source:
-                self._on_event(event)
+                await self._on_event(event)
             if replay_stopped is not None and replay_stopped():
                 await self.cancel()
             else:
@@ -112,7 +112,7 @@ class LiveDispatcher:
     def _clock(event: Event) -> int:
         return event.minute + event.added_minute
 
-    def _on_event(self, event: Event) -> None:
+    async def _on_event(self, event: Event) -> None:
         if self.delay is not None:
             self.delay.stamp(event)
         must_say = is_must_say(event, self.events)
@@ -120,7 +120,7 @@ class LiveDispatcher:
             self._announced_formations.add(formation_key(event.seq))
         clock = self._clock(event)
         if clock >= self._next_boundary:
-            self._tactical_boundary(event, min(90, clock))
+            await self._tactical_boundary(event, min(90, clock))
             while clock >= self._next_boundary:
                 self._next_boundary += WINDOW_MATCH_MINUTES
             self._last_boundary_seq = event.seq
@@ -131,9 +131,17 @@ class LiveDispatcher:
     def _gap(now: int, last: int | None) -> float:
         return float("inf") if last is None else now - last
 
-    def _tactical_boundary(self, event: Event, now: int) -> None:
+    async def _tactical_boundary(self, event: Event, now: int) -> None:
+        """Evaluate the boundary's signals and maybe dispatch a tactical window.
+
+        The signal evaluation and the window scan are CPU work (review 2 measured up to 0.4 s
+        at a boundary), so they run in a worker thread and the event loop keeps serving every
+        replay's stream. Only this coroutine touches the tracker, and it is awaited before the
+        next event is read, so the thread never races the loop.
+        """
         current: list[TacticalSignal] = []
-        for signal in self._tracker.evaluate(self.events, as_of=event.seq):
+        evaluated = await asyncio.to_thread(self._tracker.evaluate, self.events, as_of=event.seq)
+        for signal in evaluated:
             if signal.kind == "formation_change" and signal.key in self._announced_formations:
                 continue
             if signal.one_shot:
@@ -179,22 +187,25 @@ class LiveDispatcher:
         self.boundaries.append(
             BoundaryRecord(now, event.seq, "dispatched", tuple(signal.kind for signal in chosen))
         )
-        window = [
-            candidate
-            for candidate in self.events
-            if self._last_boundary_seq < candidate.seq <= event.seq
-            and not is_must_say(candidate, self.events)
-        ] or [
-            next(
-                candidate
-                for candidate in reversed(self.events)
-                if candidate.seq <= event.seq and not is_must_say(candidate, self.events)
-            )
-        ]
+        window = await asyncio.to_thread(self._tactical_window, self._last_boundary_seq, event.seq)
         self._in_flight += 1
         self._tasks.append(
             asyncio.create_task(self._run_tactical(event, now, window, chosen, generation))
         )
+
+    def _tactical_window(self, after_seq: int, as_of: int) -> list[Event]:
+        """The ordinary (not must-say) events since the last boundary, or the latest one."""
+        return [
+            candidate
+            for candidate in self.events
+            if after_seq < candidate.seq <= as_of and not is_must_say(candidate, self.events)
+        ] or [
+            next(
+                candidate
+                for candidate in reversed(self.events)
+                if candidate.seq <= as_of and not is_must_say(candidate, self.events)
+            )
+        ]
 
     async def _run_fast(self, event: Event, now: int) -> None:
         outcome = WindowOutcome("fast_path", event, now)

@@ -457,3 +457,51 @@ How it works: the answer is first checked against every snapshot fact, as before
 
 - **No line before its event** (review 2 finding 9). `publish_outcome` waits on the session's `release_condition` until the viewer stream has released the line's `as_of` event. A test that slows the viewer loop fails without this wait.
 - **Pause is immediate** (finding 10). `BroadcastDelay.pause()` holds every release, events and lines alike. `resume()` pushes each unreleased release time back by the pause (for an event that arrived mid-pause, by the rest of the pause), so the 10 s delay is kept. `/control` calls them when the replay's state becomes paused or running. Arrival stamps are unchanged, so latency figures don't change.
+
+## Phase 3 Session B, group 3: robustness and security
+
+### Replay slots
+
+- **Stream deadline.** `/start` starts a watchdog. If no stream connects within `STREAM_CONNECT_DEADLINE_SECONDS` (default 10), the replay is stopped and its slot freed (`replay_stream_deadline` is logged). Opening the stream cancels the watchdog. Before this, three starts with no stream held all three slots and kept making model calls.
+- **One replay per client.** A client is its IP address (below). A new `/start` from a client stops that client's earlier replay instead of returning 409. A lost stream or a closed tab therefore never locks a client out, and one client can't hold every slot by sending different `X-Tab-ID`s. Two viewers behind one NAT address share a single replay at a time; that's the price of a per-client limit.
+
+### Client IP
+
+`_client_ip` uses the **right-most** `X-Forwarded-For` entry. Learn's Container Apps ingress page says the header "is appended to. Only the rightmost IP is provided by Azure Container Apps. Any other values must be validated by the user to prevent IP spoofing." The question limiter and the per-client replay limit both use it, so a client that rotates a spoofed prefix stays one client.
+
+### Event loop
+
+`LiveDispatcher` runs each 3-minute boundary's signal evaluation and window scan in `asyncio.to_thread`. Only the boundary coroutine touches the tracker, and it is awaited before the next event is read, so the thread never races the loop. Longest gap between ticks of a 5 ms event-loop ticker while the dispatcher runs a whole match (fake pipeline, source yielding per event):
+
+| Match | Before: longest / p99 | After: longest / p99 |
+| :-- | :-- | :-- |
+| m01 | 814 / 440 ms | 86 / 34 ms |
+| m02 | 842 / 445 ms | 95 / 29 ms |
+| m03 | 481 / 410 ms | 81 / 30 ms |
+
+The rest of the gap is GIL contention with the worker thread plus the per-event must-say check. `tests/test_robustness.py` fails on the old dispatcher (251 ms with a 0.25 s boundary; 726 ms over m02) and passes on the new one.
+
+### Phase 4 container checklist (not built yet)
+
+Added to review 2's "Ready to deploy (Phase 4)" table:
+- **Speech role.** The app's user-assigned managed identity needs **Cognitive Services Speech User** on the Sweden Central Speech resource (`pundit-speech-swc-kl`). Assign it in Bicep, scoped to that resource, not the resource group. `SPEECH_ENDPOINT` and `SPEECH_REGION` point at Sweden Central; `SPEECH_VOICE` and `SPEECH_FALLBACK_VOICE` are passed through.
+- **Ingress request timeout.** Learn's ingress page lists "Request time out is 240 seconds" for HTTP ingress. A 20x replay's stream lasts about 5 minutes, and a 1x stream about 95. Check on Learn whether this limit applies to a streaming response with 15 s heartbeats before Phase 4 relies on one long SSE request.
+
+### Session B final gate, 17 Oct 2026
+
+The README server, with INFO logs to a file, on port 8001. Run 1 was in a Playwright Chromium page, with Start pressed by a real click and a recorder on the page's SSE handler and audio element. Runs 2 and 3 used a scripted SSE client. All at 20x. `speech_synthesized` now logs the style sent.
+
+| Check | Run | Result |
+| :-- | :-- | :-- |
+| Lines no earlier than their events | m01 (13 lines), m02 (12 lines) | 0 lines arrived before an event they cite |
+| Harry audio plays automatically after Start | m01, browser | 13 of 13 line clips played with no click after Start, in line order, then the recap clip; no "Enable audio" button. 8 of 13 lines arrived with their audio in the same event; the rest got `commentary_audio` afterwards |
+| Goal, red card and tactical line styles | m01, m02 | Goals and the equaliser `joyful`; the 88' (m01) and 82' (m02) late go-ahead goals `surprised`; the m02 red card `surprised`; tactical `narrator`; formation `narrator`; substitution `neutral`. Every line used Harry |
+| Bad voice falls back to Ryan | m01, `SPEECH_VOICE=en-GB-Nobody:MAI-Voice-2.1-Flash` | Each request failed with 1007, was logged as `speech_voice_fallback` and retried once with `en-GB-RyanNeural` (tactical `chat`, goal `cheerful`); every line's text was delivered |
+| Recap with no decimals | m01, m02 | Agent-written on the first attempt in both. No text matches `\d\.\d{2,}`. Headlines: "Ashbridge Rovers win 3-2 after stunning late turnaround", "Merehaven Athletic win 2-1 after late surge" |
+
+m01 has no red card, so the red-card style was checked on m02.
+
+**Seen in the lines, not fixed here:**
+- **Red card heard twice.** In m02 the fast path and the mandatory tactical signal each produced a red-card line, 0.3 s apart (review 2 finding 14).
+- **Minutes still spoken as numbers.** Agent lines still say "At 21 minutes" and "24 minutes left". Spoken text reads them correctly, but they're repetitive.
+- **Missing full stop.** One line ended "The score is level at 0-0" without one.

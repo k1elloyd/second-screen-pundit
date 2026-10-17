@@ -69,6 +69,8 @@ class ReplaySession:
     recap_task: asyncio.Task[None] | None = None
     runner_task: asyncio.Task[None] | None = None
     question_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # Stops the replay if no stream connects in time; cancelled when the stream opens.
+    stream_deadline_task: asyncio.Task[None] | None = None
     # Line audio started while the line waits for release, keyed by the internal line ID.
     line_audio_tasks: dict[str, asyncio.Task[str | None]] = field(default_factory=dict)
     dispatcher: LiveDispatcher | None = None
@@ -98,7 +100,12 @@ class QuestionRateLimiter:
 
 
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    """The client address that Container Apps ingress itself appended.
+
+    Ingress appends the caller's address to any X-Forwarded-For the client sent, and Learn
+    says only the right-most entry comes from Container Apps; the others are client-chosen.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "").rsplit(",", 1)[-1].strip()
     if forwarded:
         return forwarded
     if request.client is not None:
@@ -552,10 +559,26 @@ def create_app(
                     task.cancel()
             await asyncio.gather(*children, return_exceptions=True)
 
+    async def stop_without_stream(session: ReplaySession) -> None:
+        """A replay nobody is watching frees its slot instead of spending model calls."""
+        await asyncio.sleep(configured_settings.stream_connect_deadline_seconds)
+        if not session.stream_open and not session.stopped:
+            logger.warning(
+                "replay_stream_deadline replay_id=%s seconds=%s",
+                session.replay_id,
+                configured_settings.stream_connect_deadline_seconds,
+            )
+            session.stream_deadline_task = None  # don't cancel the task that is stopping it
+            await _stop_session(session)
+
     async def _stop_session(session: ReplaySession) -> None:
         if session.stopped:
             return
         session.stopped = True
+        deadline = session.stream_deadline_task
+        session.stream_deadline_task = None
+        if deadline is not None and not deadline.done():
+            deadline.cancel()
         await session.replay.stop()
         if session.runner_task is not None and not session.runner_task.done():
             session.runner_task.cancel()
@@ -635,15 +658,16 @@ def create_app(
             raise HTTPException(status_code=400, detail="A valid X-Tab-ID header is required.")
         if not 1 <= speed <= 120:
             raise HTTPException(status_code=422, detail="Replay speed must be between 1 and 120.")
-        tab_key = f"{_client_ip(request)}:{tab_id}"
-        previous_id = tab_sessions.get(tab_key)
-        if previous_id is not None and previous_id in sessions:
-            previous = sessions[previous_id]
-            if not previous.complete:
-                raise HTTPException(
-                    status_code=409,
-                    detail="This tab already has a replay. Close its stream before starting another.",
-                )
+        client_ip = _client_ip(request)
+        tab_key = f"{client_ip}:{tab_id}"
+        # One replay per client: a new start replaces the client's earlier replay, so a lost
+        # stream or a closed tab never locks the client out and one client can't hold every slot.
+        for previous in [
+            item for item in sessions.values() if item.client_ip == client_ip and not item.stopped
+        ]:
+            logger.info(
+                "replay_replaced replay_id=%s client_has_new_replay=true", previous.replay_id
+            )
             await _stop_session(previous)
         try:
             info = get_match_info(match_id)
@@ -668,7 +692,7 @@ def create_app(
         session = ReplaySession(
             replay_id=replay_id,
             tab_id=tab_key,
-            client_ip=_client_ip(request),
+            client_ip=client_ip,
             info=info,
             events=events,
             replay=replay,
@@ -689,6 +713,7 @@ def create_app(
         tab_sessions[tab_key] = replay_id
         replay.start()
         session.runner_task = asyncio.create_task(run_session(session))
+        session.stream_deadline_task = asyncio.create_task(stop_without_stream(session))
         return {
             "replay_id": replay_id,
             "match_id": match_id,
@@ -918,6 +943,9 @@ def create_app(
         if session.stream_open:
             raise HTTPException(status_code=409, detail="This replay already has an SSE client.")
         session.stream_open = True
+        if session.stream_deadline_task is not None:
+            session.stream_deadline_task.cancel()
+            session.stream_deadline_task = None
 
         async def events() -> AsyncIterator[bytes]:
             complete_sent = False

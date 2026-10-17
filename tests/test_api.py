@@ -401,25 +401,25 @@ def test_wav_duration_enforces_the_audio_limit_and_rejects_invalid_data() -> Non
         raise AssertionError("An over-length recording was accepted")
 
 
-def test_match_start_enforces_one_replay_per_tab_and_the_three_replay_cap() -> None:
+def test_match_start_gives_each_client_one_replay_and_caps_at_three() -> None:
+    # Session B: one replay per client IP (a new start replaces the old one) instead of one
+    # per client-chosen tab ID, which never limited anything. The cap of 3 is unchanged.
     app = create_app(settings=_settings(), pipeline=PunditPipeline(_settings(), None))
     with TestClient(app) as client:
-        headers = {"X-Tab-ID": "tab-one"}
-        first = client.post("/api/matches/m02/start?speed=120", headers=headers)
+        def start(match: str, ip: str, tab: str):
+            return client.post(
+                f"/api/matches/{match}/start?speed=120",
+                headers={"X-Tab-ID": tab, "X-Forwarded-For": ip},
+            )
+
+        first = start("m02", "198.51.100.1", "tab-one")
         assert first.status_code == 200
-        assert client.post("/api/matches/m01/start?speed=120", headers=headers).status_code == 409
-        assert client.post(
-            "/api/matches/m01/start?speed=120",
-            headers={"X-Tab-ID": "tab-two"},
-        ).status_code == 200
-        assert client.post(
-            "/api/matches/m03/start?speed=120",
-            headers={"X-Tab-ID": "tab-three"},
-        ).status_code == 200
-        capped = client.post(
-            "/api/matches/m01/start?speed=120",
-            headers={"X-Tab-ID": "tab-four"},
-        )
+        again = start("m01", "198.51.100.1", "tab-one")
+        assert again.status_code == 200
+        assert first.json()["replay_id"] not in app.state.sessions
+        assert start("m01", "198.51.100.2", "tab-two").status_code == 200
+        assert start("m03", "198.51.100.3", "tab-three").status_code == 200
+        capped = start("m01", "198.51.100.4", "tab-four")
 
     assert capped.status_code == 503
     assert "3 replay slots" in capped.json()["detail"]

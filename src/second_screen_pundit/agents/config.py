@@ -67,6 +67,8 @@ class AgentSettings:
     ask_audio_timeout_seconds: float = 30
     speech_synthesis_timeout_seconds: float = 8
     speech_voice: str = DEFAULT_SPEECH_VOICE
+    # A replay whose stream hasn't connected this long after /start is stopped.
+    stream_connect_deadline_seconds: float = 10
     speech_fallback_voice: str = DEFAULT_SPEECH_FALLBACK_VOICE
 
     @classmethod
@@ -112,6 +114,9 @@ class AgentSettings:
                 "SPEECH_SYNTHESIS_TIMEOUT_SECONDS", 8
             ),
             speech_voice=os.getenv("SPEECH_VOICE", "").strip() or DEFAULT_SPEECH_VOICE,
+            stream_connect_deadline_seconds=_positive_float(
+                "STREAM_CONNECT_DEADLINE_SECONDS", 10
+            ),
             speech_fallback_voice=(
                 os.getenv("SPEECH_FALLBACK_VOICE", "").strip() or DEFAULT_SPEECH_FALLBACK_VOICE
             ),

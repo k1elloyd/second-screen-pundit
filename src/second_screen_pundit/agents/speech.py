@@ -134,7 +134,13 @@ class SpeechSynthesizer:
             artifact = SpeechArtifact(
                 artifact.path, artifact.duration_seconds, artifact.audio_bytes, self.voice_name
             )
-        logger.info("speech_synthesized voice=%s tier=%s", artifact.voice, tier)
+        style = voice_profile(artifact.voice).style_for(tier)
+        logger.info(
+            "speech_synthesized voice=%s tier=%s style=%s",
+            artifact.voice,
+            tier,
+            style.style if style is not None else "none",
+        )
         return artifact
 
     def synthesize_ssml_mp3(self, ssml: str, output_path: Path) -> SpeechArtifact:
