@@ -469,7 +469,7 @@ def test_question_and_recap_fall_back_after_agent_or_tool_errors(
         result = asyncio.run(pipeline.produce_recap(info, events, as_of=as_of))
         notice = result.recap.notice
 
-    assert result.attempts == 2
+    assert result.attempts == (1 if operation == "question" else 2)
     assert result.evidence.passed
     assert notice is not None and type(error).__name__ in notice
 
@@ -703,6 +703,30 @@ def test_failed_must_say_emits_verified_fallback_line(
     assert result.line.model_dump()["source"] == "fallback"
     assert "Port Calder lead 1-0" in result.line.text
     assert result.evidence is not None and result.evidence.passed
+
+
+def test_must_say_agent_exception_emits_verified_fallback_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = get_match_info("m01")
+    events = generate_match("m01")
+    goal = next(event for event in events if event.type == "goal" and event.minute == 23)
+    pipeline = PunditPipeline(_settings("live"), object())  # type: ignore[arg-type]
+
+    class FailingAgent:
+        async def run(self, _: str) -> object:
+            raise RuntimeError("model service unavailable")
+
+    monkeypatch.setattr(pipeline, "_agent", lambda *_args, **_kwargs: FailingAgent())
+
+    result = asyncio.run(
+        pipeline.comment_on_window(info, events, [goal], as_of=goal.seq)
+    )
+
+    assert result.status == "commentary"
+    assert result.line is not None and result.line.source == "fallback"
+    assert result.evidence is not None and result.evidence.passed
+    assert "Port Calder lead 1-0" in result.line.text
 
 
 def test_failed_mandatory_formation_window_emits_verified_fallback(

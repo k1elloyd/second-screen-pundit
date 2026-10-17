@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
@@ -16,8 +17,10 @@ from second_screen_pundit.engine.schema import Event, MatchInfo
 WINDOW_MATCH_MINUTES = 3
 PENDING_SIGNAL_EXPIRY_MINUTES = 10
 RECENT_LINES_FOR_COMMENTATOR = 3
+logger = logging.getLogger(__name__)
 
 BoundaryDecision = Literal["no_signal", "held_cooldown", "held_in_flight", "dispatched"]
+OutcomeHandler = Callable[["WindowOutcome"], object]
 
 
 @dataclass
@@ -56,6 +59,7 @@ class LiveDispatcher:
     events: list[Event]
     settings: AgentSettings
     delay: BroadcastDelay | None = None
+    on_outcome: OutcomeHandler | None = None
     outcomes: list[WindowOutcome] = field(default_factory=list)
     boundaries: list[BoundaryRecord] = field(default_factory=list)
 
@@ -88,6 +92,9 @@ class LiveDispatcher:
             else:
                 await asyncio.gather(*self._tasks)
         except asyncio.CancelledError:
+            await self.cancel()
+            raise
+        except Exception:
             await self.cancel()
             raise
 
@@ -228,6 +235,12 @@ class LiveDispatcher:
                 self._recent_lines.append(outcome.result.line.text)
         except Exception as exc:  # noqa: BLE001 - one failed window must not stop the replay
             outcome.error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            logger.warning(
+                "commentary_window_failed match_id=%s event_id=%s error=%s",
+                self.info.match_id,
+                outcome.event.event_id,
+                type(exc).__name__,
+            )
         outcome.elapsed_ms = round((time.monotonic() - started) * 1000)
         if (
             self.delay is not None
@@ -240,3 +253,7 @@ class LiveDispatcher:
                 await self.delay.wait_released(outcome.event.seq) * 1000
             )
         self.outcomes.append(outcome)
+        if self.on_outcome is not None:
+            result = self.on_outcome(outcome)
+            if asyncio.iscoroutine(result):
+                await result

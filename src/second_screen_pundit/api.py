@@ -1,0 +1,855 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import logging
+import math
+import time
+import wave
+from collections import defaultdict, deque
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from azure.identity import DefaultAzureCredential
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from second_screen_pundit.agents.config import AgentSettings
+from second_screen_pundit.agents.content_filter import viewer_output_block_reason
+from second_screen_pundit.agents.dispatcher import LiveDispatcher, WindowOutcome
+from second_screen_pundit.agents.evidence import EvidenceReport
+from second_screen_pundit.agents.models import DeliveryTier, Explanation
+from second_screen_pundit.agents.pipeline import PunditPipeline, QuestionResult
+from second_screen_pundit.agents.speech import SpeechRecognizer, SpeechSynthesizer
+from second_screen_pundit.engine.broadcast import BroadcastDelay
+from second_screen_pundit.engine.generate import generate_match, get_match_info
+from second_screen_pundit.engine.replay import Replay, ReplayManager
+from second_screen_pundit.engine.schema import Event, MatchInfo
+from second_screen_pundit.engine.teams import team_name
+
+
+logger = logging.getLogger(__name__)
+MAX_QUESTION_AUDIO_BYTES = 1_000_000
+MAX_QUESTION_AUDIO_SECONDS = 15
+_WEB_DIR = Path(__file__).with_name("web")
+
+
+class QuestionRequest(BaseModel):
+    replay_id: str
+    question: str
+
+
+@dataclass
+class ReplaySession:
+    replay_id: str
+    tab_id: str
+    client_ip: str
+    info: MatchInfo
+    events: list[Event]
+    replay: Replay
+    delay: BroadcastDelay
+    queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = field(
+        default_factory=asyncio.Queue
+    )
+    release_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    released_events: list[Event] = field(default_factory=list)
+    viewer_released_as_of: int = 0
+    lines: dict[str, dict[str, Any]] = field(default_factory=dict)
+    audio: dict[str, bytes] = field(default_factory=dict)
+    stream_open: bool = False
+    complete: bool = False
+    stopped: bool = False
+    recap_task: asyncio.Task[None] | None = None
+    runner_task: asyncio.Task[None] | None = None
+    dispatcher: LiveDispatcher | None = None
+    dispatch_source: AsyncIterator[Event] | None = None
+    viewer_source: AsyncIterator[Event] | None = None
+
+
+class QuestionRateLimiter:
+    def __init__(self, limit: int = 6, window_seconds: float = 60) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+
+    def check(self, client_ip: str, *, now: float | None = None) -> None:
+        current = time.monotonic() if now is None else now
+        requests = self._requests[client_ip]
+        while requests and current - requests[0] >= self.window_seconds:
+            requests.popleft()
+        if len(requests) >= self.limit:
+            retry_after = max(1, math.ceil(self.window_seconds - (current - requests[0])))
+            raise HTTPException(
+                status_code=429,
+                detail="Question limit reached: 6 questions per minute. Please wait and try again.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        requests.append(current)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    if forwarded:
+        return forwarded
+    if request.client is not None:
+        return request.client.host
+    return "unknown"
+
+
+def _event_payload(event: Event, info: MatchInfo) -> dict[str, Any]:
+    team = (
+        team_name(info, event.team).full
+        if event.team is not None
+        else None
+    )
+    squads = (info.home, info.away)
+    player_name = next(
+        (
+            player.get("name")
+            for squad in squads
+            for player in squad.players
+            if player.get("id") == event.player_id
+        ),
+        None,
+    )
+    return {
+        **event.model_dump(mode="json"),
+        "team_name": team,
+        "player_name": player_name,
+        "clock": event.minute + event.added_minute,
+    }
+
+
+def _safe_explanation(explanation: Explanation, info: MatchInfo) -> tuple[Explanation, str | None]:
+    text = [
+        explanation.answer,
+        *(claim.text for claim in explanation.claims),
+        *explanation.cannot_tell,
+        explanation.notice or "",
+    ]
+    reason = viewer_output_block_reason(text, info)
+    if reason is None:
+        return explanation, None
+    return (
+        explanation.model_copy(
+            update={
+                "answer": "That answer was blocked by the content filter. Ask about match events or tactics.",
+                "claims": [],
+                "fact_ids": [],
+                "event_ids": [],
+                "cannot_tell": [],
+                "notice": "The answer contained restricted content and was not shown.",
+            }
+        ),
+        reason,
+    )
+
+
+def _evidence_payload(report: EvidenceReport | None) -> dict[str, Any] | None:
+    if report is None:
+        return None
+    return {"passed": report.passed, "failures": list(report.failures)}
+
+
+def _safe_question_explanation(
+    pipeline: PunditPipeline,
+    result: QuestionResult,
+    info: MatchInfo,
+    events: list[Event],
+    as_of: int,
+) -> tuple[Explanation, str | None]:
+    explanation, reason = _safe_explanation(result.explanation, info)
+    if reason is None:
+        return explanation, None
+
+    fallback = pipeline.fallback_question(
+        info,
+        events,
+        as_of,
+        result.tool_results,
+        "The generated answer was withheld; verified match facts are shown instead.",
+        result.attempts,
+    )
+    safe_fallback, fallback_reason = _safe_explanation(fallback.explanation, info)
+    if fallback_reason is not None:
+        logger.error("Verified question fallback failed content filtering: %s", fallback_reason)
+        return (
+            Explanation(
+                answer="The generated response was withheld; no verified facts could be safely shown.",
+                notice="Please try again after more match events are released.",
+            ),
+            reason,
+        )
+    return safe_fallback, reason
+
+
+def _read_wav_duration(audio_bytes: bytes, *, max_seconds: int = MAX_QUESTION_AUDIO_SECONDS) -> float:
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
+            if wav.getcomptype() != "NONE":
+                raise ValueError("Question audio must be an uncompressed WAV file")
+            duration = wav.getnframes() / wav.getframerate()
+    except (wave.Error, EOFError, ZeroDivisionError) as exc:
+        raise ValueError("Question audio must be a valid WAV file") from exc
+    if duration <= 0:
+        raise ValueError("Question audio must not be empty")
+    if duration > max_seconds:
+        raise ValueError(f"Question audio must be {max_seconds} seconds or shorter")
+    return duration
+
+
+def _encode_sse(event: str, payload: dict[str, Any]) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+
+def create_app(
+    *,
+    settings: AgentSettings | None = None,
+    pipeline: PunditPipeline | None = None,
+    credential: Any | None = None,
+    speech_recognizer: SpeechRecognizer | None = None,
+    speech_synthesizer: SpeechSynthesizer | None = None,
+) -> FastAPI:
+    configured_settings = settings or AgentSettings.from_environment()
+    limiter = QuestionRateLimiter(
+        limit=configured_settings.questions_per_minute,
+        window_seconds=configured_settings.question_rate_window_seconds,
+    )
+    manager = ReplayManager(max_concurrent=configured_settings.max_concurrent_replays)
+    sessions: dict[str, ReplaySession] = {}
+    tab_sessions: dict[str, str] = {}
+    pipeline_override = pipeline
+    credential_override = credential
+    recognizer_override = speech_recognizer
+    synthesizer_override = speech_synthesizer
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+        app.state.settings = configured_settings
+        app.state.credential = credential_override
+        if app.state.credential is None and (
+            configured_settings.mode == "live"
+            or configured_settings.speech_endpoint
+            or configured_settings.speech_region
+        ):
+            app.state.credential = DefaultAzureCredential()
+        app.state.pipeline = pipeline_override or PunditPipeline(
+            configured_settings, app.state.credential
+        )
+        app.state.speech_recognizer = recognizer_override
+        app.state.speech_synthesizer = synthesizer_override
+        app.state.sessions = sessions
+        app.state.tab_sessions = tab_sessions
+        app.state.manager = manager
+        app.state.rate_limiter = limiter
+
+        if configured_settings.mode == "live":
+            app.state.warmup = {"status": "warming", "error": None}
+
+            async def warm_up() -> None:
+                try:
+                    await app.state.pipeline.warm_up()
+                except Exception as exc:
+                    logger.exception("model_warm_up_failed")
+                    app.state.warmup = {
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}; check server configuration and logs",
+                    }
+                else:
+                    app.state.warmup = {"status": "ready", "error": None}
+
+            app.state.warmup_task = asyncio.create_task(warm_up())
+        else:
+            app.state.warmup = {"status": "ready", "error": None}
+            app.state.warmup_task = None
+
+        try:
+            yield
+        finally:
+            active = list(sessions.values())
+            for session in active:
+                await _stop_session(session)
+            if app.state.warmup_task is not None and not app.state.warmup_task.done():
+                app.state.warmup_task.cancel()
+                await asyncio.gather(app.state.warmup_task, return_exceptions=True)
+            if app.state.credential is not None:
+                close = getattr(app.state.credential, "close", None)
+                if close is not None:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+
+    app = FastAPI(title="Second Screen Pundit", lifespan=lifespan)
+    app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
+
+    def speech_services() -> tuple[SpeechRecognizer, SpeechSynthesizer]:
+        if app.state.speech_recognizer is not None and app.state.speech_synthesizer is not None:
+            return app.state.speech_recognizer, app.state.speech_synthesizer
+        try:
+            endpoint, region = configured_settings.require_speech()
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Speech is not configured on this server.",
+            ) from exc
+        if app.state.credential is None:
+            app.state.credential = DefaultAzureCredential()
+        app.state.speech_recognizer = SpeechRecognizer(
+            endpoint=endpoint,
+            region=region,
+            credential=app.state.credential,
+        )
+        app.state.speech_synthesizer = SpeechSynthesizer(
+            endpoint=endpoint,
+            region=region,
+            credential=app.state.credential,
+        )
+        return app.state.speech_recognizer, app.state.speech_synthesizer
+
+    async def synthesize(
+        session: ReplaySession,
+        text: str,
+        *,
+        tier: DeliveryTier | None = None,
+    ) -> str | None:
+        try:
+            _, synthesizer = speech_services()
+            audio_id = uuid4().hex
+            from tempfile import TemporaryDirectory
+
+            def make_audio() -> bytes:
+                with TemporaryDirectory(prefix="pundit-audio-") as directory:
+                    artifact = synthesizer.synthesize_mp3(
+                        text,
+                        Path(directory) / f"{audio_id}.mp3",
+                        tier=tier,
+                    )
+                    return artifact.path.read_bytes()
+
+            async with asyncio.timeout(configured_settings.speech_synthesis_timeout_seconds):
+                session.audio[audio_id] = await asyncio.to_thread(make_audio)
+            return audio_id
+        except TimeoutError:
+            logger.warning(
+                "speech_synthesis_timeout timeout_seconds=%s",
+                configured_settings.speech_synthesis_timeout_seconds,
+            )
+            return None
+        except Exception as exc:
+            logger.warning("speech_synthesis_unavailable error=%s", type(exc).__name__)
+            return None
+
+    async def publish_outcome(session: ReplaySession, outcome: WindowOutcome) -> None:
+        if outcome.result is None:
+            return
+        if outcome.result.insight is not None:
+            await session.queue.put(
+                (
+                    "insight",
+                    {
+                        "match_id": session.info.match_id,
+                        "insight": outcome.result.insight.model_dump(mode="json"),
+                        "event_id": outcome.event.event_id,
+                    },
+                )
+            )
+        line = outcome.result.line
+        if line is None:
+            return
+        public_line_id = f"{session.replay_id}-{line.line_id}"
+        public_line = line.model_copy(update={"line_id": public_line_id})
+        events_by_id = {event.event_id: event for event in session.events}
+        cited_events = [
+            events_by_id[event_id]
+            for event_id in line.event_ids
+            if event_id in events_by_id and events_by_id[event_id].seq <= outcome.event.seq
+        ]
+        facts = [
+            fact.model_dump(mode="json")
+            for result in outcome.result.tool_results
+            for fact in result.facts
+            if fact.fact_id in line.fact_ids
+        ]
+        session.lines[public_line_id] = {
+            "line": public_line.model_dump(mode="json"),
+            "insight": (
+                outcome.result.insight.model_dump(mode="json")
+                if outcome.result.insight is not None
+                else None
+            ),
+            "facts": facts,
+            "events": [_event_payload(event, session.info) for event in cited_events],
+            "agent": line.source,
+            "evidence": _evidence_payload(outcome.result.evidence),
+        }
+        await session.queue.put(
+            (
+                "commentary",
+                {
+                    "line": public_line.model_dump(mode="json"),
+                    "audio_id": None,
+                    "audio_available": False,
+                    "audio_pending": True,
+                },
+            )
+        )
+        audio_id = await synthesize(session, line.text, tier=line.delivery_tier)
+        await session.queue.put(
+            (
+                "commentary_audio" if audio_id is not None else "commentary_audio_unavailable",
+                {"line_id": public_line_id, "audio_id": audio_id},
+            )
+        )
+
+    async def make_recap(session: ReplaySession, as_of: int) -> None:
+        try:
+            result = await app.state.pipeline.produce_recap(
+                session.info,
+                session.events,
+                as_of=as_of,
+            )
+            payload = {
+                "recap": result.recap.model_dump(mode="json"),
+                "audio_id": None,
+                "audio_available": False,
+                "audio_pending": True,
+                "evidence": _evidence_payload(result.evidence),
+            }
+            await session.queue.put(("recap", payload))
+            audio_id = await synthesize(session, result.recap.audio_script)
+            await session.queue.put(
+                (
+                    "recap_audio" if audio_id is not None else "recap_audio_unavailable",
+                    {"audio_id": audio_id},
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("recap_failed match_id=%s", session.info.match_id)
+            await session.queue.put(
+                (
+                    "error",
+                    {"message": f"The full-time recap failed ({type(exc).__name__})."},
+                )
+            )
+
+    async def release_events(session: ReplaySession, source: AsyncIterator[Event]) -> None:
+        async for event in session.delay.events(source):
+            async with session.release_condition:
+                session.viewer_released_as_of = session.delay.released_as_of
+                session.released_events.append(event)
+                await session.queue.put(("event", _event_payload(event, session.info)))
+                session.release_condition.notify_all()
+            if event.type == "full_time":
+                session.recap_task = asyncio.create_task(make_recap(session, event.seq))
+
+    async def run_session(session: ReplaySession) -> None:
+        if session.dispatcher is None or session.dispatch_source is None or session.viewer_source is None:
+            raise RuntimeError("Replay session workers were not initialized")
+        dispatch_task = asyncio.create_task(
+            session.dispatcher.run(
+                session.dispatch_source,
+                replay_stopped=lambda: session.replay.state == "stopped",
+            )
+        )
+        release_task = asyncio.create_task(release_events(session, session.viewer_source))
+        children = (dispatch_task, release_task)
+        try:
+            results = await asyncio.gather(*children, return_exceptions=True)
+            worker_errors = [
+                result for result in results if isinstance(result, BaseException)
+            ]
+            if session.recap_task is not None:
+                try:
+                    await session.recap_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    worker_errors.append(exc)
+            if worker_errors:
+                failure = worker_errors[0]
+                logger.error(
+                    "replay_worker_failed replay_id=%s error=%s",
+                    session.replay_id,
+                    type(failure).__name__,
+                )
+                await session.queue.put(
+                    (
+                        "error",
+                        {
+                            "message": (
+                                f"Replay worker failed ({type(failure).__name__}). "
+                                "The match can be started again."
+                            )
+                        },
+                    )
+                )
+            session.complete = True
+            await session.queue.put(("complete", {"replay_id": session.replay_id}))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            for task in children:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
+
+    async def _stop_session(session: ReplaySession) -> None:
+        if session.stopped:
+            return
+        session.stopped = True
+        await session.replay.stop()
+        if session.runner_task is not None and not session.runner_task.done():
+            session.runner_task.cancel()
+            await asyncio.gather(session.runner_task, return_exceptions=True)
+        if session.recap_task is not None and not session.recap_task.done():
+            session.recap_task.cancel()
+            await asyncio.gather(session.recap_task, return_exceptions=True)
+        session.audio.clear()
+        sessions.pop(session.replay_id, None)
+        if tab_sessions.get(session.tab_id) == session.replay_id:
+            tab_sessions.pop(session.tab_id, None)
+
+    def find_session(replay_id: str) -> ReplaySession:
+        session = sessions.get(replay_id)
+        if session is None or session.stopped:
+            raise HTTPException(status_code=404, detail="Replay not found or already stopped.")
+        return session
+
+    def check_question_access(replay_id: str, request: Request) -> ReplaySession:
+        session = find_session(replay_id)
+        if session.viewer_released_as_of <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="The viewer has not received a match event yet. Please try again shortly.",
+            )
+        limiter.check(_client_ip(request))
+        return session
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(_WEB_DIR / "index.html")
+
+    @app.get("/api/matches")
+    async def matches() -> list[dict[str, str]]:
+        result = []
+        for match_id in ("m01", "m02", "m03"):
+            info = get_match_info(match_id)
+            result.append(
+                {
+                    "id": match_id,
+                    "label": f"{info.home.name} v {info.away.name}",
+                    "home": info.home.name,
+                    "away": info.away.name,
+                    "stadium": info.stadium,
+                }
+            )
+        return result
+
+    @app.post("/api/matches/{match_id}/start")
+    async def start_match(
+        match_id: str,
+        request: Request,
+        speed: int = 1,
+    ) -> dict[str, Any]:
+        warmup = app.state.warmup
+        if warmup["status"] != "ready":
+            message = (
+                "Pundit warm-up failed; check the server configuration and logs."
+                if warmup["status"] == "failed"
+                else "Pundit warming up; Start will be available when it is ready."
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=message,
+                headers={"Retry-After": "5"},
+            )
+        tab_id = request.headers.get("x-tab-id", "").strip()
+        if not tab_id or len(tab_id) > 80:
+            raise HTTPException(status_code=400, detail="A valid X-Tab-ID header is required.")
+        if not 1 <= speed <= 120:
+            raise HTTPException(status_code=422, detail="Replay speed must be between 1 and 120.")
+        tab_key = f"{_client_ip(request)}:{tab_id}"
+        previous_id = tab_sessions.get(tab_key)
+        if previous_id is not None and previous_id in sessions:
+            previous = sessions[previous_id]
+            if not previous.complete:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This tab already has a replay. Close its stream before starting another.",
+                )
+            await _stop_session(previous)
+        try:
+            info = get_match_info(match_id)
+            events = generate_match(match_id)
+            replay = manager.prepare(events, speed)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "Maximum concurrent replays" in str(exc):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"All {configured_settings.max_concurrent_replays} replay slots are in use. "
+                        "Try again when a match has finished."
+                    ),
+                    headers={"Retry-After": "10"},
+                ) from exc
+            raise
+
+        replay_id = uuid4().hex
+        delay = BroadcastDelay(configured_settings.broadcast_delay_seconds)
+        session = ReplaySession(
+            replay_id=replay_id,
+            tab_id=tab_key,
+            client_ip=_client_ip(request),
+            info=info,
+            events=events,
+            replay=replay,
+            delay=delay,
+        )
+        session.dispatcher = LiveDispatcher(
+            app.state.pipeline,
+            info,
+            events,
+            configured_settings,
+            delay=delay,
+            on_outcome=lambda outcome: publish_outcome(session, outcome),
+        )
+        session.dispatch_source = replay.subscribe()
+        session.viewer_source = replay.subscribe()
+        sessions[replay_id] = session
+        tab_sessions[tab_key] = replay_id
+        replay.start()
+        session.runner_task = asyncio.create_task(run_session(session))
+        return {
+            "replay_id": replay_id,
+            "match_id": match_id,
+            "speed": speed,
+            "state": replay.state,
+        }
+
+    @app.post("/api/replays/{replay_id}/control")
+    async def control(replay_id: str, request: Request) -> dict[str, str]:
+        session = find_session(replay_id)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Control body must be valid JSON.") from exc
+        action = body.get("action") if isinstance(body, dict) else None
+        if action not in {"pause", "resume"}:
+            raise HTTPException(status_code=422, detail="Action must be pause or resume.")
+        state = await session.replay.control(action)
+        return {"replay_id": replay_id, "state": state}
+
+    @app.post("/api/ask")
+    async def ask(payload: QuestionRequest, request: Request) -> dict[str, Any]:
+        question = payload.question.strip()
+        if not question:
+            raise HTTPException(status_code=422, detail="Question must not be empty.")
+        if len(question) > configured_settings.question_max_characters:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Question must be {configured_settings.question_max_characters} "
+                    "characters or shorter."
+                ),
+            )
+        session = check_question_access(payload.replay_id, request)
+        result = await app.state.pipeline.answer_question(
+            session.info,
+            session.events,
+            question,
+            as_of=session.viewer_released_as_of,
+        )
+        explanation, blocked_reason = _safe_question_explanation(
+            app.state.pipeline,
+            result,
+            session.info,
+            session.events,
+            session.viewer_released_as_of,
+        )
+        audio_id = None
+        return {
+            "transcript": question,
+            "explanation": explanation.model_dump(mode="json"),
+            "audio_id": audio_id,
+            "blocked": blocked_reason is not None,
+            "blocked_reason": blocked_reason,
+        }
+
+    @app.post("/api/ask-audio")
+    async def ask_audio(
+        request: Request,
+        replay_id: str = Form(...),
+        audio: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        session = check_question_access(replay_id, request)
+        audio_bytes = await audio.read(configured_settings.question_audio_max_bytes + 1)
+        await audio.close()
+        if len(audio_bytes) > configured_settings.question_audio_max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Question audio must be "
+                    f"{configured_settings.question_audio_max_bytes} bytes or smaller."
+                ),
+            )
+        try:
+            _read_wav_duration(
+                audio_bytes,
+                max_seconds=configured_settings.question_audio_max_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            recognizer, _ = speech_services()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("speech_recognition_unavailable error=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Speech recognition is unavailable ({type(exc).__name__}).",
+            ) from exc
+        try:
+            async with asyncio.timeout(configured_settings.ask_audio_timeout_seconds):
+                transcript = await asyncio.to_thread(recognizer.recognize_wav, audio_bytes)
+                if len(transcript) > configured_settings.question_max_characters:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "Speech transcript must be "
+                            f"{configured_settings.question_max_characters} characters or shorter."
+                        ),
+                    )
+                if not transcript.strip():
+                    raise HTTPException(status_code=422, detail="No speech was recognized.")
+                result = await app.state.pipeline.answer_question(
+                    session.info,
+                    session.events,
+                    transcript,
+                    as_of=session.viewer_released_as_of,
+                )
+                explanation, blocked_reason = _safe_question_explanation(
+                    app.state.pipeline,
+                    result,
+                    session.info,
+                    session.events,
+                    session.viewer_released_as_of,
+                )
+                audio_id = await synthesize(session, explanation.answer)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Spoken question timed out after 30 seconds. Please try typing it instead.",
+            ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("spoken_question_failed error=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Speech question failed ({type(exc).__name__}); please retry or type the question.",
+            ) from exc
+        return {
+            "transcript": transcript,
+            "explanation": explanation.model_dump(mode="json"),
+            "audio_id": audio_id,
+            "blocked": blocked_reason is not None,
+            "blocked_reason": blocked_reason,
+        }
+
+    @app.get("/api/lines/{line_id}/evidence")
+    async def line_evidence(line_id: str) -> dict[str, Any]:
+        for session in sessions.values():
+            if line_id in session.lines:
+                return session.lines[line_id]
+        raise HTTPException(status_code=404, detail="Commentary evidence is no longer available.")
+
+    @app.get("/api/audio/{audio_id}")
+    async def audio(audio_id: str) -> Response:
+        for session in sessions.values():
+            data = session.audio.get(audio_id)
+            if data is not None:
+                return Response(
+                    content=data,
+                    media_type="audio/mpeg",
+                    headers={"Cache-Control": "no-store"},
+                )
+        raise HTTPException(status_code=404, detail="Audio is no longer available.")
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        warmup = app.state.warmup
+        return JSONResponse(
+            {
+                "status": "ok",
+                "warmup": warmup["status"],
+                "ready": warmup["status"] == "ready",
+                "error": warmup["error"],
+                "limits": {
+                    "question_characters": configured_settings.question_max_characters,
+                    "question_audio_seconds": configured_settings.question_audio_max_seconds,
+                    "question_audio_bytes": configured_settings.question_audio_max_bytes,
+                    "questions_per_minute": configured_settings.questions_per_minute,
+                    "question_rate_window_seconds": configured_settings.question_rate_window_seconds,
+                    "concurrent_replays": configured_settings.max_concurrent_replays,
+                },
+            }
+        )
+
+    @app.get("/api/replays/{replay_id}/stream")
+    async def stream(replay_id: str) -> StreamingResponse:
+        session = find_session(replay_id)
+        if session.stream_open:
+            raise HTTPException(status_code=409, detail="This replay already has an SSE client.")
+        session.stream_open = True
+
+        async def events() -> AsyncIterator[bytes]:
+            complete_sent = False
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(session.queue.get(), timeout=15)
+                    except TimeoutError:
+                        yield b": heartbeat\n\n"
+                        continue
+                    if item is None:
+                        return
+                    name, payload = item
+                    yield _encode_sse(name, payload)
+                    if name == "complete":
+                        complete_sent = True
+                        while True:
+                            await asyncio.sleep(15)
+                            yield b": heartbeat\n\n"
+            finally:
+                session.stream_open = False
+                if not complete_sent:
+                    await _stop_session(session)
+                elif not session.stopped:
+                    await _stop_session(session)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    return app
+
+
+app = create_app()

@@ -127,6 +127,12 @@ class ReplayManager:
         self._replays: set[Replay] = set()
 
     def start(self, events: Sequence[Event], speed: int) -> Replay:
+        replay = self.prepare(events, speed)
+        replay.start()
+        return replay
+
+    def prepare(self, events: Sequence[Event], speed: int) -> Replay:
+        """Reserve a replay slot so subscribers can be attached before playback starts."""
         self._replays = {
             replay for replay in self._replays if replay.state not in {"finished", "stopped"}
         }
@@ -134,5 +140,4 @@ class ReplayManager:
             raise RuntimeError("Maximum concurrent replays reached")
         replay = Replay(events, speed)
         self._replays.add(replay)
-        replay.start()
         return replay

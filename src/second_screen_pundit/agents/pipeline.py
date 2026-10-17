@@ -1211,6 +1211,31 @@ class PunditPipeline:
                 tuple(timings),
                 tuple(output_failures),
             )
+        except Exception as exc:
+            logger.warning(
+                "live_window_failed match_id=%s as_of=%d lane=%s error=%s",
+                info.match_id,
+                as_of,
+                lane,
+                type(exc).__name__,
+            )
+            if is_tactical_stale():
+                return stale_result()
+            if fallback_plan() is not None:
+                return fallback_result(
+                    f"Live agent call failed ({type(exc).__name__}); "
+                    "deterministic fallback was used."
+                )
+            return LiveWindowResult(
+                "rejected",
+                None,
+                None,
+                tuple(accumulated_results),
+                None,
+                f"Live agent call failed ({type(exc).__name__}).",
+                tuple(timings),
+                tuple(output_failures),
+            )
 
     def _check_line(
         self,
@@ -1335,7 +1360,7 @@ class PunditPipeline:
             return self._cached_question(info, events, question, as_of)
         if self.settings.mode == "off":
             fallback = _deterministic_results(events, as_of)
-            return self._fallback_question(
+            return self.fallback_question(
                 info,
                 events,
                 as_of,
@@ -1348,10 +1373,12 @@ class PunditPipeline:
         accumulated_results: list[ToolResult] = []
         feedback = ""
         last_failure: str | None = None
+        attempt_count = 0
 
         async def attempts() -> QuestionResult | None:
-            nonlocal feedback, last_failure
+            nonlocal feedback, last_failure, attempt_count
             for attempt in range(2):
+                attempt_count = attempt + 1
                 capture = None
                 try:
                     tools, capture = build_analytics_tools(events, as_of=as_of)
@@ -1379,11 +1406,14 @@ class PunditPipeline:
                     )
                 except Exception as exc:
                     last_failure = type(exc).__name__
-                    feedback = (
-                        f"The previous agent or tool run failed with {last_failure}; "
-                        "retry with valid tool arguments."
+                    logger.warning(
+                        "question_agent_failed match_id=%s as_of=%d attempt=%d error=%s",
+                        info.match_id,
+                        as_of,
+                        attempt_count,
+                        last_failure,
                     )
-                    continue
+                    break
                 finally:
                     if capture is not None:
                         accumulated_results.extend(capture.results)
@@ -1419,19 +1449,19 @@ class PunditPipeline:
             result = await asyncio.wait_for(attempts(), timeout=deadline)
         except TimeoutError:
             deterministic = _deterministic_results(events, as_of)
-            return self._fallback_question(
+            return self.fallback_question(
                 info,
                 events,
                 as_of,
                 deterministic,
                 "The question exceeded its time budget; verified facts are shown instead.",
-                2,
+                attempt_count,
             )
         if result is not None:
             return result
 
         deterministic = _deterministic_results(events, as_of)
-        return self._fallback_question(
+        return self.fallback_question(
             info,
             events,
             as_of,
@@ -1441,10 +1471,10 @@ class PunditPipeline:
                 if last_failure is not None
                 else "The answer failed evidence checks; verified facts are shown instead."
             ),
-            2,
+            attempt_count,
         )
 
-    def _fallback_question(
+    def fallback_question(
         self,
         info: MatchInfo,
         events: list[Event],
@@ -1479,7 +1509,7 @@ class PunditPipeline:
         match = closest_cached_question(cached, question)
         if match is None:
             results = _deterministic_results(events, as_of)
-            return self._fallback_question(
+            return self.fallback_question(
                 info,
                 events,
                 as_of,
@@ -1507,7 +1537,7 @@ class PunditPipeline:
         )
         if not report.passed:
             fallback_results = _deterministic_results(events, as_of)
-            return self._fallback_question(
+            return self.fallback_question(
                 info,
                 events,
                 as_of,

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from io import BytesIO
 from pathlib import Path
+import wave
 from xml.sax.saxutils import escape, quoteattr
 
 import azure.cognitiveservices.speech as speechsdk
@@ -112,3 +114,57 @@ class SpeechSynthesizer:
         finally:
             if temporary_path.exists():
                 temporary_path.unlink()
+
+
+class SpeechRecognizer:
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        region: str,
+        credential: TokenCredential,
+    ) -> None:
+        if not region.strip():
+            raise ValueError("Speech region must not be empty")
+        self._config = speechsdk.SpeechConfig(
+            token_credential=credential,
+            endpoint=endpoint,
+        )
+
+    def recognize_wav(self, audio_bytes: bytes) -> str:
+        if not audio_bytes:
+            raise ValueError("Question audio must not be empty")
+        try:
+            with wave.open(BytesIO(audio_bytes), "rb") as wav:
+                if wav.getcomptype() != "NONE" or wav.getsampwidth() != 2:
+                    raise ValueError("Question audio must be uncompressed 16-bit PCM WAV")
+                sample_rate = wav.getframerate()
+                channels = wav.getnchannels()
+                frames = wav.readframes(wav.getnframes())
+        except (wave.Error, EOFError, ZeroDivisionError) as exc:
+            raise ValueError("Question audio must be a valid WAV file") from exc
+        stream_format = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=sample_rate,
+            bits_per_sample=16,
+            channels=channels,
+        )
+        audio_stream = speechsdk.audio.PushAudioInputStream(stream_format=stream_format)
+        audio_stream.write(frames)
+        audio_stream.close()
+        audio_config = speechsdk.AudioConfig(stream=audio_stream)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=self._config,
+            audio_config=audio_config,
+        )
+        result = recognizer.recognize_once_async().get()
+        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            transcript = result.text.strip()
+            if transcript:
+                return transcript
+            raise RuntimeError("Speech recognition returned an empty transcript")
+        if result.reason == speechsdk.ResultReason.NoMatch:
+            raise ValueError("No speech was recognized; try recording again")
+        details = getattr(result, "cancellation_details", None)
+        reason = getattr(details, "reason", result.reason)
+        error = getattr(details, "error_details", "") or ""
+        raise RuntimeError(f"Speech recognition failed: {reason} {error}".strip())

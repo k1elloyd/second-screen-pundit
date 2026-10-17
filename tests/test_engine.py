@@ -4,6 +4,7 @@ import re
 import pytest
 from pydantic import ValidationError
 
+from second_screen_pundit.agents.content_filter import _KNOWN_REAL_NAME_FINGERPRINTS
 from second_screen_pundit.engine.generate import (
     generate_match,
     get_match_info,
@@ -12,17 +13,6 @@ from second_screen_pundit.engine.generate import (
     write_event_log,
 )
 from second_screen_pundit.engine.schema import Event
-
-
-REAL_CLUB_NAME_FINGERPRINTS = {
-    "b93b9776163702f1fad6cbaf815326a41b3285d0961f4e838ebdb8ad52e5f16e",
-    "9e861941ad8bf5bcb649e5fde92d712528200a216018c2437371498e6ab7683d",
-    "15c6d611193988e468c7431229c59ce13b0407fba24f11d36c42680d7fa11e98",
-    "1ecd41c03ef78bd6daeaa6bb008896607a8413bf8ba6266be80327554b370a9e",
-    "cd111a88b18961c729263aa10f90848935da373f7480179c402427de838141c7",
-    "c762f2e9d54d8014de25fba5bd49265b5e75d504c514be6aac08ead41b71c72a",
-    "7c8159dd2e49a576176f5461ea9d8919abdfd0ed4e29e2b4c1c7b98a8060bf40",
-}
 
 
 def _score_at(events: list[Event], minute: int) -> tuple[int, int]:
@@ -159,7 +149,7 @@ def test_squads_are_curated_and_do_not_match_the_hashed_denylist() -> None:
     for name in all_names:
         canonical = re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip()
         fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        assert fingerprint not in REAL_CLUB_NAME_FINGERPRINTS
+        assert fingerprint not in _KNOWN_REAL_NAME_FINGERPRINTS
 
 
 def test_event_log_jsonl_round_trip(tmp_path) -> None:

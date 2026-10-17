@@ -27,6 +27,10 @@ class BroadcastDelay:
         self._seen: dict[int, float] = {}
         self.released: dict[int, float] = {}
 
+    @property
+    def released_as_of(self) -> int:
+        return max(self.released, default=0)
+
     def stamp(self, event: Event) -> None:
         self._seen.setdefault(event.seq, self._clock())
 
