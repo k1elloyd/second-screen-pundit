@@ -33,6 +33,7 @@ from second_screen_pundit.engine.generate import generate_match, get_match_info
 from second_screen_pundit.engine.replay import Replay, ReplayManager
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import team_name
+from second_screen_pundit.observability import record_result, tracer, turn_span
 from second_screen_pundit.outbox import ViewerOutbox
 
 
@@ -374,8 +375,13 @@ def create_app(
                     )
                     return artifact.path.read_bytes()
 
-            async with asyncio.timeout(configured_settings.speech_synthesis_timeout_seconds):
-                session.audio[audio_id] = await asyncio.to_thread(make_audio)
+            with tracer.start_as_current_span("pundit.speech.synthesize") as span:
+                span.set_attribute("app.match_id", session.info.match_id)
+                span.set_attribute("app.speech.characters", len(text))
+                span.set_attribute("app.speech.tier", str(tier) if tier is not None else "none")
+                async with asyncio.timeout(configured_settings.speech_synthesis_timeout_seconds):
+                    session.audio[audio_id] = await asyncio.to_thread(make_audio)
+                span.set_attribute("app.speech.bytes", len(session.audio[audio_id]))
             return audio_id
         except TimeoutError:
             logger.warning(
@@ -487,11 +493,14 @@ def create_app(
 
     async def make_recap(session: ReplaySession, as_of: int) -> None:
         try:
-            result = await app.state.pipeline.produce_recap(
-                session.info,
-                session.events,
-                as_of=as_of,
-            )
+            with turn_span("recap", session.info.match_id) as span:
+                span.set_attribute("app.as_of", as_of)
+                result = await app.state.pipeline.produce_recap(
+                    session.info,
+                    session.events,
+                    as_of=as_of,
+                )
+                record_result(span, result)
             payload = {
                 "recap": result.recap.model_dump(mode="json"),
                 "audio_id": None,
@@ -617,14 +626,20 @@ def create_app(
         if tab_sessions.get(session.tab_id) == session.replay_id:
             tab_sessions.pop(session.tab_id, None)
 
-    def find_session(replay_id: str) -> ReplaySession:
+    def find_session(replay_id: str, request: Request) -> ReplaySession:
+        """The replay, if the caller is the client that started it.
+
+        The ID is 128 random bits, but it shows up in URLs; a second check that the caller has
+        the starting client's address keeps another client off the stream, the controls and
+        the Q&A. Someone else's replay gets the same 404 as a missing one.
+        """
         session = sessions.get(replay_id)
-        if session is None or session.stopped:
+        if session is None or session.stopped or session.client_ip != _client_ip(request):
             raise HTTPException(status_code=404, detail="Replay not found or already stopped.")
         return session
 
     def check_question_access(replay_id: str, request: Request) -> ReplaySession:
-        session = find_session(replay_id)
+        session = find_session(replay_id, request)
         if session.viewer_released_as_of <= 0:
             raise HTTPException(
                 status_code=409,
@@ -743,7 +758,7 @@ def create_app(
 
     @app.post("/api/replays/{replay_id}/control")
     async def control(replay_id: str, request: Request) -> dict[str, str]:
-        session = find_session(replay_id)
+        session = find_session(replay_id, request)
         try:
             body = await request.json()
         except json.JSONDecodeError as exc:
@@ -766,19 +781,24 @@ def create_app(
         started: float,
     ) -> dict[str, Any]:
         as_of = session.viewer_released_as_of
-        result = await app.state.pipeline.answer_question(
-            session.info,
-            session.events,
-            question,
-            as_of=as_of,
-        )
-        explanation, blocked_reason = _safe_question_explanation(
-            app.state.pipeline,
-            result,
-            session.info,
-            session.events,
-            as_of,
-        )
+        with turn_span("question", session.info.match_id) as span:
+            span.set_attribute("app.as_of", as_of)
+            span.set_attribute("app.question.characters", len(question))
+            result = await app.state.pipeline.answer_question(
+                session.info,
+                session.events,
+                question,
+                as_of=as_of,
+            )
+            explanation, blocked_reason = _safe_question_explanation(
+                app.state.pipeline,
+                result,
+                session.info,
+                session.events,
+                as_of,
+            )
+            record_result(span, result)
+            span.set_attribute("app.answer.blocked", blocked_reason is not None)
         return _answer_payload(question_id, question, result, explanation, blocked_reason, started)
 
     @app.post("/api/ask")
@@ -889,8 +909,13 @@ def create_app(
             ) from exc
         limit = configured_settings.ask_audio_timeout_seconds
         try:
-            async with asyncio.timeout(limit):
-                transcript = (await asyncio.to_thread(recognizer.recognize_wav, audio_bytes)).strip()
+            with tracer.start_as_current_span("pundit.speech.recognize") as span:
+                span.set_attribute("app.match_id", session.info.match_id)
+                span.set_attribute("app.speech.bytes", len(audio_bytes))
+                async with asyncio.timeout(limit):
+                    transcript = (
+                        await asyncio.to_thread(recognizer.recognize_wav, audio_bytes)
+                    ).strip()
         except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
@@ -970,6 +995,7 @@ def create_app(
     @app.get("/api/replays/{replay_id}/stream")
     async def stream(
         replay_id: str,
+        request: Request,
         last_event_id: Annotated[str | None, Header()] = None,
     ) -> StreamingResponse:
         """The replay's viewer stream; a reconnect with Last-Event-ID resumes after it.
@@ -978,7 +1004,7 @@ def create_app(
         replay: it keeps running, paused or not, for STREAM_RECONNECT_GRACE_SECONDS. Each
         connection closes itself after STREAM_MAX_SECONDS, inside the ingress request timeout.
         """
-        session = find_session(replay_id)
+        session = find_session(replay_id, request)
         position = _resume_position(last_event_id, len(session.outbox))
         # The newest connection wins: an older one (often a dead socket nobody has noticed
         # yet) ends instead of blocking the reconnect.

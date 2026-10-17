@@ -89,7 +89,9 @@ def _run(synth: _Synth, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict
                 route.path: route.endpoint for route in app.routes if hasattr(route, "endpoint")
             }
             started = await routes["/api/matches/{match_id}/start"]("m02", Request(scope), speed=120)
-            response = await routes["/api/replays/{replay_id}/stream"](started["replay_id"])
+            response = await routes["/api/replays/{replay_id}/stream"](
+                started["replay_id"], Request(scope)
+            )
             received: list[tuple[str, dict]] = []
             buffer = ""
             async for chunk in response.body_iterator:

@@ -227,3 +227,6 @@ __marimo__/
 /data/audio/voice-trials/
 
 .playwright-mcp/
+
+# azd environments (local settings per environment)
+.azure/

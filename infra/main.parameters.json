@@ -2,11 +2,44 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
   "contentVersion": "1.0.0.0",
   "parameters": {
+    "environmentName": {
+      "value": "${AZURE_ENV_NAME}"
+    },
     "existingFoundryAccountName": {
       "value": "${EXISTING_FOUNDRY_ACCOUNT_NAME}"
     },
     "existingFoundryResourceGroup": {
       "value": "${EXISTING_FOUNDRY_RESOURCE_GROUP}"
+    },
+    "foundryProjectName": {
+      "value": "${FOUNDRY_PROJECT_NAME}"
+    },
+    "modelFast": {
+      "value": "${MODEL_FAST=gpt-5.4-mini}"
+    },
+    "modelDeep": {
+      "value": "${MODEL_DEEP=gpt-5.4-mini}"
+    },
+    "existingSpeechAccountName": {
+      "value": "${EXISTING_SPEECH_ACCOUNT_NAME}"
+    },
+    "existingSpeechResourceGroup": {
+      "value": "${EXISTING_SPEECH_RESOURCE_GROUP=}"
+    },
+    "speechVoice": {
+      "value": "${SPEECH_VOICE=en-GB-Harry:MAI-Voice-2.1-Flash}"
+    },
+    "speechFallbackVoice": {
+      "value": "${SPEECH_FALLBACK_VOICE=en-GB-RyanNeural}"
+    },
+    "narrativeMode": {
+      "value": "${NARRATIVE_MODE=live}"
+    },
+    "minReplicas": {
+      "value": "${MIN_REPLICAS=1}"
+    },
+    "apiImageName": {
+      "value": "${SERVICE_API_IMAGE_NAME=}"
     }
   }
 }

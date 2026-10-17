@@ -12,6 +12,7 @@ from second_screen_pundit.agents.pipeline import LiveWindowResult, PunditPipelin
 from second_screen_pundit.agents.signals import SignalTracker, TacticalSignal, formation_key
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.schema import Event, MatchInfo
+from second_screen_pundit.observability import record_result, turn_span
 
 
 WINDOW_MATCH_MINUTES = 3
@@ -245,15 +246,18 @@ class LiveDispatcher:
     ) -> None:
         started = time.monotonic()
         try:
-            outcome.result = await self.pipeline.comment_on_window(
-                self.info,
-                self.events,
-                window,
-                as_of=outcome.event.seq,
-                signals=signals,
-                is_stale=is_stale,
-                recent_lines=tuple(self._recent_lines[-RECENT_LINES_FOR_COMMENTATOR:]),
-            )
+            with turn_span("live", self.info.match_id) as span:
+                span.set_attribute("app.as_of", outcome.event.seq)
+                outcome.result = await self.pipeline.comment_on_window(
+                    self.info,
+                    self.events,
+                    window,
+                    as_of=outcome.event.seq,
+                    signals=signals,
+                    is_stale=is_stale,
+                    recent_lines=tuple(self._recent_lines[-RECENT_LINES_FOR_COMMENTATOR:]),
+                )
+                record_result(span, outcome.result)
             line = outcome.result.line if _has_line(outcome.result) else None
             if line is not None and line.line_id in self._published_line_ids:
                 outcome.result = replace(

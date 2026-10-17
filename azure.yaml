@@ -6,6 +6,28 @@ infra:
   provider: bicep
   path: infra
 
+# Everything deploys into the existing resource group rg-<environment name> (rg-pundit for
+# environment pundit). main.bicep is resource-group scoped and creates no resource group;
+# this hook pins AZURE_RESOURCE_GROUP so azd never offers to create one.
+hooks:
+  preprovision:
+    windows:
+      shell: pwsh
+      interactive: false
+      run: |
+        if (-not $env:AZURE_RESOURCE_GROUP) { azd env set AZURE_RESOURCE_GROUP "rg-$env:AZURE_ENV_NAME" }
+        $rg = if ($env:AZURE_RESOURCE_GROUP) { $env:AZURE_RESOURCE_GROUP } else { "rg-$env:AZURE_ENV_NAME" }
+        if ((az group exists --name $rg) -ne 'true') { Write-Error "Resource group $rg does not exist; create it first."; exit 1 }
+        Write-Host "Deploying into existing resource group $rg"
+    posix:
+      shell: sh
+      interactive: false
+      run: |
+        if [ -z "$AZURE_RESOURCE_GROUP" ]; then azd env set AZURE_RESOURCE_GROUP "rg-$AZURE_ENV_NAME"; fi
+        rg="${AZURE_RESOURCE_GROUP:-rg-$AZURE_ENV_NAME}"
+        if [ "$(az group exists --name "$rg")" != "true" ]; then echo "Resource group $rg does not exist; create it first." >&2; exit 1; fi
+        echo "Deploying into existing resource group $rg"
+
 services:
   api:
     project: .

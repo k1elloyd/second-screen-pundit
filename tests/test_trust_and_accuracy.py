@@ -342,7 +342,7 @@ def test_pause_control_pauses_the_broadcast_delay() -> None:
         session = ReplaySession(
             replay_id="pause-replay",
             tab_id="t",
-            client_ip="c",
+            client_ip="testclient",  # TestClient's address
             info=get_match_info("m02"),
             events=events,
             replay=Replay(events, 20),

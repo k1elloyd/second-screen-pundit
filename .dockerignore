@@ -1,0 +1,22 @@
+# Only what the image needs: pyproject, README, the licences, src and data/cached.
+.env
+.env.*
+.venv
+venv
+.git
+.github
+.azure
+.claude
+.pytest_cache
+.playwright-mcp
+**/__pycache__
+**/*.pyc
+docs
+docs/screenshots
+infra
+prompts
+tests
+data/matches
+data/audio
+*.log
+**/*.egg-info

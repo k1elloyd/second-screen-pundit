@@ -12,6 +12,7 @@ dependencies = [
     "agent-framework-foundry==1.15.0",
     "azure-cognitiveservices-speech==1.52.0",
     "azure-identity==1.26.0",
+    "azure-monitor-opentelemetry==1.8.11",
     "fastapi==0.143.2",
     "pydantic==2.14.1",
     "python-multipart==0.0.32",

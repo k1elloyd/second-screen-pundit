@@ -83,6 +83,7 @@ def _session(
     *,
     goal_seq: int,
     released_as_of: int,
+    client_ip: str = "testclient",
 ) -> ReplaySession:
     events = generate_match("m02")
     replay = Replay(events, 20)
@@ -90,13 +91,23 @@ def _session(
     return ReplaySession(
         replay_id=replay_id,
         tab_id="test-client:test-tab",
-        client_ip="testclient",
+        client_ip=client_ip,
         info=get_match_info("m02"),
         events=events,
         replay=replay,
         delay=BroadcastDelay(0),
         viewer_released_as_of=released_as_of,
     )
+
+
+def _get_request(client_ip: str, path: str = "/") -> Request:
+    """A bare request from `client_ip`, for calling a route's endpoint directly."""
+    return Request({
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "GET", "scheme": "http", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "headers": [], "client": (client_ip, 1234),
+        "server": ("127.0.0.1", 8000),
+    })
 
 
 def _wav(seconds: int = 1) -> bytes:
@@ -116,7 +127,12 @@ def test_typed_question_uses_viewer_release_not_newer_agent_position() -> None:
     app = create_app(settings=_settings(), pipeline=pipeline)  # type: ignore[arg-type]
 
     with TestClient(app) as client:
-        session = _session("cutoff-replay", goal_seq=goal.seq, released_as_of=goal.seq - 1)
+        session = _session(
+            "cutoff-replay",
+            goal_seq=goal.seq,
+            released_as_of=goal.seq - 1,
+            client_ip="198.51.100.22",
+        )
         app.state.sessions[session.replay_id] = session
         response = client.post(
             "/api/ask",
@@ -142,7 +158,12 @@ def test_spoken_question_uses_the_same_viewer_cutoff_and_returns_server_audio() 
     )
 
     with TestClient(app) as client:
-        session = _session("spoken-cutoff-replay", goal_seq=goal.seq, released_as_of=goal.seq - 1)
+        session = _session(
+            "spoken-cutoff-replay",
+            goal_seq=goal.seq,
+            released_as_of=goal.seq - 1,
+            client_ip="198.51.100.23",
+        )
         app.state.sessions[session.replay_id] = session
         response = client.post(
             "/api/ask-audio",
@@ -191,7 +212,12 @@ def test_typed_answer_text_returns_at_once_and_its_audio_follows_on_sse() -> Non
     )
 
     with TestClient(app) as client:
-        session = _session("typed-audio-replay", goal_seq=goal.seq, released_as_of=goal.seq)
+        session = _session(
+            "typed-audio-replay",
+            goal_seq=goal.seq,
+            released_as_of=goal.seq,
+            client_ip="198.51.100.24",
+        )
         app.state.sessions[session.replay_id] = session
         response = client.post(
             "/api/ask",
@@ -498,7 +524,7 @@ def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:
                 for route in app.routes
                 if getattr(route, "path", None) == "/api/replays/{replay_id}/stream"
             )
-            response = await route.endpoint(session.replay_id)
+            response = await route.endpoint(session.replay_id, _get_request("testclient"))
             chunks = [await response.body_iterator.__anext__() for _ in range(2)]
             await response.body_iterator.aclose()
             assert not session.stopped  # still inside the grace period
@@ -559,7 +585,7 @@ def test_sse_reports_worker_failure_and_completes_full_time(
             )
             started = await start_endpoint("m02", Request(scope), speed=120)
             session = app.state.sessions[started["replay_id"]]
-            response = await stream_endpoint(started["replay_id"])
+            response = await stream_endpoint(started["replay_id"], Request(scope))
             chunks: list[bytes] = []
             async for chunk in response.body_iterator:
                 chunks.append(chunk)

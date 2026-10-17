@@ -31,8 +31,9 @@ class ViewerOutbox:
         self.put_nowait(message)
 
     def close(self) -> None:
-        """End every stream reading this outbox; later messages are dropped."""
+        """End every stream reading this outbox, and free what it held; later messages are dropped."""
         self.closed = True
+        self._messages.clear()
         self._wake()
 
     def wake(self) -> None:

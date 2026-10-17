@@ -76,7 +76,10 @@ def test_a_replay_with_no_stream_frees_its_slot_after_the_deadline() -> None:
         for index in range(3):
             assert _start(client, f"198.51.100.{70 + index}").status_code == 200
         assert _start(client, "198.51.100.80").status_code == 503
-        time.sleep(0.8)
+        # The deadline is 0.3 s; allow for a loaded test machine before calling it a failure.
+        waited = time.monotonic() + 5
+        while app.state.sessions and time.monotonic() < waited:
+            time.sleep(0.05)
         assert app.state.sessions == {}
         assert _start(client, "198.51.100.80").status_code == 200
 
@@ -96,7 +99,9 @@ def test_a_connected_stream_cancels_the_deadline() -> None:
             }
             routes = {r.path: r.endpoint for r in app.routes if hasattr(r, "endpoint")}
             started = await routes["/api/matches/{match_id}/start"]("m02", Request(scope), speed=1)
-            response = await routes["/api/replays/{replay_id}/stream"](started["replay_id"])
+            response = await routes["/api/replays/{replay_id}/stream"](
+                started["replay_id"], Request(scope)
+            )
             await response.body_iterator.__anext__()
             await asyncio.sleep(0.8)
             alive = started["replay_id"] in app.state.sessions

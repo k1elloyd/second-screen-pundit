@@ -566,3 +566,71 @@ The spec said a replay stops when its SSE client disconnects, with no resume, an
 Mutation checks: with the server ignoring `Last-Event-ID`, the first four fail. With no reconnect grace (a drop stops the replay, as before), the mid-match, spoken-answer and paused tests fail.
 
 **The page's reconnect, in a browser.** Local server, cached mode, `STREAM_MAX_SECONDS=15`, m01 at 60x in Playwright Chromium, Start clicked. The page opened 9 connections; each reconnect sent `Last-Event-ID` (60, 291, 511, …, 1413). It received 1,548 events, each once and in order; 8 lines, 8 cards and 8 line clips queued, none twice; then one recap and one recap clip, and "Replay complete". That's the client code the unit tests can't reach. The deployed gate repeats this at 20x across the real 200 s close.
+
+### Follow-ups after group 1
+
+- **Only the starting client can use a replay.** The replay ID is `uuid4().hex` (122 random bits), but it appears in URLs and in line IDs. The stream, `/control`, `/api/ask` and `/api/ask-audio` now also require the caller's address (the right-most `X-Forwarded-For` entry, as for the limits) to match the address that started the replay; anyone else gets the same 404 as a missing replay. `tests/test_stream_resume.py::test_only_the_starting_client_can_attach_to_or_drive_a_replay` covers a second client, a resume attempt with `Last-Event-ID`, a spoofed `X-Forwarded-For` prefix, `/control` and `/ask`; it fails with the check removed. **Cost:** a phone that changes network mid-match (Wi-Fi to mobile) gets a new address, so its reconnect is refused and it must press Start again.
+- **Memory.** When a replay is stopped (a new Start from the same client, or no reconnect within the grace period) its session is removed, its audio cleared and its outbox emptied. A replay that has reached full time is kept while its tab stays open, so audio Replay and Why? still work; it holds no replay slot. Measured for m01 in cached mode: 1,567 outbox messages, 623 KB of JSON, about 4.5 MB of Python heap with stub audio. Real audio is 160 kbit/s MP3, about 20 KB per spoken second: about 2–3 MB of line audio and 1 MB of recap for a 20x match. Spoken answers add about 200 KB each, so the worst case is set by the question limit (6 a minute) times the match length; the group 3 TTS cap bounds it.
+
+## Phase 4, group 2: infrastructure
+
+### Where it deploys
+
+- `infra/main.bicep` is resource-group scoped (azd's resource-group-scoped deployment, beta on Learn). It creates no resource group. The `preprovision` hook in `azure.yaml` sets `AZURE_RESOURCE_GROUP` to `rg-<environment name>` when unset and fails if that group doesn't exist, so environment `pundit` deploys into the existing `rg-pundit` and azd never offers to create a group.
+- `environmentName` is used only for the `azd-env-name` tag and the resource token (`uniqueString(resourceGroup().id, environmentName, location)`).
+- Region: UK South, a template default that doesn't follow `AZURE_LOCATION`. The model stays in Australia East (the existing Foundry account) and Speech in Sweden Central.
+- `.azure/` is in `.gitignore`.
+- **Checked before deploying:** `azd provision --preview` for `pundit` with `AZURE_RESOURCE_GROUP` unset. The hook set it to `rg-pundit`. The plan creates the Container App, its environment, the registry, Application Insights and Log Analytics in `rg-pundit`, and skips every existing resource.
+
+### Replicas (decision)
+
+- **`maxReplicas: 1`.** Streams, outboxes, replays, pause state and resume positions live in one process's memory. A second replica would receive a reconnect it knows nothing about and break resume. One uvicorn worker, for the same reason.
+- **`minReplicas` is a parameter (`MIN_REPLICAS`), default 1**, so the app stays warm for judging: no cold start, no warm-up page for the first judge. Set 0 to scale to zero outside judging. A restart or new revision ends every replay.
+- 0.5 vCPU and 1 GiB.
+
+### Identity and roles
+
+One user-assigned managed identity; `AZURE_CLIENT_ID` points `DefaultAzureCredential` at it. Roles by GUID (Learn's built-in roles pages), each scoped to its resource:
+
+| Role | GUID | Scope |
+| :-- | :-- | :-- |
+| Foundry User | `53ca6127-db72-4b80-b1b0-d745d6d5456d` | The existing Foundry account (`existingFoundryAccountName` in `existingFoundryResourceGroup`) |
+| Cognitive Services Speech User | `f2dc8367-1007-4938-bd23-fe263f013447` | The existing Speech resource `pundit-speech-swc-kl` |
+| AcrPull | `7f951dda-4ed3-4680-a7ca-43fe172d538d` | The registry |
+| Monitoring Metrics Publisher | `3913510d-42f4-4e42-8a64-420c390055eb` | Application Insights |
+
+The Foundry account, its project and the Speech resource are `existing` references: a missing one fails the deployment, and none is recreated. B7's other path (create a new Foundry account when the names are empty) isn't built; the names are required.
+
+### Settings
+
+Plain container environment variables, no secrets and no keys: `NARRATIVE_MODE`, `FOUNDRY_PROJECT_ENDPOINT` (built from the account's subdomain and project), `MODEL_FAST`, `MODEL_DEEP`, `SPEECH_ENDPOINT` and `SPEECH_REGION` (read from the Speech resource), `SPEECH_VOICE`, `SPEECH_FALLBACK_VOICE`, `AZURE_CLIENT_ID`, `APPLICATIONINSIGHTS_CONNECTION_STRING`, `OTEL_SERVICE_NAME`, `ENABLE_SENSITIVE_DATA=false`, `PORT`. The App Insights connection string contains an instrumentation key, which identifies the resource rather than authorising anything: with local auth disabled, ingestion needs an Entra token.
+- The registry has the admin user off; the app pulls with the identity.
+- The Container Apps environment sends logs through Azure Monitor diagnostic settings to Log Analytics, so it holds no Log Analytics shared key.
+- `.dockerignore` excludes `.env`, `.venv`, `.azure`, `.git`, `docs` (including `docs/screenshots`), `.playwright-mcp`, tests, prompts and infra.
+
+### Image
+
+`python:3.12-slim-bookworm` (Debian 12 is on the Speech SDK's supported list) with `ca-certificates`, `libssl3` and `libasound2`. Non-root user. `WORKDIR /app` with `data/cached` copied in, so the cache path (relative to the working directory) resolves; matches are generated in memory and nothing is written at runtime except temp audio under `/tmp`. `third_party/` is copied so the MIT licence of the adapted grounding code ships with it. Entry point `python -m second_screen_pundit.serve`: logging, then Azure Monitor, then the app, on `0.0.0.0:8000` with one worker.
+
+### Health
+
+`/healthz` reads in-process state only; a test fails if it touches the pipeline or speech. It answers 200 while warming, so startup and readiness don't wait for warm-up and the page can show its warming state. Probes: startup every 3 s for up to 60 s, liveness every 30 s, readiness every 10 s. On the very first provision the app runs a placeholder image with no custom probes until azd deploys the real image (`SERVICE_API_IMAGE_NAME`). The ingress target port is 8000 from the start: `azd deploy` swaps only the image and keeps the port. The first deployment used the placeholder's port 80, and the real revision sat in "Activating" behind it; that's fixed.
+
+### Observability
+
+- `configure_azure_monitor(connection_string=…, credential=ManagedIdentityCredential(client_id=AZURE_CLIENT_ID))`, keyless, with Application Insights `DisableLocalAuth: true`. `azure-monitor-opentelemetry==1.8.11`. App logs under `second_screen_pundit` go to App Insights as traces.
+- Agent Framework 1.22 emits `invoke_agent`, `chat` and `execute_tool` spans by default once a tracer provider exists; no GenAI spans are made by hand.
+- `pundit.turn` wraps each live window, question and recap, with `app.route`, `app.match_id`, `app.as_of`, `app.evidence.status`, `app.outcome` and token totals. `pundit.speech.synthesize` and `pundit.speech.recognize` wrap the speech calls (characters or bytes, delivery tier). No question or answer text goes on a span.
+- No request spans for `/healthz`, `/api/audio/` or the SSE stream (`OTEL_PYTHON_FASTAPI_EXCLUDED_URLS`). The stream alone added one "http send" span per message, about 1,500 a match, and every probe added two.
+- The Azure SDK logger is set to WARNING; at INFO it logged every telemetry export's HTTP headers.
+- **Not yet:** `app.estimated_cost_usd` needs `agents/pricing.py` (dated list prices), which isn't built.
+- **Open (existing code):** the app's own `agent_call` log and the `pundit.turn` token totals read `usage_details` from the workflow response and get `None` in Azure. The `chat` spans carry the real counts (`gen_ai.usage.input_tokens` and `output_tokens`).
+
+### Deployed, 17 Oct 2026
+
+`azd` environment `pundit`, settings `EXISTING_FOUNDRY_ACCOUNT_NAME=second-pundit-resource`, `EXISTING_FOUNDRY_RESOURCE_GROUP=rg-pundit`, `FOUNDRY_PROJECT_NAME=second-pundit`, `EXISTING_SPEECH_ACCOUNT_NAME=pundit-speech-swc-kl`, `MODEL_FAST`/`MODEL_DEEP=gpt-5.4-mini`; `AZURE_RESOURCE_GROUP` set by the hook.
+- `azd up` succeeded (remote ACR build; 5 min 22 s the first time, 2 min 10 s after). `az group list` shows `rg-pundit` and no other `pundit` group.
+- The app: target port 8000, three probes, 0.5 vCPU, 1 GiB, min 1, max 1. `secrets` is null; the registry entry has an identity and no username or password; the environment's logs destination is `azure-monitor` with no Log Analytics configuration; the registry's admin user is off; App Insights `DisableLocalAuth` is true.
+- `/healthz` reported `warmup: ready`, so the identity's Foundry call worked.
+- Smoke test: m01 at 120x from a script. The first line arrived 22.6 s in, its audio followed as `commentary_audio`, and `/api/audio/{id}` returned a 176,640-byte `audio/mpeg`. When the script left, the replay stopped 30 s later (`replay_stream_not_reconnected`).
+- App Insights, last 30 minutes: `chat gpt-5.4-mini` and `pundit.turn` dependencies, `GET /msi/token` (keyless ingestion and model access), and the app's logs as traces.
