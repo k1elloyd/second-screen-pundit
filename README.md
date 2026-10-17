@@ -56,7 +56,7 @@ Start the one-container API and static front end locally. The app begins the Fou
 
 Open `http://127.0.0.1:8000`, select **m02**, set the speed to **20×**, and start the replay. During play, submit one typed question and one push-to-talk question, open **Why?** on a commentary line, then let the match reach full time to see the recap and its audio. The viewer questions are cut off at the latest event released to that browser, and question limits are shared between typed and spoken requests.
 
-Commentary text is sent before its audio is synthesized, so a slow speech service does not hide the line or hold up full time. If a model or speech call fails, the app uses a deterministic commentary fallback or shows text without audio. Interactive model calls default to 8 seconds for live commentary and 10 seconds for questions; `LIVE_WINDOW_TIMEOUT_SECONDS`, `EXPLAINER_TIMEOUT_SECONDS`, and `SPEECH_SYNTHESIS_TIMEOUT_SECONDS` can override those budgets.
+Commentary text is sent before its audio is synthesized, so a slow speech service does not hide the line or hold up full time. If a model or speech call fails, the app uses a deterministic commentary fallback or shows text without audio. Model calls default to 15 seconds for a live commentary window and 20 seconds for a question, each including one retry; `LIVE_WINDOW_TIMEOUT_SECONDS`, `EXPLAINER_TIMEOUT_SECONDS`, and `SPEECH_SYNTHESIS_TIMEOUT_SECONDS` can override those budgets.
 
 The evidence-check number extraction is adapted from Brian Benz's MIT-licensed [football-results-dashboard grounding.py](https://github.com/bbenz/football-results-dashboard/blob/main/agent/grounding.py); its license is retained in `third_party/bbenz_grounding/`.
 

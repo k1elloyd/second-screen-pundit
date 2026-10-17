@@ -325,7 +325,8 @@ def generate_match(match_id: str) -> list[Event]:
         team="home",
         player_id=None,
         event_type="kickoff",
-        detail={"formation": info.home.formation},
+        # No formation: a restart must not undo a first-half formation change.
+        detail={},
     )
     _inject_beats(drafts, story, info.home, info.away)
     _random_play(drafts, info, rng)

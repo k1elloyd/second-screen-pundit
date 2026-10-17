@@ -24,7 +24,7 @@ from second_screen_pundit.agents.tools.parameters import (
     XgTimelineParams,
 )
 from second_screen_pundit.engine.generate import get_match_info
-from second_screen_pundit.engine.schema import Event
+from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import team_name
 
 
@@ -221,7 +221,8 @@ def _formation_at(events: list[Event], team: Team, minute: int) -> tuple[str, li
         event
         for event in events
         if event.team == team
-        and event.type in {"kickoff", "formation_change"}
+        # Only the opening kick-off sets a starting shape; later restarts never reset it.
+        and (event.type == "formation_change" or (event.type == "kickoff" and event.period == 1))
         and _in_window(event, 0, minute + 1)
         and isinstance(event.detail.get("formation"), str)
     ]
@@ -705,6 +706,152 @@ def match_context(
             )
         )
     return ToolResult(tool="match_context", facts=facts)
+
+
+SNAPSHOT_RECENT_MINUTES = 15
+SNAPSHOT_MOMENTS = 5
+_FULL_SQUAD = 11
+
+
+def _player(info: MatchInfo, team: str | None, player_id: str | None) -> str | None:
+    if team not in {"home", "away"} or player_id is None:
+        return None
+    squad = info.home if team == "home" else info.away
+    return next((p.get("name") for p in squad.players if p.get("id") == player_id), None)
+
+
+def match_snapshot(
+    events: list[Event],
+    *,
+    as_of: int,
+    moments: int = SNAPSHOT_MOMENTS,
+    minor: bool = True,
+) -> list[ToolResult]:
+    """What the viewer has seen so far, as cited facts: the Explainer's and Recap's starting point.
+
+    The first result holds the clock, score, formations and per-team possession (whole match
+    and the last 15 minutes), shots, xG, cards and players on the pitch. Then one result per
+    key moment (the last ``moments``, in match order), so each keeps its own event ID under
+    the five-ID evidence cap. A moment's table row describes it in words for the prompt.
+    ``minor=False`` leaves out yellow cards and big chances (the recap's turning points).
+    """
+    visible = _visible(events, as_of)
+    if not visible:
+        raise ValueError("match_snapshot requires at least one visible event")
+    info = get_match_info(visible[0].match_id)
+    clock_result = match_context(events, as_of=as_of)
+    latest = max(visible, key=lambda event: event.seq)
+    clock = latest.minute + latest.added_minute
+    goals = [event for event in visible if event.type == "goal"]
+    shots = [event for event in visible if event.type == "shot"]
+    cards = [event for event in visible if event.type == "card"]
+    names = {team: _team_name(visible, team) for team in ("home", "away")}
+    home_goals = sum(event.team == "home" for event in goals)
+    facts = [
+        *clock_result.facts,
+        _fact("match_snapshot", f"Match-level score through {clock}'", f"{home_goals}-{len(goals) - home_goals}", None, goals),
+    ]
+    for team in ("home", "away"):
+        formation, formation_events = _formation_at(visible, team, clock)
+        facts.append(
+            _fact("match_snapshot", f"{names[team]} formation through {clock}'", formation, None, formation_events)
+        )
+    recent_start = max(0, clock - SNAPSHOT_RECENT_MINUTES)
+    recent = [event for event in visible if _in_window(event, recent_start, clock + 1)]
+    for team in ("home", "away"):
+        name = names[team]
+        team_shots = [event for event in shots if event.team == team]
+        on_target = [event for event in team_shots if event.outcome == "success"]
+        team_cards = [event for event in cards if event.team == team]
+        reds = [event for event in team_cards if event.detail.get("colour") == "red"]
+        possession, possession_events = _possession(visible, team)
+        recent_possession, recent_events = _possession(recent, team)
+        facts.extend([
+            _fact("match_snapshot", f"{name} possession through {clock}'", possession, "%", possession_events),
+            _fact("match_snapshot", f"{name} possession, {recent_start}-{clock + 1}'", recent_possession, "%", recent_events),
+            _fact("match_snapshot", f"{name} shots through {clock}'", len(team_shots), "shots", team_shots),
+            _fact("match_snapshot", f"{name} shots on target through {clock}'", len(on_target), "shots", on_target),
+            _fact("match_snapshot", f"{name} xG through {clock}'", round(sum(event.xg or 0 for event in team_shots), 3), "xG", team_shots),
+            _fact("match_snapshot", f"{name} cards through {clock}'", len(team_cards), "cards", team_cards),
+            _fact("match_snapshot", f"{name} players on the pitch through {clock}'", _FULL_SQUAD - len(reds), "players", reds),
+        ])
+    results = [ToolResult(tool="match_snapshot", facts=facts)]
+
+    goal_shot_ids = {related for goal in goals for related in goal.related_event_ids}
+    chosen = [
+        event
+        for event in visible
+        if event.type in {"goal", "formation_change", "substitution"}
+        or (event.type == "card" and (minor or event.detail.get("colour") == "red"))
+        or (
+            minor
+            and event.type == "shot"
+            and is_big_chance(event.xg)
+            and event.event_id not in goal_shot_ids
+        )
+    ][-moments:] if moments else []
+    for event in chosen:
+        minute = event.minute + event.added_minute
+        name = names[event.team] if event.team in names else "Match-level"
+        short = team_name(info, event.team).short if event.team else ""
+        player = _player(info, event.team, event.player_id) or "a player"
+        moment_facts: list[Fact] = []
+        if event.type == "goal":
+            context = goal_context(visible, event)
+            own_goal = " (own goal)" if event.detail.get("own_goal") else ""
+            moment_facts.append(_fact("match_snapshot", f"{name} goal at {minute}'", context, None, [event]))
+            shot = next(
+                (item for item in visible if item.event_id in event.related_event_ids and item.type == "shot"),
+                None,
+            )
+            chance = chance_descriptor(shot.xg) if shot is not None else None
+            # The running score, so a recap can tell a comeback ("Port Calder lead 2-0").
+            so_far = [goal for goal in goals if goal.seq <= event.seq]
+            home_so_far = sum(goal.team == "home" for goal in so_far)
+            away_so_far = len(so_far) - home_so_far
+            moment_facts.append(
+                _fact("match_snapshot", f"Match-level score after the goal at {minute}'", f"{home_so_far}-{away_so_far}", None, [event])
+            )
+            if home_so_far == away_so_far:
+                running = f"level at {home_so_far}-{away_so_far}"
+            elif home_so_far > away_so_far:
+                running = f"{team_name(info, 'home').short} lead {home_so_far}-{away_so_far}"
+            else:
+                running = f"{team_name(info, 'away').short} lead {away_so_far}-{home_so_far}"
+            description = (
+                f"{player} scores for {short}{own_goal}: the {context}"
+                + (f", converting {chance}" if chance else "")
+                + f"; {running}"
+            )
+        elif event.type == "card":
+            colour = str(event.detail.get("colour", "yellow"))
+            moment_facts.append(_fact("match_snapshot", f"{name} {colour} card at {minute}'", f"{colour} card", None, [event]))
+            description = (
+                f"{player} of {short} is sent off" if colour == "red" else f"{player} of {short} is booked"
+            )
+        elif event.type == "formation_change":
+            before, _ = _formation_at([item for item in visible if item.seq < event.seq], event.team, minute)  # type: ignore[arg-type]
+            after = str(event.detail.get("formation"))
+            moment_facts.append(_fact("match_snapshot", f"{name} formation change at {minute}'", after, None, [event]))
+            moment_facts.append(_fact("match_snapshot", f"{name} formation before the change at {minute}'", before, None, [event]))
+            description = f"{short} change shape from {before} to {after}"
+        elif event.type == "substitution":
+            player_on = _player(info, event.team, event.detail.get("player_on")) or "a substitute"
+            player_off = _player(info, event.team, event.detail.get("player_off")) or "a player"
+            moment_facts.append(_fact("match_snapshot", f"{name} substitution at {minute}'", "substitution", None, [event]))
+            description = f"{player_on} replaces {player_off} for {short}"
+        else:
+            on_target = "on target" if event.outcome == "success" else "off target"
+            moment_facts.append(_fact("match_snapshot", f"{name} big chance at {minute}'", "big chance", None, [event]))
+            description = f"{player} has a big chance for {short}, {on_target}"
+        results.append(
+            ToolResult(
+                tool="match_snapshot",
+                facts=moment_facts,
+                table=[{"fact_id": moment_facts[0].fact_id, "minute": minute, "description": description}],
+            )
+        )
+    return results
 
 
 TOOL_PARAMETERS: dict[str, type[BaseModel]] = {

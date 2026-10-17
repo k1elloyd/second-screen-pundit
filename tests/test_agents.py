@@ -469,9 +469,11 @@ def test_question_and_recap_fall_back_after_agent_or_tool_errors(
         result = asyncio.run(pipeline.produce_recap(info, events, as_of=as_of))
         notice = result.recap.notice
 
-    assert result.attempts == (1 if operation == "question" else 2)
+    # One retry after an exception, then verified facts with a plain notice.
+    assert result.attempts == 2
+    assert result.source == "fallback"
     assert result.evidence.passed
-    assert notice is not None and type(error).__name__ in notice
+    assert notice is not None and type(error).__name__ not in notice
 
 
 @pytest.mark.parametrize(
@@ -996,10 +998,10 @@ def test_shared_factory_sets_required_options_for_each_role(monkeypatch: pytest.
         options = captured["default_options"]
         assert options["store"] is False
         assert options["include"] == ["reasoning.encrypted_content"]
-        if role in {"director", "commentator"}:
-            assert options["reasoning"] == {"effort": "low"}
-        else:
+        if role == "analyst":
             assert "reasoning" not in options
+        else:
+            assert options["reasoning"] == {"effort": "low"}
 
 
 def test_factory_honours_reasoning_override_and_shared_client(

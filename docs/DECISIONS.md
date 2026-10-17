@@ -359,3 +359,45 @@ Also seen in the emitted lines:
 - m01 meets all of them, but its fast-path median of 3,938 ms is only just under 4 s.
 
 **New in the emitted lines:** with the variety rules out of the prompt, the model states the minute in most lines, as "At N minutes" or "at N minutes" (8 of 10 agent lines in m01, 6 of 8 in m02), and sometimes adds "N minutes left". At 74' in m01 it used the word "consolation" for a goal that pulled one back mid-match.
+
+## Phase 3: review 2 fixes
+
+Scope: findings 1, 2, 3, 4 (items 1–4), 6 (prompt and ID validation) and 15 of `docs/reviews/review-2-opus.md`.
+
+### Changes
+
+- **Viewer snapshot.** `match_snapshot` computes, at the viewer's released position, the clock, score, both formations, per-team possession (whole match and the last 15 minutes), shots, shots on target, xG, cards and players on the pitch, plus the last 5 key moments. Each moment has a plain description (scorer, goal context, chance quality, running score, previous and new formation) and is its own `ToolResult`, so it keeps its event ID under the five-ID cap. The Explainer prompt carries this snapshot, `viewer_clock` and a deterministic `score_phrase`.
+- **Explainer reply.** The model returns `ExplainerReply { answer, fact_ids }` only. Facts are shown to it as short aliases (`F1`…), including tool results (the capture middleware restores the real IDs). The server maps aliases back, derives event IDs from the cited facts, and lists the cited facts as deterministic claims. `xg_timeline` is not offered to the Explainer.
+- **Snapshot facts are cited by the server.** Every snapshot fact given to the Explainer or the Recap Producer is cited for its output, as the live Analyst path does for the score. The spec grounds a number in "this run's tool results", and the models listed the facts they used unreliably: in live runs an answer stated the score and previous formation without their IDs, and a recap quoted shot counts and xG without theirs. The number check is unchanged: a matching value, with the team and metric named in the same sentence. Facts from tool calls the model makes must still be cited by the model.
+- **Caps and budget.** `reasoning.effort: low` for both. Explainer `max_tokens` 1,500; Recap 2,500 (one recap hit 1,500 and stopped with `finish_reason=length`; a later one used 1,576). `finish_reason` is logged per call and returned in each answer payload. `EXPLAINER_TIMEOUT_SECONDS` is 20 and `LIVE_WINDOW_TIMEOUT_SECONDS` 15 again (the spec values). An exception now retries once, with the parse error as feedback.
+- **Text before audio.** `/api/ask` returns the checked text at once (no TTS, as before). `/api/ask-audio` returns `202 {question_id, transcript}` as soon as speech-to-text finishes; the answer follows on the replay's SSE stream as `answer`, then its audio as `answer_audio` (or `answer_audio_unavailable` / `answer_error`). The 30-second limit covers STT plus the answer.
+- **Out of scope.** A question with betting terms or a denylisted real name gets a fixed reply with no model call.
+- **Content filter.** It blocks only the hashed real-name denylist (possessives folded) and betting terms ("odds", except "against the odds"/"against all odds"; "stakes" no longer matches). The capitalised-word heuristic is gone. It runs only on the model-written answer, never on notices or deterministic fact text. Viewer-facing notices and errors no longer contain exception class names.
+- **Formation reset.** The 46' kick-off carries no formation, and `_formation_at` reads only the period-1 kick-off, so stale event logs are also correct. m02's home formation at 60' is 4-4-1.
+- **Recap.** The prompt carries a winner-first `score_phrase` ("Merehaven Athletic win 2-1"), the clock facts, the stats and every turning point (goals, red cards, formation changes, substitutions) with minute, event IDs, description and running score. Every ID the model returns is checked against the listed facts and the released events: an event ID among `fact_ids` (or an F ID among `event_ids`) is moved to the right list, and any other ID gets retry feedback naming it. Evidence failures in Q&A and the recap get a one-line fix hint per failure kind. The instructions limit statistics and say how to tell a comeback.
+- **Evidence check.** For answers and recaps only, a minute is grounded by the clock of a cited event (the spec's "or the minute of a cited event") or by a minute in a cited fact's label, such as its window `59-75'`; live lines keep the clock-fact rule. A score never ends in `'`, so `59-75'` is no longer read as a score. "men" counts as the players metric.
+
+### Live gate: m02 at 20x, the review's 8 questions
+
+Same questions and viewer clocks as review 2, final code. Time to text runs from the request to the checked answer text; for the spoken question, to the `answer` SSE event, with the transcript returned first.
+
+| Viewer clock | Question | Source | Attempts | finish_reason | Time to text |
+| :-- | :-- | :-- | --: | :-- | --: |
+| 15' | Who has had the better of the chances so far? | model | 1 | stop | 4.3 s |
+| 30' | How did Port Calder score their goal? | model | 1 | stop | 3.0 s |
+| 42' | spoken: What changed for Port Calder after the red card? | model | 1 | stop | 6.3 s (transcript 3.4 s, audio 8.7 s) |
+| 50' | What changed for Port Calder after the red card? | model | 1 | stop | 3.4 s |
+| 58' | What are the odds Merehaven win this? | fixed reply | 0 | – | 0.004 s |
+| 66' | Is Merehaven's pressing better than Liverpool's? | fixed reply | 0 | – | 0.006 s |
+| 74' | Why are Merehaven camped in the final third? | model | 1 | stop | 3.2 s |
+| 84' | What formation are Port Calder playing now? | model | 1 | stop | 2.5 s |
+
+6 of 8 got a model answer (target: at least 6); the other 2 are out of scope by design. Explainer calls: 2.4–4.2 s, input 1,767–2,191 tokens, output 106–231 (32–134 reasoning). The 84' answer: "Port Calder FC are now set up in a 4-4-1, having changed from a 4-2-3-1 in the 39th minute."
+
+The recap was agent-written on its second attempt (the first failed on an ungrounded "19"; calls 13.6 s and 9.8 s, `finish_reason=stop`):
+
+> **Merehaven rally late to seize the points.** Port Calder FC led through Brio Fallowmere's opener in the 27th minute, then Quen Rillstone's red card in the 38th minute forced a reshuffle to 4-4-1. Merehaven Athletic struck back in the 54th minute and completed the turnaround in the 82nd, and Merehaven Athletic win 2-1. Port Calder FC had 19 shots and 7 on target. Merehaven Athletic had 33 shots and 3.919 xG.
+
+**Earlier runs while fixing.** Run 1 (headline facts not auto-cited): 5 of 8; the 50' answer stated the score and previous formation without citing them. Run 2 (headline facts auto-cited): 6 of 8, recap agent-written. Run 3 (after adding running scores and the recap story rule): 5 of 8 and a fallback recap; the 74' answer quoted the window `59-75'`, which the check read as a score, and both recap attempts used uncited snapshot stats. Run 4 is the table above. Separately, 8 standalone recaps after the recap changes: m01 3 of 3 agent-written, m02 4 of 5 (the miss was the `length` cut-off that led to the 2,500 cap), m03 1 of 1.
+
+Full suite: 170 passed, 3 deselected (live). The live `test_live_m01_recap_is_agent_written` passed.

@@ -49,6 +49,7 @@ from second_screen_pundit.agents.commentator import (
     validate_plain_spoken_text,
 )
 from second_screen_pundit.agents.config import AgentSettings
+from second_screen_pundit.agents.content_filter import OUT_OF_SCOPE_ANSWER, question_scope_reason
 from second_screen_pundit.agents.delivery import TIER_TONES, tier_for_event, tier_for_signals
 from second_screen_pundit.agents.evidence import EvidenceReport, check_evidence, mentions_score
 from second_screen_pundit.agents.fallbacks import fallback_lines
@@ -57,10 +58,12 @@ from second_screen_pundit.agents.models import (
     CommentaryLine,
     CommentaryReply,
     DirectorDecision,
+    ExplainerReply,
     Explanation,
     Insight,
     Recap,
     RecapMoment,
+    RecapReply,
 )
 from second_screen_pundit.agents.prompts import (
     ANALYST_INSTRUCTIONS,
@@ -81,6 +84,7 @@ from second_screen_pundit.agents.tools.analytics import (
     is_big_chance,
     key_moments,
     match_context,
+    match_snapshot,
     match_state,
 )
 from second_screen_pundit.agents.tools.parameters import KeyMomentsParams, MatchStateParams
@@ -117,12 +121,18 @@ class LiveWindowResult:
     output_failures: tuple[str, ...] = ()
 
 
+AnswerSource = Literal["agent", "fallback", "out_of_scope", "cached"]
+
+
 @dataclass(frozen=True)
 class QuestionResult:
     explanation: Explanation
     tool_results: tuple[ToolResult, ...]
     evidence: EvidenceReport
     attempts: int
+    # Only "agent" text is model-written; the content filter runs on nothing else.
+    source: AnswerSource = "fallback"
+    timings: tuple[AgentCallTiming, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -131,6 +141,8 @@ class RecapResult:
     tool_results: tuple[ToolResult, ...]
     evidence: EvidenceReport
     attempts: int
+    source: AnswerSource = "fallback"
+    timings: tuple[AgentCallTiming, ...] = ()
 
 
 def is_must_say(event: Event, events: Sequence[Event] = ()) -> bool:
@@ -339,6 +351,196 @@ def _deterministic_results(events: list[Event], as_of: int) -> list[ToolResult]:
     ]
 
 
+def _fact_claim(fact: Fact) -> Claim:
+    """A deterministic one-line statement of a fact, for the evidence list under an answer."""
+    label = re.sub(
+        r"\s+(?:through|at)\s+\d+'$|,\s*\d+-\d+'(?:\s+vs\s+\d+-\d+')?$",
+        "",
+        fact.label,
+    )
+    return Claim(
+        text=f"{label}: {fact.value}{f' {fact.unit}' if fact.unit else ''}.",
+        fact_ids=[fact.fact_id],
+        event_ids=fact.event_ids,
+    )
+
+
+class _FactAliases:
+    """Short names (F1, F2, ...) for fact IDs in a prompt, mapped back on the server.
+
+    Real fact IDs are long hashes; copying them cost output tokens and invited typos.
+    """
+
+    def __init__(self) -> None:
+        self._by_fact: dict[str, str] = {}
+        self._by_alias: dict[str, str] = {}
+
+    def alias(self, fact_id: str) -> str:
+        if fact_id not in self._by_fact:
+            alias = f"F{len(self._by_fact) + 1}"
+            self._by_fact[fact_id] = alias
+            self._by_alias[alias] = fact_id
+        return self._by_fact[fact_id]
+
+    def real(self, alias: str) -> str | None:
+        return self._by_alias.get(alias.strip())
+
+    def present(self, result: ToolResult) -> ToolResult:
+        return result.model_copy(
+            update={
+                "facts": [
+                    fact.model_copy(update={"fact_id": self.alias(fact.fact_id)})
+                    for fact in result.facts
+                ]
+            }
+        )
+
+    def restore(self, result: ToolResult) -> ToolResult:
+        return result.model_copy(
+            update={
+                "facts": [
+                    fact.model_copy(update={"fact_id": self.real(fact.fact_id) or fact.fact_id})
+                    for fact in result.facts
+                ]
+            }
+        )
+
+
+def _prompt_facts(
+    results: Sequence[ToolResult],
+    aliases: _FactAliases,
+    *,
+    moment_event_ids: bool = False,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Snapshot facts and key moments as the model sees them, with aliased IDs."""
+    facts: list[dict[str, object]] = []
+    moments: list[dict[str, object]] = []
+    for result in results:
+        rows = {str(row.get("fact_id")): row for row in result.table or []}
+        for fact in result.facts:
+            item: dict[str, object] = {
+                "id": aliases.alias(fact.fact_id),
+                "label": fact.label,
+                "value": fact.value,
+            }
+            if fact.unit:
+                item["unit"] = fact.unit
+            if fact.spoken_value is not None and fact.spoken_value != fact.value:
+                item["spoken_value"] = fact.spoken_value
+            row = rows.get(fact.fact_id)
+            if row is None:
+                facts.append(item)
+                continue
+            moment = {**item, "minute": row["minute"], "description": row["description"]}
+            if moment_event_ids:
+                moment["event_ids"] = fact.event_ids
+            moments.append(moment)
+    return facts, moments
+
+
+def full_time_score_phrase(info: MatchInfo, score: str) -> str:
+    """The final score, winner first: 'Merehaven Athletic win 2-1' or 'X and Y draw 1-1'."""
+    home_score, away_score = (int(value) for value in score.split("-", maxsplit=1))
+    if home_score > away_score:
+        return f"{team_display_name(info, 'home')} win {home_score}-{away_score}"
+    if away_score > home_score:
+        return f"{team_display_name(info, 'away')} win {away_score}-{home_score}"
+    return (
+        f"{team_display_name(info, 'home')} and {team_display_name(info, 'away')} "
+        f"draw {home_score}-{away_score}"
+    )
+
+
+def _snapshot_score(results: Sequence[ToolResult]) -> Fact:
+    return next(
+        fact
+        for result in results
+        for fact in result.facts
+        if fact.label.startswith("Match-level score")
+    )
+
+
+def _workflow_response(result: object) -> object | None:
+    """The agent response a single-agent workflow produced, or None."""
+    for name in ("get_outputs", "get_intermediate_outputs"):
+        getter = getattr(result, name, None)
+        if getter is None:
+            continue
+        for output in getter():
+            response = getattr(output, "agent_response", output)
+            if hasattr(response, "value"):
+                return response
+    return None
+
+
+def _finish_reason(response: object | None) -> str | None:
+    reason = getattr(response, "finish_reason", None)
+    reason = getattr(reason, "value", reason)
+    return str(reason).casefold() if reason is not None else None
+
+
+def _failure_detail(error: BaseException) -> tuple[str, bool]:
+    """Model-facing retry detail for an exception, and whether it looks like a cut-off reply."""
+    cause: BaseException | None = error
+    while cause is not None:
+        if isinstance(cause, ValidationError):
+            text = " ".join(str(cause).split())
+            return text[:240], "EOF while parsing" in text
+        cause = cause.__cause__
+    return type(error).__name__, False
+
+
+async def _run_single_agent(
+    agent: Agent,
+    prompt: str,
+    *,
+    role: AgentRole,
+    attempt: int,
+    timings: list[AgentCallTiming],
+    match_id: str,
+    as_of: int,
+) -> object | None:
+    """Run one agent as a one-executor workflow and record its timing and finish_reason."""
+    workflow = WorkflowBuilder(start_executor=AgentExecutor(agent)).build()
+    started = time.perf_counter()
+    response: object | None = None
+    finish_reason: str | None = "error"
+    try:
+        run_result = await workflow.run(Message(role="user", contents=prompt))
+        response = _workflow_response(run_result)
+        finish_reason = _finish_reason(response) or ("no_response" if response is None else None)
+        return response
+    except Exception as exc:
+        if _failure_detail(exc)[1]:
+            finish_reason = "length"
+        raise
+    finally:
+        usage = getattr(response, "usage_details", None) or {}
+        timing = AgentCallTiming(
+            role=role,
+            attempt=attempt,
+            duration_ms=round((time.perf_counter() - started) * 1000),
+            input_tokens=usage.get("input_token_count"),
+            output_tokens=usage.get("output_token_count"),
+            reasoning_tokens=usage.get("reasoning_output_token_count"),
+            finish_reason=finish_reason,
+        )
+        timings.append(timing)
+        logger.info(
+            "agent_call role=%s match_id=%s as_of=%d attempt=%d duration_ms=%d "
+            "input_tokens=%s output_tokens=%s reasoning_tokens=%s finish_reason=%s",
+            role,
+            match_id,
+            as_of,
+            attempt,
+            timing.duration_ms,
+            timing.input_tokens,
+            timing.output_tokens,
+            timing.reasoning_tokens,
+            finish_reason,
+        )
+
+
 def _fallback_explanation(
     results: Sequence[ToolResult],
     *,
@@ -346,22 +548,7 @@ def _fallback_explanation(
 ) -> Explanation:
     facts_by_id = _result_fact_map(results)
     selected = list(facts_by_id.values())[:5]
-
-    def display_label(fact: Fact) -> str:
-        return re.sub(
-            r"\s+(?:through|at)\s+\d+'$|,\s*\d+-\d+'(?:\s+vs\s+\d+-\d+')?$",
-            "",
-            fact.label,
-        )
-
-    claims = [
-        Claim(
-            text=f"{display_label(fact)}: {fact.value}{f' {fact.unit}' if fact.unit else ''}.",
-            fact_ids=[fact.fact_id],
-            event_ids=fact.event_ids,
-        )
-        for fact in selected
-    ]
+    claims = [_fact_claim(fact) for fact in selected]
     return Explanation(
         answer="Live answers are unavailable; verified match facts follow.",
         claims=claims,
@@ -432,6 +619,121 @@ def _fallback_recap(
         fact_ids=citations,
         event_ids=cited_events,
     )
+
+
+RECAP_MOMENTS = 12
+
+_RETRY_HINTS = (
+    ("ungrounded number", "Use only numbers that are fact values; give a minute only for a listed key moment."),
+    ("score", "State the score only as score_phrase, word for word."),
+    ("formation", "Write a formation exactly as a fact value, with that team named in the sentence."),
+    ("per cent", "Write each percentage with %."),
+    ("fact_id", "Cite only the listed F IDs."),
+)
+
+
+def _retry_feedback(failures: Sequence[str]) -> str:
+    """The evidence failures, plus one plain instruction per kind of failure."""
+    hints = [
+        hint
+        for key, hint in _RETRY_HINTS
+        if any(key in failure for failure in failures)
+    ]
+    return "; ".join(failures) + (". " + " ".join(hints) if hints else "")
+
+
+def _snapshot_fact_ids(snapshot: Sequence[ToolResult]) -> list[str]:
+    """Every snapshot fact the model was given, cited for it.
+
+    The spec grounds each number in "this run's tool results"; the snapshot is one, computed
+    by the server. Models listed the facts they used unreliably (a recap quoted the shot
+    counts and xG without their IDs), so the server cites them all. The number check still
+    needs a matching value with the team and metric named in the same sentence. Facts from
+    tool calls the model made must still be cited by the model.
+    """
+    return [fact.fact_id for result in snapshot for fact in result.facts]
+
+
+def _recap_from_reply(
+    reply: RecapReply,
+    aliases: _FactAliases,
+    results: Sequence[ToolResult],
+    events: list[Event],
+    *,
+    as_of: int,
+    given_fact_ids: Sequence[str],
+) -> tuple[Recap | None, list[str]]:
+    """Map fact aliases back and check every ID against the facts and the released events.
+
+    An ID in the wrong list (an event ID among fact_ids, or an F ID among event_ids) is moved
+    to the right one; an ID that is neither gives retry feedback naming it.
+    """
+    facts_by_id = _result_fact_map(results)
+    released = {event.event_id for event in events if event.seq <= as_of}
+    problems: list[str] = []
+    fact_ids: list[str] = []
+    event_ids: list[str] = []
+
+    def place(identifier: str, field: str) -> list[str]:
+        """The event IDs an identifier stands for; a fact alias is also cited as a fact."""
+        fact_id = aliases.real(identifier)
+        if fact_id is not None and fact_id in facts_by_id:
+            fact_ids.append(fact_id)
+            return list(facts_by_id[fact_id].event_ids)
+        if identifier in released:
+            return [identifier]
+        problems.append(
+            f"{field} contains {identifier!r}, which is neither a listed F ID nor a listed "
+            "event ID"
+        )
+        return []
+
+    for identifier in reply.fact_ids:
+        event_ids.extend(place(identifier, "fact_ids"))
+    for identifier in reply.event_ids:
+        event_ids.extend(place(identifier, "event_ids"))
+    moments: list[RecapMoment] = []
+    for moment in reply.key_moments:
+        moment_events = [
+            event_id
+            for identifier in moment.event_ids
+            for event_id in place(identifier, f"key moment at {moment.minute}' event_ids")
+        ]
+        if moment_events:
+            moments.append(
+                moment.model_copy(
+                    update={
+                        "text": " ".join(moment.text.split()),
+                        "event_ids": list(dict.fromkeys(moment_events)),
+                    }
+                )
+            )
+    if problems:
+        return None, problems
+    fact_ids = list(dict.fromkeys([*fact_ids, *given_fact_ids]))
+    event_ids = list(
+        dict.fromkeys(
+            [
+                *event_ids,
+                *(event_id for moment in moments for event_id in moment.event_ids),
+            ]
+        )
+    )
+    try:
+        recap = Recap(
+            headline=" ".join(reply.headline.split()),
+            summary=" ".join(reply.summary.split()),
+            key_moments=moments,
+            audio_script=" ".join(reply.audio_script.split()),
+            fact_ids=fact_ids,
+            event_ids=event_ids,
+        )
+    except ValidationError as exc:
+        return None, [
+            f"{'.'.join(str(part) for part in item['loc']) or 'recap'}: {item['msg']}"
+            for item in exc.errors()
+        ]
+    return recap, []
 
 
 class PunditPipeline:
@@ -1356,6 +1658,8 @@ class PunditPipeline:
     ) -> QuestionResult:
         if len(question) > 300:
             raise ValueError("Question must not exceed 300 characters")
+        if question_scope_reason(question) is not None:
+            return self.out_of_scope_question()
         if self.settings.mode == "cached":
             return self._cached_question(info, events, question, as_of)
         if self.settings.mode == "off":
@@ -1370,18 +1674,47 @@ class PunditPipeline:
             )
 
         deadline = self.settings.explainer_timeout_seconds
-        accumulated_results: list[ToolResult] = []
+        snapshot = await asyncio.to_thread(match_snapshot, events, as_of=as_of)
+        aliases = _FactAliases()
+        snapshot_facts, snapshot_moments = _prompt_facts(snapshot, aliases)
+        visible = [event for event in events if event.seq <= as_of]
+        latest = max(visible, key=lambda event: event.seq)
+        score = str(_snapshot_score(snapshot).value)
+        finished = any(event.type == "full_time" for event in visible)
+        prompt_base = {
+            "match": {
+                "home": info.home.name,
+                "away": info.away.name,
+                "stadium": info.stadium,
+            },
+            "viewer_clock": "full time" if finished else f"{latest.minute + latest.added_minute}'",
+            "score_phrase": (
+                full_time_score_phrase(info, score) if finished else score_phrase(info, score)
+            ),
+            "facts": snapshot_facts,
+            "key_moments": snapshot_moments,
+            "question": question,
+        }
+        given_fact_ids = _snapshot_fact_ids(snapshot)
+        accumulated_results: list[ToolResult] = list(snapshot)
+        timings: list[AgentCallTiming] = []
         feedback = ""
-        last_failure: str | None = None
         attempt_count = 0
+        started = time.perf_counter()
 
         async def attempts() -> QuestionResult | None:
-            nonlocal feedback, last_failure, attempt_count
-            for attempt in range(2):
-                attempt_count = attempt + 1
+            nonlocal feedback, attempt_count
+            for attempt in (1, 2):
+                attempt_count = attempt
                 capture = None
                 try:
-                    tools, capture = build_analytics_tools(events, as_of=as_of)
+                    tools, capture = build_analytics_tools(
+                        events,
+                        as_of=as_of,
+                        exclude={"xg_timeline"},
+                        present=aliases.present,
+                        restore=aliases.restore,
+                    )
                     explainer = self._agent(
                         "explainer",
                         EXPLAINER_INSTRUCTIONS,
@@ -1389,89 +1722,146 @@ class PunditPipeline:
                         middleware=[capture],
                         time_budget=deadline,
                     )
-                    workflow = WorkflowBuilder(start_executor=AgentExecutor(explainer)).build()
-                    prompt = json.dumps(
-                        {
-                            "match": {
-                                "id": info.match_id,
-                                "home": info.home.name,
-                                "away": info.away.name,
-                            },
-                            "question": question,
-                            "retry_feedback": feedback,
-                        }
-                    )
-                    run_result = await workflow.run(
-                        Message(role="user", contents=prompt)
+                    response = await _run_single_agent(
+                        explainer,
+                        json.dumps({**prompt_base, "retry_feedback": feedback}),
+                        role="explainer",
+                        attempt=attempt,
+                        timings=timings,
+                        match_id=info.match_id,
+                        as_of=as_of,
                     )
                 except Exception as exc:
-                    last_failure = type(exc).__name__
+                    detail, truncated = _failure_detail(exc)
                     logger.warning(
                         "question_agent_failed match_id=%s as_of=%d attempt=%d error=%s",
                         info.match_id,
                         as_of,
-                        attempt_count,
-                        last_failure,
+                        attempt,
+                        type(exc).__name__,
                     )
-                    break
+                    feedback = (
+                        "The previous reply was cut off; keep the answer short and list each "
+                        "fact ID once."
+                        if truncated
+                        else f"The previous reply failed ({detail}). Return answer and fact_ids "
+                        "only, with valid tool arguments."
+                    )
+                    continue
                 finally:
                     if capture is not None:
                         accumulated_results.extend(capture.results)
-                explanation = next(
-                    (
-                        model
-                        for model in _workflow_models(run_result)
-                        if isinstance(model, Explanation)
-                    ),
-                    None,
+                reply = _parsed(response, ExplainerReply)
+                if reply is None:
+                    feedback = _invalid_output("ExplainerReply")
+                    continue
+                explanation, problems = self._explanation_from_reply(
+                    reply, aliases, accumulated_results, given_fact_ids
                 )
-                if explanation is not None:
-                    report = check_evidence(
+                if explanation is None:
+                    feedback = "; ".join(problems)
+                    continue
+                report = check_evidence(
+                    explanation,
+                    events=events,
+                    as_of=as_of,
+                    tool_results=accumulated_results,
+                    info=info,
+                )
+                if report.passed:
+                    return QuestionResult(
                         explanation,
-                        events=events,
-                        as_of=as_of,
-                        tool_results=accumulated_results,
-                        info=info,
+                        tuple(accumulated_results),
+                        report,
+                        attempt,
+                        source="agent",
+                        timings=tuple(timings),
                     )
-                    if report.passed:
-                        return QuestionResult(
-                            explanation,
-                            tuple(accumulated_results),
-                            report,
-                            attempt + 1,
-                        )
-                    feedback = "; ".join(report.failures)
-                else:
-                    feedback = "The workflow did not return a structured Explanation."
+                logger.info(
+                    "question_evidence_failed match_id=%s as_of=%d attempt=%d failures=%s",
+                    info.match_id,
+                    as_of,
+                    attempt,
+                    "; ".join(report.failures),
+                )
+                feedback = _retry_feedback(report.failures)
             return None
 
         try:
             result = await asyncio.wait_for(attempts(), timeout=deadline)
+            notice = "The answer could not be verified; verified match facts are shown instead."
         except TimeoutError:
-            deterministic = _deterministic_results(events, as_of)
-            return self.fallback_question(
-                info,
-                events,
-                as_of,
-                deterministic,
-                "The question exceeded its time budget; verified facts are shown instead.",
-                attempt_count,
+            result = None
+            notice = "The answer took too long; verified match facts are shown instead."
+        if result is None:
+            fallback = self.fallback_question(
+                info, events, as_of, snapshot, notice, attempt_count
             )
-        if result is not None:
-            return result
-
-        deterministic = _deterministic_results(events, as_of)
-        return self.fallback_question(
-            info,
-            events,
+            result = replace(fallback, timings=tuple(timings))
+        logger.info(
+            "question_answered match_id=%s as_of=%d source=%s attempts=%d duration_ms=%d "
+            "finish_reasons=%s",
+            info.match_id,
             as_of,
-            deterministic,
-            (
-                f"The live explanation failed ({last_failure}); verified facts are shown instead."
-                if last_failure is not None
-                else "The answer failed evidence checks; verified facts are shown instead."
+            result.source,
+            result.attempts,
+            round((time.perf_counter() - started) * 1000),
+            ",".join(str(timing.finish_reason) for timing in result.timings),
+        )
+        return result
+
+    @staticmethod
+    def _explanation_from_reply(
+        reply: ExplainerReply,
+        aliases: _FactAliases,
+        results: Sequence[ToolResult],
+        given_fact_ids: Sequence[str] = (),
+    ) -> tuple[Explanation | None, list[str]]:
+        """Map the reply's fact aliases back and derive the event IDs from the cited facts.
+
+        ``given_fact_ids`` (every snapshot fact) are cited for the answer whether or not the
+        model listed them, as the live Analyst path does for the score. The claims list
+        shows only the facts the model cited.
+        """
+        answer = " ".join(reply.answer.split())
+        problems: list[str] = []
+        if not answer:
+            problems.append("answer is empty")
+        if len(answer.split()) > 80:
+            problems.append(f"answer is {len(answer.split())} words; the limit is 80")
+        facts_by_id = _result_fact_map(results)
+        cited: list[Fact] = []
+        for alias in dict.fromkeys(reply.fact_ids):
+            fact_id = aliases.real(alias)
+            if fact_id is None or fact_id not in facts_by_id:
+                problems.append(f"fact_id {alias!r} is not one of the listed F IDs")
+                continue
+            cited.append(facts_by_id[fact_id])
+        if problems:
+            return None, problems
+        return (
+            Explanation(
+                answer=answer,
+                claims=[_fact_claim(fact) for fact in cited],
+                fact_ids=list(
+                    dict.fromkeys([*(fact.fact_id for fact in cited), *given_fact_ids])
+                ),
+                event_ids=list(
+                    dict.fromkeys(event_id for fact in cited for event_id in fact.event_ids)
+                ),
             ),
-            attempt_count,
+            [],
+        )
+
+    @staticmethod
+    def out_of_scope_question() -> QuestionResult:
+        """Betting and real-club questions get a fixed reply with no model call."""
+        return QuestionResult(
+            Explanation(answer=OUT_OF_SCOPE_ANSWER),
+            (),
+            EvidenceReport(True, ()),
+            0,
+            source="out_of_scope",
         )
 
     def fallback_question(
@@ -1545,7 +1935,7 @@ class PunditPipeline:
                 "The cached answer is not valid at this replay point; verified facts are shown.",
                 0,
             )
-        return QuestionResult(explanation, tuple(results), report, 0)
+        return QuestionResult(explanation, tuple(results), report, 0, source="cached")
 
     async def produce_recap(
         self,
@@ -1556,28 +1946,52 @@ class PunditPipeline:
     ) -> RecapResult:
         if self.settings.mode == "cached":
             return self._cached_recap(info, events, as_of)
-        deterministic = _deterministic_results(events, as_of)
         if self.settings.mode == "off":
             return self._fallback_recap_result(
                 info,
                 events,
                 as_of,
-                deterministic,
+                _deterministic_results(events, as_of),
                 "Narrative mode is off; showing a deterministic recap.",
                 0,
             )
 
         deadline = self.settings.recap_timeout_seconds
-        accumulated_results: list[ToolResult] = []
+        snapshot = await asyncio.to_thread(
+            match_snapshot, events, as_of=as_of, moments=RECAP_MOMENTS, minor=False
+        )
+        aliases = _FactAliases()
+        stats_facts, moment_facts = _prompt_facts(snapshot, aliases, moment_event_ids=True)
+        score_fact = _snapshot_score(snapshot)
+        prompt_base = {
+            "match": {
+                "home": info.home.name,
+                "away": info.away.name,
+                "stadium": info.stadium,
+            },
+            "score_phrase": full_time_score_phrase(info, str(score_fact.value)),
+            "facts": stats_facts,
+            "key_moments": moment_facts,
+        }
+        given_fact_ids = _snapshot_fact_ids(snapshot)
+        accumulated_results: list[ToolResult] = list(snapshot)
+        timings: list[AgentCallTiming] = []
         feedback = ""
-        last_failure: str | None = None
+        attempt_count = 0
 
         async def attempts() -> RecapResult | None:
-            nonlocal feedback, last_failure
-            for attempt in range(2):
+            nonlocal feedback, attempt_count
+            for attempt in (1, 2):
+                attempt_count = attempt
                 capture = None
                 try:
-                    tools, capture = build_analytics_tools(events, as_of=as_of)
+                    tools, capture = build_analytics_tools(
+                        events,
+                        as_of=as_of,
+                        exclude={"xg_timeline"},
+                        present=aliases.present,
+                        restore=aliases.restore,
+                    )
                     producer = self._agent(
                         "recap",
                         RECAP_INSTRUCTIONS,
@@ -1585,41 +1999,48 @@ class PunditPipeline:
                         middleware=[capture],
                         time_budget=deadline,
                     )
-                    workflow = WorkflowBuilder(start_executor=AgentExecutor(producer)).build()
-                    prompt = json.dumps(
-                        {
-                            "match": {
-                                "id": info.match_id,
-                                "home": info.home.name,
-                                "away": info.away.name,
-                            },
-                            "request": "Produce the full-time recap using analytics tools.",
-                            "retry_feedback": feedback,
-                        }
-                    )
-                    run_result = await workflow.run(
-                        Message(role="user", contents=prompt)
+                    response = await _run_single_agent(
+                        producer,
+                        json.dumps({**prompt_base, "retry_feedback": feedback}),
+                        role="recap",
+                        attempt=attempt,
+                        timings=timings,
+                        match_id=info.match_id,
+                        as_of=as_of,
                     )
                 except Exception as exc:
-                    last_failure = type(exc).__name__
+                    detail, truncated = _failure_detail(exc)
+                    logger.warning(
+                        "recap_agent_failed match_id=%s as_of=%d attempt=%d error=%s",
+                        info.match_id,
+                        as_of,
+                        attempt,
+                        type(exc).__name__,
+                    )
                     feedback = (
-                        f"The previous agent or tool run failed with {last_failure}; "
-                        "retry with valid tool arguments."
+                        "The previous reply was cut off; keep every field within its word limit."
+                        if truncated
+                        else f"The previous reply failed ({detail}); retry with valid tool "
+                        "arguments."
                     )
                     continue
                 finally:
                     if capture is not None:
                         accumulated_results.extend(capture.results)
-                recap = next(
-                    (
-                        model
-                        for model in _workflow_models(run_result)
-                        if isinstance(model, Recap)
-                    ),
-                    None,
+                reply = _parsed(response, RecapReply)
+                if reply is None:
+                    feedback = _invalid_output("RecapReply")
+                    continue
+                recap, problems = _recap_from_reply(
+                    reply,
+                    aliases,
+                    accumulated_results,
+                    events,
+                    as_of=as_of,
+                    given_fact_ids=given_fact_ids,
                 )
                 if recap is None:
-                    feedback = "The workflow did not return a structured Recap."
+                    feedback = "; ".join(problems)
                     continue
                 report = check_evidence(
                     recap,
@@ -1629,35 +2050,36 @@ class PunditPipeline:
                     info=info,
                 )
                 if report.passed:
-                    return RecapResult(recap, tuple(accumulated_results), report, attempt + 1)
-                feedback = "; ".join(report.failures)
+                    return RecapResult(
+                        recap,
+                        tuple(accumulated_results),
+                        report,
+                        attempt,
+                        source="agent",
+                        timings=tuple(timings),
+                    )
+                logger.info(
+                    "recap_evidence_failed match_id=%s attempt=%d failures=%s",
+                    info.match_id,
+                    attempt,
+                    "; ".join(report.failures),
+                )
+                feedback = _retry_feedback(report.failures)
             return None
 
         try:
             result = await asyncio.wait_for(attempts(), timeout=deadline)
+            notice = "The recap could not be verified; a recap from verified facts is shown."
         except TimeoutError:
-            return self._fallback_recap_result(
-                info,
-                events,
-                as_of,
-                deterministic,
-                "The recap exceeded its time budget; verified facts are shown instead.",
-                2,
-            )
+            result = None
+            notice = "The recap took too long; a recap from verified facts is shown."
         if result is not None:
             return result
-        return self._fallback_recap_result(
-            info,
-            events,
-            as_of,
-            deterministic,
-            (
-                f"The recap failed ({last_failure}); verified facts are shown instead."
-                if last_failure is not None
-                else "The recap failed evidence checks; verified facts are shown instead."
-            ),
-            2,
+        deterministic = await asyncio.to_thread(_deterministic_results, events, as_of)
+        fallback = self._fallback_recap_result(
+            info, events, as_of, deterministic, notice, attempt_count
         )
+        return replace(fallback, timings=tuple(timings))
 
     def _fallback_recap_result(
         self,
@@ -1721,4 +2143,4 @@ class PunditPipeline:
                 "The cached recap is not valid at this replay point; verified facts are shown.",
                 0,
             )
-        return RecapResult(recap, tuple(results), report, 0)
+        return RecapResult(recap, tuple(results), report, 0, source="cached")

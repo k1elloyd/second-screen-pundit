@@ -68,6 +68,7 @@ class ReplaySession:
     stopped: bool = False
     recap_task: asyncio.Task[None] | None = None
     runner_task: asyncio.Task[None] | None = None
+    question_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     dispatcher: LiveDispatcher | None = None
     dispatch_source: AsyncIterator[Event] | None = None
     viewer_source: AsyncIterator[Event] | None = None
@@ -128,13 +129,8 @@ def _event_payload(event: Event, info: MatchInfo) -> dict[str, Any]:
 
 
 def _safe_explanation(explanation: Explanation, info: MatchInfo) -> tuple[Explanation, str | None]:
-    text = [
-        explanation.answer,
-        *(claim.text for claim in explanation.claims),
-        *explanation.cannot_tell,
-        explanation.notice or "",
-    ]
-    reason = viewer_output_block_reason(text, info)
+    """Filter the model-written answer. Claims and notices are deterministic and never filtered."""
+    reason = viewer_output_block_reason([explanation.answer], info)
     if reason is None:
         return explanation, None
     return (
@@ -165,10 +161,12 @@ def _safe_question_explanation(
     events: list[Event],
     as_of: int,
 ) -> tuple[Explanation, str | None]:
+    if getattr(result, "source", "agent") != "agent":
+        return result.explanation, None
     explanation, reason = _safe_explanation(result.explanation, info)
     if reason is None:
         return explanation, None
-
+    logger.warning("question_answer_withheld reason=%s", reason)
     fallback = pipeline.fallback_question(
         info,
         events,
@@ -177,17 +175,30 @@ def _safe_question_explanation(
         "The generated answer was withheld; verified match facts are shown instead.",
         result.attempts,
     )
-    safe_fallback, fallback_reason = _safe_explanation(fallback.explanation, info)
-    if fallback_reason is not None:
-        logger.error("Verified question fallback failed content filtering: %s", fallback_reason)
-        return (
-            Explanation(
-                answer="The generated response was withheld; no verified facts could be safely shown.",
-                notice="Please try again after more match events are released.",
-            ),
-            reason,
-        )
-    return safe_fallback, reason
+    return fallback.explanation, reason
+
+
+def _answer_payload(
+    question_id: str,
+    transcript: str,
+    result: Any,
+    explanation: Explanation,
+    blocked_reason: str | None,
+    started: float,
+) -> dict[str, Any]:
+    timings = getattr(result, "timings", ())
+    return {
+        "question_id": question_id,
+        "transcript": transcript,
+        "explanation": explanation.model_dump(mode="json"),
+        "audio_id": None,
+        "blocked": blocked_reason is not None,
+        "blocked_reason": blocked_reason,
+        "source": "fallback" if blocked_reason else getattr(result, "source", "agent"),
+        "attempts": getattr(result, "attempts", 0),
+        "finish_reasons": [timing.finish_reason for timing in timings],
+        "duration_ms": round((time.perf_counter() - started) * 1000),
+    }
 
 
 def _read_wav_duration(audio_bytes: bytes, *, max_seconds: int = MAX_QUESTION_AUDIO_SECONDS) -> float:
@@ -260,7 +271,7 @@ def create_app(
                     logger.exception("model_warm_up_failed")
                     app.state.warmup = {
                         "status": "failed",
-                        "error": f"{type(exc).__name__}; check server configuration and logs",
+                        "error": "Warm-up failed; check server configuration and logs",
                     }
                 else:
                     app.state.warmup = {"status": "ready", "error": None}
@@ -437,7 +448,7 @@ def create_app(
             await session.queue.put(
                 (
                     "error",
-                    {"message": f"The full-time recap failed ({type(exc).__name__})."},
+                    {"message": "The full-time recap is unavailable."},
                 )
             )
 
@@ -486,8 +497,7 @@ def create_app(
                         "error",
                         {
                             "message": (
-                                f"Replay worker failed ({type(failure).__name__}). "
-                                "The match can be started again."
+                                "The replay stopped unexpectedly. The match can be started again."
                             )
                         },
                     )
@@ -513,6 +523,9 @@ def create_app(
         if session.recap_task is not None and not session.recap_task.done():
             session.recap_task.cancel()
             await asyncio.gather(session.recap_task, return_exceptions=True)
+        for task in list(session.question_tasks):
+            task.cancel()
+        await asyncio.gather(*session.question_tasks, return_exceptions=True)
         session.audio.clear()
         sessions.pop(session.replay_id, None)
         if tab_sessions.get(session.tab_id) == session.replay_id:
@@ -650,8 +663,31 @@ def create_app(
         state = await session.replay.control(action)
         return {"replay_id": replay_id, "state": state}
 
+    async def answer(
+        session: ReplaySession,
+        question_id: str,
+        question: str,
+        started: float,
+    ) -> dict[str, Any]:
+        as_of = session.viewer_released_as_of
+        result = await app.state.pipeline.answer_question(
+            session.info,
+            session.events,
+            question,
+            as_of=as_of,
+        )
+        explanation, blocked_reason = _safe_question_explanation(
+            app.state.pipeline,
+            result,
+            session.info,
+            session.events,
+            as_of,
+        )
+        return _answer_payload(question_id, question, result, explanation, blocked_reason, started)
+
     @app.post("/api/ask")
     async def ask(payload: QuestionRequest, request: Request) -> dict[str, Any]:
+        started = time.perf_counter()
         question = payload.question.strip()
         if not question:
             raise HTTPException(status_code=422, detail="Question must not be empty.")
@@ -664,34 +700,59 @@ def create_app(
                 ),
             )
         session = check_question_access(payload.replay_id, request)
-        result = await app.state.pipeline.answer_question(
-            session.info,
-            session.events,
-            question,
-            as_of=session.viewer_released_as_of,
-        )
-        explanation, blocked_reason = _safe_question_explanation(
-            app.state.pipeline,
-            result,
-            session.info,
-            session.events,
-            session.viewer_released_as_of,
-        )
-        audio_id = None
-        return {
-            "transcript": question,
-            "explanation": explanation.model_dump(mode="json"),
-            "audio_id": audio_id,
-            "blocked": blocked_reason is not None,
-            "blocked_reason": blocked_reason,
-        }
+        return await answer(session, uuid4().hex, question, started)
 
-    @app.post("/api/ask-audio")
+    async def answer_spoken(
+        session: ReplaySession,
+        question_id: str,
+        transcript: str,
+        started: float,
+        budget: float,
+    ) -> None:
+        """Send the answer text over SSE as soon as it is checked, then its audio."""
+        try:
+            async with asyncio.timeout(budget):
+                payload = await answer(session, question_id, transcript, started)
+        except TimeoutError:
+            await session.queue.put(
+                (
+                    "answer_error",
+                    {
+                        "question_id": question_id,
+                        "message": "The spoken question timed out. Please try typing it instead.",
+                    },
+                )
+            )
+            return
+        except Exception:
+            logger.exception("spoken_question_failed question_id=%s", question_id)
+            await session.queue.put(
+                (
+                    "answer_error",
+                    {
+                        "question_id": question_id,
+                        "message": "The answer is unavailable; please retry or type the question.",
+                    },
+                )
+            )
+            return
+        await session.queue.put(("answer", {**payload, "audio_pending": True}))
+        audio_id = await synthesize(session, payload["explanation"]["answer"])
+        await session.queue.put(
+            (
+                "answer_audio" if audio_id is not None else "answer_audio_unavailable",
+                {"question_id": question_id, "audio_id": audio_id},
+            )
+        )
+
+    @app.post("/api/ask-audio", status_code=202)
     async def ask_audio(
         request: Request,
         replay_id: str = Form(...),
         audio: UploadFile = File(...),
     ) -> dict[str, Any]:
+        """Transcribe, return the transcript at once, and answer over the replay's SSE stream."""
+        started = time.perf_counter()
         session = check_question_access(replay_id, request)
         audio_bytes = await audio.read(configured_settings.question_audio_max_bytes + 1)
         await audio.close()
@@ -718,54 +779,47 @@ def create_app(
             logger.warning("speech_recognition_unavailable error=%s", type(exc).__name__)
             raise HTTPException(
                 status_code=503,
-                detail=f"Speech recognition is unavailable ({type(exc).__name__}).",
+                detail="Speech recognition is unavailable; please type the question.",
             ) from exc
+        limit = configured_settings.ask_audio_timeout_seconds
         try:
-            async with asyncio.timeout(configured_settings.ask_audio_timeout_seconds):
-                transcript = await asyncio.to_thread(recognizer.recognize_wav, audio_bytes)
-                if len(transcript) > configured_settings.question_max_characters:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            "Speech transcript must be "
-                            f"{configured_settings.question_max_characters} characters or shorter."
-                        ),
-                    )
-                if not transcript.strip():
-                    raise HTTPException(status_code=422, detail="No speech was recognized.")
-                result = await app.state.pipeline.answer_question(
-                    session.info,
-                    session.events,
-                    transcript,
-                    as_of=session.viewer_released_as_of,
-                )
-                explanation, blocked_reason = _safe_question_explanation(
-                    app.state.pipeline,
-                    result,
-                    session.info,
-                    session.events,
-                    session.viewer_released_as_of,
-                )
-                audio_id = await synthesize(session, explanation.answer)
+            async with asyncio.timeout(limit):
+                transcript = (await asyncio.to_thread(recognizer.recognize_wav, audio_bytes)).strip()
         except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
-                detail="Spoken question timed out after 30 seconds. Please try typing it instead.",
+                detail="Spoken question timed out. Please try typing it instead.",
             ) from exc
-        except HTTPException:
-            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
-            logger.warning("spoken_question_failed error=%s", type(exc).__name__)
+            logger.warning("speech_recognition_failed error=%s", type(exc).__name__)
             raise HTTPException(
                 status_code=502,
-                detail=f"Speech question failed ({type(exc).__name__}); please retry or type the question.",
+                detail="Speech recognition failed; please retry or type the question.",
             ) from exc
+        if not transcript:
+            raise HTTPException(status_code=422, detail="No speech was recognized.")
+        if len(transcript) > configured_settings.question_max_characters:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Speech transcript must be "
+                    f"{configured_settings.question_max_characters} characters or shorter."
+                ),
+            )
+        question_id = uuid4().hex
+        remaining = max(1.0, limit - (time.perf_counter() - started))
+        task = asyncio.create_task(
+            answer_spoken(session, question_id, transcript, started, remaining)
+        )
+        session.question_tasks.add(task)
+        task.add_done_callback(session.question_tasks.discard)
         return {
+            "question_id": question_id,
             "transcript": transcript,
-            "explanation": explanation.model_dump(mode="json"),
-            "audio_id": audio_id,
-            "blocked": blocked_reason is not None,
-            "blocked_reason": blocked_reason,
+            "status": "answering",
+            "stt_ms": round((time.perf_counter() - started) * 1000),
         }
 
     @app.get("/api/lines/{line_id}/evidence")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import Any
 
 from agent_framework import FunctionInvocationContext, FunctionMiddleware, MiddlewareFailure
@@ -35,9 +35,15 @@ from second_screen_pundit.agents.tools.parameters import (
 from second_screen_pundit.engine.schema import Event
 
 
+ResultMap = Callable[[ToolResult], ToolResult]
+
+
 class ToolResultCapture(FunctionMiddleware):
-    def __init__(self) -> None:
+    """Captures each tool result for the evidence check, with its real fact IDs restored."""
+
+    def __init__(self, restore: ResultMap | None = None) -> None:
         self.results: list[ToolResult] = []
+        self._restore = restore
 
     async def process(self, context: FunctionInvocationContext, call_next: Any) -> None:
         await call_next()
@@ -72,21 +78,30 @@ class ToolResultCapture(FunctionMiddleware):
             )
             if expected_tool is not None and captured.tool != expected_tool:
                 raise MiddlewareFailure("Analytics tool result does not match its function name")
-            self.results.append(captured)
+            self.results.append(self._restore(captured) if self._restore else captured)
 
 
 def build_analytics_tools(
     events: Sequence[Event],
     *,
     as_of: int,
+    exclude: Collection[str] = (),
+    present: ResultMap | None = None,
+    restore: ResultMap | None = None,
 ) -> tuple[list[Any], ToolResultCapture]:
+    """The analytics tools bound to ``as_of``, and the middleware that captures their results.
+
+    ``exclude`` names tools to leave out. ``present`` rewrites a result for the model (for
+    example short fact aliases), and ``restore`` undoes it in the capture.
+    """
     if as_of < 0:
         raise ValueError("as_of must be a non-negative event sequence")
     event_log = list(events)
-    capture = ToolResultCapture()
+    capture = ToolResultCapture(restore)
 
     def serialize(result: ToolResult) -> str:
-        return result.model_dump_json(exclude={"table"})
+        shown = present(result) if present is not None else result
+        return shown.model_dump_json(exclude={"table"})
 
     def match_state_tool(minute: int) -> str:
         """Return score, possession, shots, xG, cards, and formations at a minute."""
@@ -174,7 +189,7 @@ def build_analytics_tools(
         )
         return serialize(result)
 
-    return [
+    tools = [
         match_state_tool,
         possession_window_tool,
         xg_timeline_tool,
@@ -184,4 +199,5 @@ def build_analytics_tools(
         formation_at_tool,
         key_moments_tool,
         compare_windows_tool,
-    ], capture
+    ]
+    return [tool for tool in tools if tool.__name__.removesuffix("_tool") not in exclude], capture

@@ -11,6 +11,7 @@ const state = {
   score: { home: 0, away: 0 },
   events: 0,
   recording: null,
+  pendingQuestionId: null,
   questionAudioSeconds: 15,
   questionAudioBytes: 1_000_000,
 };
@@ -299,6 +300,7 @@ function handleSse(name, payload) {
     el("resume-button").disabled = true;
   }
   if (name === "error") showMessage(el("ask-message"), payload.message, true);
+  if (name.startsWith("answer")) handleAnswerEvent(name, payload);
 }
 
 async function consumeStream(url, controller) {
@@ -424,13 +426,12 @@ function displayAnswer(result) {
   const blockMessages = {
     "betting language": "Betting language was blocked.",
     "a blocked real-club name": "A real club or league name was blocked.",
-    "an unapproved proper name": "An unapproved proper name was blocked.",
   };
   const notice = result.blocked
     ? claims.childElementCount
       ? "Some generated wording was withheld; verified match facts are shown."
       : blockMessages[result.blocked_reason] || "Some answer content was blocked."
-    : result.explanation.notice || "";
+    : result.explanation.notice || (result.audio_pending ? "Preparing audio…" : "");
   showMessage(
     el("ask-message"),
     notice,
@@ -514,10 +515,35 @@ async function sendSpokenQuestion(blob) {
   form.append("replay_id", state.replayId);
   form.append("audio", blob, "question.wav");
   try {
-    const result = await responseJson(await fetch("/api/ask-audio", { method: "POST", body: form }));
-    displayAnswer(result);
+    // 202 with the transcript as soon as speech-to-text finishes; the answer and its audio
+    // follow on the replay's SSE stream as "answer" and "answer_audio".
+    const pending = await responseJson(await fetch("/api/ask-audio", { method: "POST", body: form }));
+    state.pendingQuestionId = pending.question_id;
+    el("answer-card").hidden = false;
+    el("answer-text").textContent = "";
+    el("answer-claims").replaceChildren();
+    el("answer-claims").hidden = true;
+    el("answer-audio").hidden = true;
+    el("answer-transcript").textContent = `Heard: “${pending.transcript}”`;
+    showMessage(el("ask-message"), "Checking the released match events…");
   } catch (error) {
     showMessage(el("ask-message"), error.message, true);
+  }
+}
+
+function handleAnswerEvent(name, payload) {
+  if (payload.question_id !== state.pendingQuestionId) return;
+  if (name === "answer") displayAnswer(payload);
+  if (name === "answer_error") showMessage(el("ask-message"), payload.message, true);
+  if (name === "answer_audio") {
+    const player = el("answer-audio");
+    player.src = audioUrl(payload.audio_id);
+    player.muted = el("mute-audio").checked;
+    player.hidden = false;
+    if (el("ask-message").textContent === "Preparing audio…") showMessage(el("ask-message"), "");
+  }
+  if (name === "answer_audio_unavailable" && el("ask-message").textContent === "Preparing audio…") {
+    showMessage(el("ask-message"), "Audio unavailable · text answer shown.");
   }
 }
 

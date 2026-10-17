@@ -32,7 +32,9 @@ _NUMBER = re.compile(
     r"(?:\s*(?P<scale>million|billion|thousand))?",
     re.IGNORECASE,
 )
-_SCORE = re.compile(r"(?<![\w\d-])(?P<home>\d{1,2})\s*[-–—]\s*(?P<away>\d{1,2})(?![-–—\w])")
+# A score never ends in a minute mark: 59-75' is a minute range.
+_SCORE = re.compile(r"(?<![\w\d-])(?P<home>\d{1,2})\s*[-–—]\s*(?P<away>\d{1,2})(?![-–—\w'’])")
+_LABEL_MINUTES = re.compile(r"(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?'")
 _FORMATION = re.compile(r"\b\d{1,2}(?:-\d{1,2}){2,3}\b")
 _BACK_LINE = re.compile(r"\bback\s+(?P<count>zero|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b", re.IGNORECASE)
 _XG_DECIMAL = re.compile(
@@ -214,7 +216,7 @@ def _metric_mentioned(fact: Fact, text: str) -> bool:
         (("shots", "shot"), ("shots", "shot", "attempts")),
         (("xg",), ("xg", "expected goals")),
         (("cards", "card"), ("cards", "card", "bookings")),
-        (("players on the pitch",), ("players",)),
+        (("players on the pitch",), ("players", "men")),
     )
     for label_terms, sentence_terms in metrics:
         if any(term in label for term in label_terms):
@@ -284,6 +286,17 @@ def _grounding_facts(
 
 
 _PERCENT_AFTER = re.compile(r"\s*(?:%|per\s*cent\b|percent\b)", re.IGNORECASE)
+_MINUTE_WORD = re.compile(r"\bminutes?\b", re.IGNORECASE)
+_MINUTE_MARK_AFTER = re.compile(r"(?:\s*[-–]\s*\d{1,3})?['’]")
+
+
+def _is_minute_mention(sentence: str, number: NumberMention, number_end: int) -> bool:
+    """27', either end of 59-75', 27th, or a number in a sentence that talks about the minute."""
+    return (
+        _MINUTE_MARK_AFTER.match(sentence, number_end) is not None
+        or number.ordinal
+        or _MINUTE_WORD.search(sentence) is not None
+    )
 
 
 def mentions_score(text: str) -> bool:
@@ -471,6 +484,22 @@ def check_evidence(
         if isinstance(output, CommentaryLine) and _XG_DECIMAL.search(text):
             failures.append("CommentaryLine must not state xG or expected-goals decimals")
         cited_facts = [facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id]
+        # Answers and recaps may give the minute of an event they cite (spec: "or the minute
+        # of a cited event"), or a minute in a cited fact's label, such as its window
+        # 59-75'. Live lines keep the stricter clock-fact rule.
+        cited_minutes: set[float] = set()
+        if isinstance(output, Explanation | Recap):
+            cited_minutes = {
+                float(event.minute + event.added_minute)
+                for event_id in [*event_ids, *(i for fact in cited_facts for i in fact.event_ids)]
+                if (event := event_by_id.get(event_id)) is not None and event.seq <= as_of
+            } | {
+                float(minute)
+                for fact in cited_facts
+                for match in _LABEL_MINUTES.finditer(fact.label)
+                for minute in match.groups()
+                if minute is not None
+            }
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             score_spans = list(_SCORE.finditer(sentence))
             formation_spans = list(_FORMATION.finditer(sentence))
@@ -481,6 +510,10 @@ def check_evidence(
                 if any(
                     number_start < span.end() and number_end > span.start()
                     for span in [*score_spans, *formation_spans, *back_line_spans]
+                ):
+                    continue
+                if number.value in cited_minutes and _is_minute_mention(
+                    sentence, number, number_end
                 ):
                     continue
                 grounding = _grounding_facts(number, sentence, cited_facts, info=info)

@@ -11,9 +11,9 @@ from pydantic import BaseModel
 from second_screen_pundit.agents.models import (
     CommentaryReply,
     DirectorDecision,
-    Explanation,
+    ExplainerReply,
     Insight,
-    Recap,
+    RecapReply,
 )
 
 
@@ -26,8 +26,10 @@ _MAX_TOKENS: dict[AgentRole, int] = {
     "analyst": 384,
     # Includes reasoning tokens; 400 truncated replies once the persona instructions grew.
     "commentator": 700,
-    "explainer": 512,
-    "recap": 768,
+    # Includes reasoning tokens; 512 and 768 cut answers and recaps off mid-JSON, and a
+    # recap still hit 1,500 once.
+    "explainer": 1500,
+    "recap": 2500,
 }
 _TIME_BUDGETS: dict[AgentRole, float] = {
     "director": 15,
@@ -37,13 +39,13 @@ _TIME_BUDGETS: dict[AgentRole, float] = {
     "recap": 45,
 }
 _FAST_ROLES = {"director", "analyst", "commentator"}
-_LOW_REASONING_ROLES = {"director", "commentator"}
+_LOW_REASONING_ROLES = {"director", "commentator", "explainer", "recap"}
 _OUTPUT_MODELS: dict[AgentRole, type[BaseModel]] = {
     "director": DirectorDecision,
     "analyst": Insight,
     "commentator": CommentaryReply,
-    "explainer": Explanation,
-    "recap": Recap,
+    "explainer": ExplainerReply,
+    "recap": RecapReply,
 }
 
 

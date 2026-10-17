@@ -83,6 +83,19 @@ class Explanation(AgentOutput):
         return value
 
 
+class ExplainerReply(BaseModel):
+    """What the Tactics Explainer model returns: the answer and the fact IDs it used.
+
+    The server maps fact aliases back, derives event IDs from the cited facts and builds the
+    viewer-facing Explanation. No length limit here: an over-long answer gets retry feedback.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    answer: str
+    fact_ids: list[str] = Field(default_factory=list)
+
+
 class RecapMoment(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -111,6 +124,15 @@ class Recap(AgentOutput):
         if len(value.split()) > 150:
             raise ValueError("audio_script must be no more than 150 words")
         return value
+
+
+class RecapReply(AgentOutput):
+    """What the Recap Producer model returns; the server sets the notice."""
+
+    headline: str
+    summary: str
+    key_moments: list[RecapMoment]
+    audio_script: str
 
 
 class NarrativeModeConfig(BaseModel):

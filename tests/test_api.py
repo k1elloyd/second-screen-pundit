@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import time
 import wave
@@ -8,9 +9,11 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from second_screen_pundit.agents import content_filter
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.content_filter import viewer_output_block_reason
 from second_screen_pundit.agents.evidence import EvidenceReport
@@ -148,27 +151,52 @@ def test_spoken_question_uses_the_same_viewer_cutoff_and_returns_server_audio() 
             headers={"X-Forwarded-For": "198.51.100.23"},
         )
         body = response.json()
-        audio = client.get(f"/api/audio/{body['audio_id']}")
 
-    assert response.status_code == 200
+        async def next_item() -> tuple[str, dict]:
+            item = await asyncio.wait_for(session.queue.get(), timeout=5)
+            assert item is not None
+            return item
+
+        answer_name, answer = client.portal.call(next_item)
+        audio_name, audio_event = client.portal.call(next_item)
+        audio = client.get(f"/api/audio/{audio_event['audio_id']}")
+
+    # The transcript comes back as soon as speech-to-text finishes; the answer follows on SSE.
+    assert response.status_code == 202
     assert body["transcript"] == "Has a goal been scored?"
+    assert body["status"] == "answering"
+    assert "explanation" not in body
+    assert answer_name == "answer"
+    assert answer["question_id"] == body["question_id"]
+    assert answer["transcript"] == "Has a goal been scored?"
     assert pipeline.received_as_of == goal.seq - 1
-    assert goal.event_id not in body["explanation"]["answer"]
+    assert goal.event_id not in answer["explanation"]["answer"]
+    assert audio_name == "answer_audio"
+    assert audio_event["question_id"] == body["question_id"]
     assert audio.content == b"stub-mp3"
 
 
-def test_viewer_output_filter_blocks_unknown_names_and_betting_talk() -> None:
-    info = get_match_info("m01")
+def _denylist(monkeypatch, name: str) -> None:
+    """Add a fictional name to the hashed denylist, so no real name appears in the tests."""
+    fingerprints = {
+        *content_filter._KNOWN_REAL_NAME_FINGERPRINTS,
+        hashlib.sha256(name.encode("utf-8")).hexdigest(),
+    }
+    monkeypatch.setattr(content_filter, "_KNOWN_REAL_NAME_FINGERPRINTS", fingerprints)
 
-    assert viewer_output_block_reason(["North Coast League is in the table."], info)
-    assert (
-        viewer_output_block_reason(
-            ["Merehaven Athletic had more chances after Half Time."],
-            get_match_info("m02"),
-        )
-        is None
+
+def test_viewer_output_filter_blocks_denylisted_names_and_betting_talk(monkeypatch) -> None:
+    info = get_match_info("m01")
+    _denylist(monkeypatch, "gravel town")
+
+    assert viewer_output_block_reason(["Gravel Town are top of the table."], info) == (
+        "a blocked real-club name"
+    )
+    assert viewer_output_block_reason(["Gravel Town's pressing is better."], info) == (
+        "a blocked real-club name"
     )
     assert viewer_output_block_reason(["The odds are tempting."], info) == "betting language"
+    assert viewer_output_block_reason(["Have a bet on the next goal."], info) == "betting language"
     assert viewer_output_block_reason(["Ashbridge Rovers control possession."], info) is None
 
     explanation, reason = _safe_explanation(
@@ -178,6 +206,76 @@ def test_viewer_output_filter_blocks_unknown_names_and_betting_talk() -> None:
     assert reason == "betting language"
     assert "odds" not in explanation.answer.casefold()
     assert explanation.notice is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Review 2, finding 2: each of these was blocked before.
+        "Port Calder's shape changed after the red card.",
+        "Merehaven Athletic's pressing has been relentless.",
+        "Merehaven have generated more xG since the red card.",
+        "Merehaven have the better chances, with 1.42 xG.",
+        "It is the Expected Goals that tell the story.",
+        "The stakes are high for Port Calder.",
+        "Port Calder are holding on against the odds.",
+        "Merehaven Athletic have won against all odds before.",
+        "Port Calder FC have kept a 4-4-1 since the red card at Saltmere Park.",
+        "VAR has not been needed; Merehaven have camped in the final third.",
+        # The notice that blocked itself (an exception class name looked like a proper name).
+        "The live explanation failed (ChatClientException); verified facts are shown instead.",
+    ],
+)
+def test_viewer_output_filter_allows_ordinary_football_english(text: str) -> None:
+    assert viewer_output_block_reason([text], get_match_info("m02")) is None
+
+
+def test_system_notices_and_fallback_facts_are_never_filtered(monkeypatch) -> None:
+    info = get_match_info("m02")
+    _denylist(monkeypatch, "verified")
+    fallback = SimpleNamespace(
+        source="fallback",
+        explanation=Explanation(
+            answer="Live answers are unavailable; verified match facts follow.",
+            notice="The answer could not be verified; verified match facts are shown instead.",
+        ),
+    )
+
+    explanation, reason = _safe_question_explanation(
+        None,  # type: ignore[arg-type]
+        fallback,  # type: ignore[arg-type]
+        info,
+        [],
+        0,
+    )
+
+    assert reason is None
+    assert explanation is fallback.explanation
+
+
+def test_betting_and_real_name_questions_get_a_fixed_reply_without_a_model_call(
+    monkeypatch,
+) -> None:
+    info = get_match_info("m02")
+    events = generate_match("m02")
+    _denylist(monkeypatch, "gravel town")
+    pipeline = PunditPipeline(replace(_settings(), mode="live"), object())  # type: ignore[arg-type]
+
+    def no_model(*_args, **_kwargs):
+        raise AssertionError("an out-of-scope question must not call the model")
+
+    monkeypatch.setattr(pipeline, "_agent", no_model)
+    for question in (
+        "What are the odds Merehaven win this?",
+        "Should I bet on Port Calder?",
+        "Is Merehaven's pressing better than Gravel Town's?",
+    ):
+        result = asyncio.run(
+            pipeline.answer_question(info, events, question, as_of=events[-1].seq)
+        )
+        assert result.source == "out_of_scope", question
+        assert result.attempts == 0
+        assert "no betting" in result.explanation.answer
 
 
 def test_evidence_report_is_serialized_for_sse_payloads() -> None:
@@ -200,7 +298,8 @@ def test_blocked_question_returns_only_verified_fallback_facts() -> None:
     )
     unsafe_result = replace(
         result,
-        explanation=Explanation(answer="North Coast League is dominating the match."),
+        source="agent",
+        explanation=Explanation(answer="Have a bet on Merehaven, they are dominating."),
     )
 
     explanation, reason = _safe_question_explanation(
@@ -211,10 +310,10 @@ def test_blocked_question_returns_only_verified_fallback_facts() -> None:
         as_of,
     )
 
-    assert reason == "an unapproved proper name"
+    assert reason == "betting language"
     assert explanation.answer == "Live answers are unavailable; verified match facts follow."
     assert explanation.claims
-    assert "North Coast League" not in str(explanation.model_dump())
+    assert "bet" not in explanation.answer
     assert viewer_output_block_reason(
         [
             explanation.answer,
@@ -225,7 +324,7 @@ def test_blocked_question_returns_only_verified_fallback_facts() -> None:
     ) is None
 
 
-def test_interactive_timeouts_use_short_fallback_budgets_by_default(monkeypatch) -> None:
+def test_interactive_timeouts_use_spec_budgets_by_default(monkeypatch) -> None:
     for name in (
         "LIVE_WINDOW_TIMEOUT_SECONDS",
         "EXPLAINER_TIMEOUT_SECONDS",
@@ -235,8 +334,8 @@ def test_interactive_timeouts_use_short_fallback_budgets_by_default(monkeypatch)
 
     settings = AgentSettings.from_environment()
 
-    assert settings.live_timeout_seconds == 8
-    assert settings.explainer_timeout_seconds == 10
+    assert settings.live_timeout_seconds == 15
+    assert settings.explainer_timeout_seconds == 20
     assert settings.speech_synthesis_timeout_seconds == 8
 
 
@@ -426,7 +525,8 @@ def test_sse_reports_worker_failure_and_completes_full_time(
     assert "event: event" in stream
     assert "full_time" in stream
     assert "event: error" in stream
-    assert "Replay worker failed (RuntimeError)" in stream
+    assert "The replay stopped unexpectedly" in stream
+    assert "RuntimeError" not in stream
     assert "event: complete" in stream
 
 
