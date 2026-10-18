@@ -271,7 +271,7 @@ def test_no_viewer_event_is_released_while_paused() -> None:
     events = generate_match("m01")[:6]
 
     async def run() -> tuple[list[int], list[int]]:
-        delay = BroadcastDelay(0.1)
+        delay = BroadcastDelay(0.5)
         released: list[int] = []
 
         async def source() -> AsyncIterator[Event]:
@@ -283,12 +283,15 @@ def test_no_viewer_event_is_released_while_paused() -> None:
                 released.append(event.seq)
 
         task = asyncio.create_task(consume())
-        await asyncio.sleep(0.02)  # every event stamped, none released yet
+        # Pause once every event is stamped, well inside the 0.5 s delay (none released yet).
+        async with asyncio.timeout(10):
+            while len(delay._seen) < len(events):
+                await asyncio.sleep(0.005)
         delay.pause()
-        await asyncio.sleep(0.4)  # four times the delay
+        await asyncio.sleep(1.0)  # twice the delay: nothing may come out while paused
         during_pause = list(released)
         delay.resume()
-        await asyncio.wait_for(task, timeout=2)
+        await asyncio.wait_for(task, timeout=10)
         return during_pause, released
 
     during_pause, released = asyncio.run(run())
@@ -307,7 +310,7 @@ def test_a_line_waits_while_the_broadcast_is_paused() -> None:
         await asyncio.sleep(0.2)
         held = not waiter.done()
         delay.resume()
-        await asyncio.wait_for(waiter, timeout=1)
+        await asyncio.wait_for(waiter, timeout=10)
         return held
 
     assert asyncio.run(run())

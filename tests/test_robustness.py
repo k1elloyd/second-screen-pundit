@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import statistics
 import time
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -148,36 +150,94 @@ async def _max_loop_gap(work) -> float:
     return max(gaps)
 
 
+def _median_loop_gap(make_work, runs: int) -> tuple[float, list[float], list[str]]:
+    """The median, over `runs` fresh runs, of each run's longest event-loop gap.
+
+    One run's longest gap is a single sample, and in the full suite the test process is
+    sometimes paused for a few hundred ms by something outside the code under test (one
+    m02 run measured 266 ms there, one m01 run 398 ms; alone both stay under 100 ms). A
+    blocking call in the dispatcher blocks every run, so the median still catches it; a
+    one-off pause lands in one run and doesn't move the median. The threshold stays the
+    same in and out of the suite. Garbage is collected before each run, and any full
+    (generation 2) collection during a run is reported with its length, to show whether
+    that is where a slow run's time went.
+    """
+    gaps: list[float] = []
+    notes: list[str] = []
+    collections: list[float] = []
+    started: list[float] = []
+
+    def on_gc(phase: str, info: dict) -> None:
+        if info["generation"] != 2:
+            return
+        if phase == "start":
+            started.append(time.perf_counter())
+        elif started:
+            collections.append(time.perf_counter() - started.pop())
+
+    gc.callbacks.append(on_gc)
+    try:
+        for _ in range(runs):
+            gc.collect()
+            collections.clear()
+            gaps.append(asyncio.run(_max_loop_gap(make_work())))
+            if collections:
+                notes.append(
+                    f"run {len(gaps)}: {len(collections)} full GC, longest "
+                    f"{max(collections) * 1000:.0f} ms"
+                )
+    finally:
+        gc.callbacks.remove(on_gc)
+    return statistics.median(gaps), gaps, notes
+
+
+def _describe(gaps: list[float], notes: list[str]) -> str:
+    runs = ", ".join(f"{gap * 1000:.0f}" for gap in gaps)
+    return f"longest gap per run: {runs} ms" + (f" ({'; '.join(notes)})" if notes else "")
+
+
 def test_a_slow_tactical_check_does_not_block_the_event_loop(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     events = generate_match("m01")
-    dispatcher = LiveDispatcher(
-        _SilentPipeline(), get_match_info("m01"), events, _settings()  # type: ignore[arg-type]
-    )
+    first_minutes = [event for event in events if event.minute < 7]
+    dispatchers: list[LiveDispatcher] = []
 
     def slow_evaluate(_events, *, as_of):
         time.sleep(0.25)  # a boundary as slow as review 2's worst case (0.4 s)
         return []
 
-    monkeypatch.setattr(dispatcher._tracker, "evaluate", slow_evaluate)
-    first_minutes = [event for event in events if event.minute < 7]
+    def work():
+        dispatcher = LiveDispatcher(
+            _SilentPipeline(), get_match_info("m01"), events, _settings()  # type: ignore[arg-type]
+        )
+        monkeypatch.setattr(dispatcher._tracker, "evaluate", slow_evaluate)
+        dispatchers.append(dispatcher)
+        return dispatcher.run(_source(first_minutes))
 
-    gap = asyncio.run(_max_loop_gap(dispatcher.run(_source(first_minutes))))
-    assert len(dispatcher.boundaries) >= 2
+    gap, gaps, notes = _median_loop_gap(work, runs=5)
+    assert all(len(dispatcher.boundaries) >= 2 for dispatcher in dispatchers)
+    with capsys.disabled():
+        print(f"\nslow tactical check, m01 to 7': {_describe(gaps, notes)}")
     # Each boundary sleeps 0.25 s in a worker thread; the loop keeps ticking meanwhile.
-    assert gap < 0.1, f"event loop blocked for {gap * 1000:.0f} ms"
+    assert gap < 0.1, f"event loop blocked for {gap * 1000:.0f} ms (median); {_describe(gaps, notes)}"
 
 
 def test_a_full_match_of_tactical_checks_leaves_the_loop_responsive(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     events = generate_match("m02")
-    dispatcher = LiveDispatcher(
-        _SilentPipeline(), get_match_info("m02"), events, _settings()  # type: ignore[arg-type]
-    )
-    gap = asyncio.run(_max_loop_gap(dispatcher.run(_source(events))))
-    assert len(dispatcher.boundaries) == 30
+    dispatchers: list[LiveDispatcher] = []
+
+    def work():
+        dispatcher = LiveDispatcher(
+            _SilentPipeline(), get_match_info("m02"), events, _settings()  # type: ignore[arg-type]
+        )
+        dispatchers.append(dispatcher)
+        return dispatcher.run(_source(events))
+
+    gap, gaps, notes = _median_loop_gap(work, runs=3)
+    assert all(len(dispatcher.boundaries) == 30 for dispatcher in dispatchers)
     with capsys.disabled():
-        print(f"\nlongest event-loop gap over m02's 30 boundaries: {gap * 1000:.0f} ms")
-    assert gap < 0.2, f"event loop blocked for {gap * 1000:.0f} ms"
+        print(f"\nm02's 30 boundaries: {_describe(gaps, notes)}")
+    assert gap < 0.2, f"event loop blocked for {gap * 1000:.0f} ms (median); {_describe(gaps, notes)}"

@@ -85,6 +85,9 @@ class ReplaySession:
     lines: dict[str, dict[str, Any]] = field(default_factory=dict)
     audio: dict[str, bytes] = field(default_factory=dict)
     stream_open: bool = False
+    # When the stream last dropped (monotonic), None while one is connected: when the app is
+    # full, the replay whose viewer has been gone longest gives up its slot.
+    away_since: float | None = None
     # Each stream connection takes the next number; an older connection ends when replaced.
     stream_generation: int = 0
     complete: bool = False
@@ -756,6 +759,43 @@ def create_app(
             )
         return result
 
+    async def evict_absent_replay(client_ip: str | None = None) -> bool:
+        """Free the slot of the replay whose viewer has been gone longest, if there is one.
+
+        Only a replay that is paused with no stream connected (its page was hidden or lost) is
+        a candidate: it costs a slot but nobody is watching. Its viewer gets a 404 on return,
+        and the page shows "This replay has ended". With `client_ip`, only that address's
+        replays are candidates (for the per-address cap).
+        """
+        absent = [
+            item
+            for item in sessions.values()
+            if not item.stopped
+            and (client_ip is None or item.client_ip == client_ip)
+            and not item.stream_open
+            and item.away_since is not None
+            and item.replay.state == "paused"
+        ]
+        if not absent:
+            return False
+        oldest = min(absent, key=lambda item: item.away_since or 0.0)
+        logger.info(
+            "replay_evicted replay_id=%s away_seconds=%.0f",
+            oldest.replay_id,
+            time.monotonic() - (oldest.away_since or 0.0),
+        )
+        await _stop_session(oldest)
+        return True
+
+    async def prepare_replay(events: list[Event], speed: int) -> Replay:
+        """Reserve a slot; when the app is full, take one from a viewer who has gone."""
+        try:
+            return manager.prepare(events, speed)
+        except RuntimeError as exc:
+            if "Maximum concurrent replays" not in str(exc) or not await evict_absent_replay():
+                raise
+        return manager.prepare(events, speed)
+
     @app.post("/api/matches/{match_id}/start")
     async def start_match(
         match_id: str,
@@ -792,14 +832,20 @@ def create_app(
             await _stop_session(previous)
         # Up to MAX_REPLAYS_PER_ADDRESS running replays per address, so one address can't take
         # every slot by inventing client IDs. Finished replays (tab still open) don't count.
-        running_here = sum(
-            1
-            for item in sessions.values()
-            if item.client_ip == client_ip
-            and not item.stopped
-            and item.replay.state not in {"finished", "stopped"}
-        )
-        if running_here >= MAX_REPLAYS_PER_ADDRESS:
+        def running_here() -> int:
+            return sum(
+                1
+                for item in sessions.values()
+                if item.client_ip == client_ip
+                and not item.stopped
+                and item.replay.state not in {"finished", "stopped"}
+            )
+
+        # At the cap, a replay from this address whose viewer has gone (a locked phone) gives
+        # way before anyone present is refused.
+        if running_here() >= MAX_REPLAYS_PER_ADDRESS:
+            await evict_absent_replay(client_ip)
+        if running_here() >= MAX_REPLAYS_PER_ADDRESS:
             raise HTTPException(
                 status_code=429,
                 detail=(
@@ -811,7 +857,7 @@ def create_app(
         try:
             info = get_match_info(match_id)
             events = generate_match(match_id)
-            replay = manager.prepare(events, speed)
+            replay = await prepare_replay(events, speed)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -1155,6 +1201,7 @@ def create_app(
         generation = session.stream_generation
         session.outbox.wake()
         session.stream_open = True
+        session.away_since = None
         if session.stream_deadline_task is not None:
             session.stream_deadline_task.cancel()
             session.stream_deadline_task = None
@@ -1187,6 +1234,7 @@ def create_app(
             finally:
                 if session.stream_generation == generation and not session.stopped:
                     session.stream_open = False
+                    session.away_since = time.monotonic()
                     if not planned_close and session.replay.state == "running":
                         # The viewer has gone (lock screen, app switch, lost signal): stop the
                         # match clock now rather than let it run on unseen. The page resumes

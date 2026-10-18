@@ -28,6 +28,7 @@ from tests.test_stream_resume import (
     _faster_clock,
     _json_request,
     _scope,
+    _settled,
     _stream,
 )
 
@@ -89,19 +90,6 @@ async def _until(condition, *, limit: float = 10.0, every: float = 0.02) -> None
         await asyncio.sleep(every)
 
 
-async def _settled(read, *, quiet: float = 0.6, limit: float = 10.0):
-    """The value once it has stopped changing for `quiet` seconds (at most `limit` seconds)."""
-    deadline = time.monotonic() + limit
-    value, since = read(), time.monotonic()
-    while time.monotonic() - since < quiet:
-        if time.monotonic() > deadline:
-            raise AssertionError(f"still changing after {limit} s: {value}")
-        await asyncio.sleep(0.05)
-        if (current := read()) != value:
-            value, since = current, time.monotonic()
-    return value
-
-
 def _cached(**overrides: Any) -> AgentSettings:
     return replace(_settings(delay=0.2), mode="cached", **overrides)
 
@@ -153,7 +141,7 @@ def test_a_paused_replay_is_kept_for_the_paused_grace_then_freed(
 ) -> None:
     _faster_clock(monkeypatch, 30)
     app, routes = _app(
-        _cached(stream_reconnect_grace_seconds=0.3, stream_paused_grace_seconds=1.5)
+        _cached(stream_reconnect_grace_seconds=0.3, stream_paused_grace_seconds=3)
     )
 
     async def run() -> None:
@@ -165,10 +153,10 @@ def test_a_paused_replay_is_kept_for_the_paused_grace_then_freed(
             await connection.drop()
             dropped = time.monotonic()
             # Well past the running replay's 0.3 s grace, the paused one is still there.
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(1.0)
             assert replay_id in app.state.sessions
-            await _until(lambda: replay_id not in app.state.sessions, limit=10)
-            assert time.monotonic() - dropped >= 1.5
+            await _until(lambda: replay_id not in app.state.sessions, limit=15)
+            assert time.monotonic() - dropped >= 3
             # The page then gets a 404, and shows "This replay has ended".
             with pytest.raises(HTTPException) as gone:
                 await _stream(routes, ip, replay_id, "1")
@@ -241,5 +229,110 @@ def test_no_model_or_speech_calls_while_paused(monkeypatch: pytest.MonkeyPatch) 
             await _until(lambda: pipeline.calls > calls[0], limit=20)
             await _until(lambda: synthesizer.calls > calls[1], limit=20)
             await second.drop()
+
+    asyncio.run(asyncio.wait_for(run(), 60))
+
+
+# A full app takes a slot from a viewer who has gone
+
+
+async def _start_as(routes, ip: str, client_id: str) -> str:
+    started = await routes["/api/matches/{match_id}/start"](
+        "m01", Request(_scope("/api/matches/m01/start", ip, client_id=client_id)), speed=1
+    )
+    _TOKENS[started["replay_id"]] = started["replay_token"]
+    return started["replay_id"]
+
+
+async def _fill_slots(routes, slots: int) -> list[tuple[str, str, Any]]:
+    """Start `slots` replays, each a different viewer on its own address, each watching."""
+    viewers = []
+    for index in range(slots):
+        ip = f"198.51.100.{150 + index}"
+        replay_id = await _start_as(routes, ip, f"evict-viewer-{index}")
+        connection = _Connection(await _stream(routes, ip, replay_id))
+        await connection.read(lambda got: True, timeout=10)  # the first message
+        viewers.append((ip, replay_id, connection))
+    return viewers
+
+
+def test_a_full_app_evicts_the_paused_replay_whose_viewer_has_gone() -> None:
+    app, routes = _app(_cached(max_concurrent_replays=6))
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            viewers = await _fill_slots(routes, 6)
+            away_ip, away_id, away_connection = viewers[2]
+            await away_connection.drop()  # the phone is locked: paused, no stream
+            assert app.state.sessions[away_id].replay.state == "paused"
+            replay_id = await _start_as(routes, "203.0.113.150", "evict-newcomer")
+            assert replay_id in app.state.sessions
+            assert away_id not in app.state.sessions
+            assert len(app.state.sessions) == 6
+            # The evicted viewer comes back: 404, and the page says the replay has ended.
+            with pytest.raises(HTTPException) as gone:
+                await _stream(routes, away_ip, away_id, "1")
+            assert gone.value.status_code == 404
+            # Everyone still watching keeps their replay.
+            for ip, kept, connection in viewers:
+                if kept != away_id:
+                    assert kept in app.state.sessions
+                    await connection.drop()
+
+    asyncio.run(asyncio.wait_for(run(), 60))
+
+
+def test_the_viewer_gone_longest_is_evicted_first() -> None:
+    app, routes = _app(_cached(max_concurrent_replays=3))
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            viewers = await _fill_slots(routes, 3)
+            await viewers[1][2].drop()  # gone first
+            await asyncio.sleep(0.05)
+            await viewers[0][2].drop()  # gone second
+            await _start_as(routes, "203.0.113.151", "evict-newcomer-2")
+            assert viewers[1][1] not in app.state.sessions
+            assert viewers[0][1] in app.state.sessions
+
+    asyncio.run(asyncio.wait_for(run(), 60))
+
+
+def test_with_every_viewer_watching_a_full_app_is_still_busy() -> None:
+    app, routes = _app(_cached(max_concurrent_replays=3))
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            viewers = await _fill_slots(routes, 3)
+            with pytest.raises(HTTPException) as busy:
+                await _start_as(routes, "203.0.113.152", "evict-newcomer-3")
+            assert busy.value.status_code == 503
+            assert busy.value.detail["code"] == "busy"
+            assert all(replay_id in app.state.sessions for _, replay_id, _ in viewers)
+
+    asyncio.run(asyncio.wait_for(run(), 60))
+
+
+def test_at_the_address_cap_a_viewer_who_has_gone_gives_way() -> None:
+    # Three phones on one home network; one is locked. A fourth viewer there can start.
+    app, routes = _app(_cached(max_concurrent_replays=6))
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            ip = "198.51.100.170"
+            viewers = []
+            for index in range(3):
+                replay_id = await _start_as(routes, ip, f"home-viewer-{index}")
+                connection = _Connection(await _stream(routes, ip, replay_id))
+                await connection.read(lambda got: True, timeout=10)
+                viewers.append((replay_id, connection))
+            await viewers[0][1].drop()  # locked
+            newcomer = await _start_as(routes, ip, "home-viewer-3")
+            assert newcomer in app.state.sessions
+            assert viewers[0][0] not in app.state.sessions
+            # With all three present, the address cap still refuses a fourth.
+            with pytest.raises(HTTPException) as capped:
+                await _start_as(routes, ip, "home-viewer-4")
+            assert capped.value.status_code == 429
 
     asyncio.run(asyncio.wait_for(run(), 60))

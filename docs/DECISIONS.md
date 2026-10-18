@@ -880,3 +880,36 @@ On a real iPhone, locking the screen stopped the match and it never came back. T
 - **11-minute lock.** The server freed the replay at 600 s (`replay_stream_not_reconnected … seconds=600`). On return the page showed "This replay has ended." with Start again, the dot red. Start again ran a new replay.
 
 Not covered here: a real iPhone. In particular, whether iOS delivers the keepalive request before freezing the page, and whether Safari fires `visibilitychange` on lock. The server pause on the dropped stream covers the first case.
+
+### Group 3: slot eviction and test reliability
+
+**Slot eviction.** When a Start needs a slot and all `MAX_CONCURRENT_REPLAYS` are taken, the server stops the replay whose viewer has been gone longest: paused, no stream connected, ordered by when its stream dropped (`away_since`). It is logged as `replay_evicted`. Its viewer gets a 404 on return and the page shows "This replay has ended" with Start again. A replay with a viewer connected is never evicted, so with everyone watching a full app still answers "busy". The per-address cap (3 replays per address) does the same before refusing with 429: that address's longest-gone paused replay gives way. The gate found this case: with the 10-minute hold, a household where one phone is locked would otherwise have kept a third viewer on the same network out. Tests in `tests/test_away.py`: six slots full with one viewer gone, a new Start succeeds and the gone viewer's stream gets 404; the viewer gone longest goes first; with everyone watching the app is still busy; at the address cap a gone viewer gives way and three present viewers still cap it. With eviction switched off, the first two fail. In a browser (two slots): A started and locked, B started, C's Start took A's slot, and A came back to "This replay has ended" while B kept running.
+
+**The event-loop tests.** One run's longest event-loop gap is a single sample. In the full suite it sometimes caught a pause of the whole test process: 398 ms in the 7-minute test (limit 100 ms) and 266 ms in the full-match test (limit 200 ms), both well under 100 ms alone. A probe with a 3-million-object heap didn't reproduce it and saw no full collection, so garbage collection isn't proven as the cause. The fix doesn't depend on the cause:
+- **Median of several runs.** Each test now measures 5 runs (the 7-minute test, about 0.7 s each) or 3 (the full match, about 13 s each) and asserts on the median of the runs' longest gaps. A blocking call in the dispatcher blocks every run, so the median catches it; a one-off pause lands in one run and doesn't move the median. The thresholds stay 100 ms and 200 ms in and out of the suite. A higher threshold just for the suite was rejected because it would let a real block of up to that size through in the run that matters.
+- Garbage is collected before each run, and any full collection during a run is printed with its length, so a slow run in the suite shows whether GC was involved.
+- **Still catches a real block.** With the tactical evaluation moved back onto the event loop (no `to_thread`), every run showed it: 250, 251, 251, 250, 251 ms (median 251, limit 100) and 509, 541, 501 ms (median 509, limit 200). Both tests failed.
+
+**Fixed short waits.** Every wait in the suite was reviewed. A wait for something that should happen now waits for that condition, with a generous upper limit that only stops a hang:
+- `test_stopping_replay_cancels_in_flight_agent_runs`: the pipeline call starting had 1 s; now 10 s.
+- `test_replay_pause_resume_preserves_order_and_as_of`: delivery 1 s → 10 s.
+- `test_api` warm-up: a 0.15 s sleep before "ready" → poll `/healthz` until ready, up to 10 s.
+- `test_trust_and_accuracy` broadcast pause: a 0.02 s sleep assumed every event was stamped and none released, with a 0.1 s delay, so any stall over 0.1 s released events early. Now it waits until all are stamped, then pauses; the delay is 0.5 s and the hold 1 s. The completion limits went from 1–2 s to 10 s.
+- `test_stream_resume` paused reconnect: a 0.4 s sleep to "let the outbox drain" → wait until the outbox stops growing (`_settled`, shared with `test_away.py`). The stale-connection wait went from 1 s to 10 s.
+- `test_away` paused grace: the "still there" check now has a 3 s grace against a 1 s look, not 1.5 s against 0.8 s.
+
+Left as they are: waits that check something *doesn't* happen (load only makes those more lenient), waits that are part of the scenario (time passing while away), `sleep(0)` yields, and polling loops that already had deadlines.
+
+**A test that passed for the wrong reason.** `test_sse_disconnect_stops_the_replay_after_the_reconnect_grace` asserted after `asyncio.run` returned, when app shutdown had already stopped every session. After group 2 the grace never stopped that replay (the drop pauses it for 10 minutes), and the test still passed. It is now `test_sse_disconnect_pauses_then_frees_the_replay_after_the_grace`: it checks inside the app's lifetime that the drop paused the replay and that it was freed after the paused grace.
+
+### Gate, 18 Oct 2026 (local)
+
+| Check | Result |
+| :-- | :-- |
+| Layout at 375, 390, 430 (Playwright Chromium, phone emulation; normal text, fonts 130%, page zoom 130%) | `scrollWidth` equal to `innerWidth` in all 18 cases, also with the overflow clip lifted; no element past the right edge. Header plus controls at 390×844: 129 px (15.3%) before Start, 89 px (10.6%) running |
+| Simulated 2-minute lock (m01, 20x, real Azure Speech) | Welcome back card; nothing moved before the tap; 447 messages handled, last ID 447; event seqs contiguous and unique; each line once; a line clip played after the tap |
+| Simulated 11-minute lock | Freed at 600 s (`replay_stream_not_reconnected … seconds=600`); "This replay has ended" with Start again, which started a new replay |
+| Slot eviction (browser, 2 slots) | The locked viewer's slot went to the new Start; that viewer came back to "This replay has ended" |
+| Full suite twice in a row | See the session report |
+
+Screenshots: `docs/screenshots/mobile/` (1×). iPhone checks of groups 1 and 2 (layout, 1-minute lock, app switch, airplane-mode blip) passed on the deployed app.

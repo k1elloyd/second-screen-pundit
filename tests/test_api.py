@@ -518,10 +518,14 @@ def test_the_default_global_cap_is_six_with_three_per_address() -> None:
     assert full.status_code == 503 and full.json()["detail"]["code"] == "busy"
 
 
-def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:
-    # Phase 4: a dropped stream no longer stops the replay at once; the browser has
-    # STREAM_RECONNECT_GRACE_SECONDS to reconnect before the replay and its session go.
-    settings = replace(_settings(), stream_reconnect_grace_seconds=0.2)
+def test_sse_disconnect_pauses_then_frees_the_replay_after_the_grace() -> None:
+    # Phase 4: a dropped stream no longer stops the replay at once. Mobile group 2: the drop
+    # pauses a running replay, which is kept for STREAM_PAUSED_GRACE_SECONDS before it and
+    # its session go. The checks run inside the app's lifetime: after it, shutdown stops
+    # every session anyway, which once let this test pass without the grace doing anything.
+    settings = replace(
+        _settings(), stream_reconnect_grace_seconds=0.2, stream_paused_grace_seconds=0.4
+    )
     app = create_app(settings=settings, pipeline=PunditPipeline(settings, None))
 
     async def run_disconnect() -> tuple[ReplaySession, bool]:
@@ -554,15 +558,19 @@ def test_sse_disconnect_stops_the_replay_after_the_reconnect_grace() -> None:
             chunks = [await response.body_iterator.__anext__() for _ in range(2)]
             await response.body_iterator.aclose()
             assert not session.stopped  # still inside the grace period
-            await asyncio.sleep(0.4)
+            assert session.replay.state == "paused"  # the drop paused it at once
+            dropped = time.monotonic()
+            async with asyncio.timeout(10):  # waits for the stop; the limit only stops a hang
+                while session.replay_id in app.state.sessions:
+                    await asyncio.sleep(0.02)
+            assert time.monotonic() - dropped >= 0.4
+            assert session.stopped
+            assert session.replay.state == "stopped"
             return session, b"event: event" in b"".join(chunks)
 
     session, got_event = asyncio.run(run_disconnect())
 
     assert got_event
-    assert session.stopped
-    assert session.replay.state == "stopped"
-    assert session.replay_id not in app.state.sessions
 
 
 def test_sse_reports_worker_failure_and_completes_full_time(
@@ -663,5 +671,8 @@ def test_live_model_warmup_runs_in_background_and_gates_start() -> None:
             headers={"X-Client-ID": "warmup-tab"},
         )
         assert gated.status_code == 503
-        time.sleep(0.15)
+        # The warm-up takes 0.1 s; wait for "ready" rather than guess, up to 10 s.
+        deadline = time.monotonic() + 10
+        while client.get("/healthz").json()["warmup"] != "ready" and time.monotonic() < deadline:
+            time.sleep(0.02)
         assert client.get("/healthz").json()["warmup"] == "ready"

@@ -337,7 +337,8 @@ def test_stopping_replay_cancels_in_flight_agent_runs() -> None:
             )
         )
 
-        await asyncio.wait_for(started.wait(), timeout=1)
+        # Waits for the condition, not a guessed time; the limit only stops a hang.
+        await asyncio.wait_for(started.wait(), timeout=10)
         await replay.stop()
         await dispatch_task
 

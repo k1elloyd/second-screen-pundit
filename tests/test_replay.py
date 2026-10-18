@@ -37,7 +37,7 @@ def test_replay_pause_resume_preserves_order_and_as_of() -> None:
         assert replay.as_of == 0
 
         assert await replay.control("resume") == "running"
-        delivered = await asyncio.wait_for(_collect(replay), timeout=1)
+        delivered = await asyncio.wait_for(_collect(replay), timeout=10)
         second_delivered = [event async for event in second_reader]
         assert [event.seq for event in delivered] == [1, 2, 3]
         assert [event.seq for event in second_delivered] == [1, 2, 3]

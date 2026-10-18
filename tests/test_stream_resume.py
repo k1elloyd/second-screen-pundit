@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -101,6 +102,19 @@ class _Connection:
 
     async def drop(self) -> None:
         await self.body.aclose()
+
+
+async def _settled(read, *, quiet: float = 0.6, limit: float = 10.0):
+    """The value once it has stopped changing for `quiet` seconds (at most `limit` seconds)."""
+    deadline = time.monotonic() + limit
+    value, since = read(), time.monotonic()
+    while time.monotonic() - since < quiet:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"still changing after {limit} s: {value}")
+        await asyncio.sleep(0.05)
+        if (current := read()) != value:
+            value, since = current, time.monotonic()
+    return value
 
 
 def _app(settings, pipeline=None):
@@ -275,8 +289,9 @@ def test_a_paused_replay_stays_paused_across_a_reconnect(monkeypatch: pytest.Mon
                 replay_id, _json_request({"action": "pause"}, ip, replay_id)
             )
             assert paused["state"] == "paused"
-            await asyncio.sleep(0.4)  # let anything already released drain into the outbox
-            sent = len(session.outbox)
+            # Let anything already released drain into the outbox: wait until it stops
+            # growing, rather than guess how long that takes.
+            sent = await _settled(lambda: len(session.outbox))
             released = session.viewer_released_as_of
             await first.drop()
             await asyncio.sleep(0.5)
@@ -359,12 +374,12 @@ def test_a_new_connection_replaces_an_unnoticed_dead_one() -> None:
             fresh = await _stream(routes, ip, replay_id, last_event_id="0")
             # It ends at once instead of holding the replay.
             with pytest.raises(StopAsyncIteration):
-                await asyncio.wait_for(waiting, 1)
+                await asyncio.wait_for(waiting, 10)
             session = app.state.sessions[replay_id]
             assert session.stream_open and not session.stopped
             await fresh.body_iterator.aclose()
 
-    asyncio.run(asyncio.wait_for(run(), 10))
+    asyncio.run(asyncio.wait_for(run(), 30))
 
 
 # ---- A replay belongs to whoever holds its token, not to an address ----
@@ -409,7 +424,7 @@ def test_a_request_without_the_replay_token_is_refused() -> None:
             assert session.stream_open
             await connected.body_iterator.aclose()
 
-    asyncio.run(asyncio.wait_for(run(), 10))
+    asyncio.run(asyncio.wait_for(run(), 30))
 
 
 def test_two_viewers_on_one_address_each_run_a_replay() -> None:
