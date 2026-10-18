@@ -32,6 +32,7 @@ from second_screen_pundit.agents.models import CommentaryLine, CommentaryReply
 from second_screen_pundit.agents.pipeline import PunditPipeline, is_must_say
 from second_screen_pundit.agents.signals import SIGNAL_TOOL, SignalTracker, signals_tool_result
 from second_screen_pundit.agents.speech import build_ssml
+from second_screen_pundit.agents.spoken import number_words
 from second_screen_pundit.agents.wording import back_line_note, name_teams
 from second_screen_pundit.agents.tools.analytics import (
     ToolResult,
@@ -467,6 +468,8 @@ def test_every_signal_fallback_variant_passes_for_every_team() -> None:
                 values["back_line"] = back_line_note(
                     values.get("previous_formation"), values.get("new_formation")
                 )
+                if "window" in values:
+                    values["window_words"] = number_words(int(values["window"]))
                 fact_ids = [fact.fact_id for result in results for fact in result.facts]
                 for template in FALLBACK_VARIANTS[kind]:
                     # The line as it ships: full name first, short form after.

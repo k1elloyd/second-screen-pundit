@@ -76,6 +76,22 @@ def formation_key(seq: int) -> str:
     return f"formation_{seq}"
 
 
+# The commentator never sees a raw match average; it sees this description instead.
+MATCH_AVERAGE = "match_average"
+RATE_DESCRIPTION = "rate_description"
+
+
+def rate_description(recent: float, average: float) -> str | None:
+    """ "well above their usual rate" at 2x the match average or more, "above their usual rate"
+    at 1.5x or more, otherwise nothing."""
+    ratio = float("inf") if average <= 0 else recent / average
+    if recent > 0 and ratio >= 2:
+        return "well above their usual rate"
+    if recent > 0 and ratio >= 1.5:
+        return "above their usual rate"
+    return None
+
+
 def _clock(event: Event) -> int:
     return event.minute + event.added_minute
 
@@ -521,13 +537,29 @@ class SignalTracker:
                         ),
                         _fact(
                             key,
-                            "match_average",
+                            MATCH_AVERAGE,
                             f"{label} match-to-date high turnovers per {window} minutes, "
                             f"0-{now}'",
                             round(team_average, 2),
                             "turnovers",
                             [event.event_id for event in team_total],
                             clock=now,
+                        ),
+                        *(
+                            (
+                                _fact(
+                                    key,
+                                    RATE_DESCRIPTION,
+                                    f"{label} high-turnover rate compared with their match "
+                                    f"average, 0-{now}'",
+                                    description,
+                                    None,
+                                    [event.event_id for event in team_recent],
+                                    clock=now,
+                                ),
+                            )
+                            if (description := rate_description(len(team_recent), team_average))
+                            else ()
                         ),
                         _fact(
                             key,

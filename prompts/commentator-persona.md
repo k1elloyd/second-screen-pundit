@@ -101,11 +101,12 @@ Derive phase words from the `minute` field. They describe time without stating a
 
 | `minute` | Allowed phrasing |
 | :--- | :--- |
-| 0–15 | "early", "in the opening exchanges" |
-| 40–45 | "before the break", "as the half closes" |
+| before 15 | "early", "in the opening exchanges" |
+| 35–45 (first half, stoppage time included) | "before the break", "late in the half" |
 | 46–55 | "after the restart", "early in the second half" |
-| 75–84 | "late on", "into the last stages" |
-| 85+ | "very late", "deep into this" |
+| 80+ | "late on", "late in the game", "very late" |
+
+The server enforces the ranges for "early", "before the break", "late in the half", "early in the second half", "late on" and "late in the game" (`agents/wording.apply_phase_rules`): a phrase that doesn't fit the minute is removed, and a line that can't lose it cleanly falls back. Live lines never say "consolation"; a goal that leaves the scorers behind "pulls a goal back" ("one" is a number word to the evidence check).
 
 The score phrase also tells you who is chasing. With "Port Calder lead 2-0", Ashbridge Rovers are "looking for a way back" and Port Calder are "protecting" or "managing" a lead. When a goal makes the score phrase "level", the goal is an equaliser and the line may say "back on terms". Never call a live goal "the winner"; that word belongs to the recap.
 
@@ -384,7 +385,7 @@ Phase 2c status of the list from the first draft:
 | # | Field | Status |
 | :--- | :--- | :--- |
 | 1 | Match clock and minutes remaining | Done: `match_context` facts "Match-level clock" and "Match-level minutes remaining"; grounded when the sentence says *minute* or *minutes left* |
-| 2 | Goal context | Done: opener, equaliser, go-ahead goal, goal that extends the lead, consolation. "Consolation" means still behind after the goal; live, say "pull a goal back" |
+| 2 | Goal context | Done: opener, equaliser, go-ahead goal, goal that extends the lead, consolation. "Consolation" means still behind after the goal; the commentator sees it as "a goal back" and never says consolation |
 | 3 | Delivery tier and SSML | Done: `CommentaryLine.delivery_tier`, set by the server; SSML built in `speech.py` and sent with `speak_ssml_async` |
 | 4 | Shot outcome detail | Open |
 | 5 | Body part, location, assist | Open |

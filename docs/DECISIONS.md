@@ -779,3 +779,47 @@ Wording and small fixes only; the pipeline structure, timing, evidence rules, st
 - **Browser** (Playwright Chromium, m02 then m01 at 20x, live): every queued clip played. m02: 11 line clips (goal, red card, equaliser, late go-ahead), the answer and the recap. m01: 13 line clips (all five goals) and the recap. With the first answer's evidence check forced to fail by a gate-only launcher, the answer card showed "Checking the facts…" and the answer then replaced it: "Port Calder FC have 60% possession and Merehaven Athletic 40%", with facts of 59.7% and 40.3%.
 - No line in either latency run spoke a possession pair; the browser answer above is the pair seen live. The pairs are covered by tests for every window and snapshot in m01–m03.
 - The browser m01 run had one clock line, "… 67 minutes gone." on the 67' formation line (within the budget). "Minutes gone/played" wasn't recognised as a clock reading; it is now.
+
+## Polish follow-up: wording accuracy, 17 Oct 2026
+
+Deterministic post-checks and template changes; the evidence check is unchanged. A model line that fails one of the wording checks goes straight to its deterministic line (no retry), like a banned phrase.
+
+- **Scoring-team phrases.** On a goal line, "back on terms", "level it", "the equaliser", "the opener", "struck first", "a goal back" and similar must follow the scoring team: the nearest team named before the phrase in its sentence must be the scorer (`scorer_phrase_failures`).
+- **No "consolation" live.** Out of the commentator instructions, on the live banned list, and the goal-context fact is shown to the commentator as "a goal back". The recap keeps "a goal back".
+- **Possessives.** A name ending in s takes an apostrophe only ("Ashbridge Rovers'"), on every line.
+- **Phase words fit the minute.** "early" before 15'; "before the break" and "late in the half" from 35' in the first half (stoppage time included); "early in the second half" up to 55'; "late on" and "late in the game" from 80'. A misplaced phrase is removed; if that leaves a broken sentence (too short, a dangling word, "an" before a consonant), the line falls back.
+- **Final punctuation** on every line, cached ones included.
+- **Fallback variety.** Every tactical fallback kind has 3 to 6 versions; the dispatcher keeps the templates used in the match and a fallback picks an unused one first.
+- **No empty restating.** Lines other than goals and red cards never get the score phrase at 0-0; the existing rule (not when any of the last 3 lines gave it) covers the rest.
+- **Comparisons.** "up from N%" must name the period it compares with; "N-point swing" is banned. The possession fallback says "up from 45% in the 10 minutes before that".
+- **Fallback wording.** "the better of the expected goals" became "the better of the chances" (without the window number, which the check can only ground next to "xG").
+- **Late drama.** A peak goal from 80' may give its minute even soon after another clock line; the 1-in-4 cap still holds.
+- **Docs.** The build prompt's replay lines now say 6 slots, 3 per address, 429 and 503, and the resumable stream.
+
+### Live gate, m01 and m02 at 20x
+
+Every new check is clean in both runs: no line without final punctuation, no "Rovers's", no "consolation", no point swing, no tactical 0-0, no repeated fallback line, no wording rejection, no clock line, no "FC" after a first mention, one red-card line in m02, tokens counted for every call.
+
+The model share fell: m01 8 of 13 lines from the model (9 before), m02 5 of 11 (9 before). The fallbacks came from evidence failures on both attempts, led by:
+- an ungrounded "10" (9 times across the runs; "ten" once): the model says "the last 10 minutes" without a citable window fact in that sentence;
+- "score stated when score_phrase was null" (4 in m02): with the new 0-0 rule the tactical lines get no score phrase, and the model still writes "The score is level at 0-0".
+
+### Follow-up 2: recovering the model's lines, 18 Oct 2026
+
+- **Window lengths are grounded.** "the last / previous / past N minutes" passes the evidence check when N is a window length configured in `engine/analytics.yaml` (today 10 and 5), in digits or words. Any other N, or N in another phrase ("for 10 minutes"), still needs a fact.
+- **A withheld score is removed, not rejected.** With no score phrase, a short trailing score sentence ("The score is level at 0-0.") is cut; a score anywhere else still fails the line check.
+- **Comparison example** in the commentator instructions is now "up from 45% before that" (no window number).
+- **Possession fallback:** "{team} have taken over the ball: {after}% of the possession in the last {window in words} minutes, up from {before}% before that." "of the possession" is there because the check grounds a possession percentage only in a sentence that says possession. The "N points more of the possession" version is gone.
+- **"a man short"** (and "down", "light") becomes "a player short" in the same pass as the team names (`apply_house_style`), cached lines included.
+
+Live, 20x: m01 11 of 13 lines from the model (target 9), m02 8 of 11 (target 8). All wording checks clean; one clock line in m01 (8%). Remaining fallbacks: two m02 goal lines whose replies stated the score without citing the score fact ("score does not match" 5, away-leader rule 2), and three tactical windows.
+
+### Follow-up 3: score citation, match averages, red cards, 18 Oct 2026
+
+- **Score citation.** When a model line contains the supplied score phrase (in full or with the short form the house style gives it), the server adds the score fact to the line's citations. A wrong score still fails.
+- **No raw match averages for the commentator.** The high-turnover signal carries a rate description fact ("well above their usual rate" at 2x the match average or more, "above their usual rate" at 1.5x, otherwise none). A cited average stays in the Insight, so the Insight's own check holds, but the commentator's facts and fact IDs leave it out, the description comes in, and an average cited back in a line is dropped, so its number can't be grounded.
+- **Red cards.** The instructions ask for the consequence ("a player short"; "down to ten men" only with the players-on-the-pitch fact) rather than repeating that a card was shown.
+
+Live, 20x: m01 10 of 13 lines from the model, m02 8 of 11; both m02 goal lines are model lines now. No raw average was spoken; the m02 red-card line gave the consequence. The scorer-phrase check sent one m01 line (81', the equaliser) to its fallback.
+
+This ends the commentary changes for the polish session.

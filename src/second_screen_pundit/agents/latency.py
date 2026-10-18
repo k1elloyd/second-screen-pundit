@@ -214,8 +214,31 @@ def wording_checks(
         for outcome in outcomes
         if outcome.result is not None and outcome.result.banned_phrases
     ]
+    wording = [
+        {"minute": outcome.minute, "failures": list(outcome.result.wording_failures)}
+        for outcome in outcomes
+        if outcome.result is not None and outcome.result.wording_failures
+    ]
+    fallback_texts = [line.text for line in lines if line.source == "fallback"]
+    tactical_nil_nil = [
+        outcome.result.line.text
+        for outcome in outcomes
+        if outcome.path == "tactical"
+        and outcome.result is not None
+        and outcome.result.line is not None
+        and "level at 0-0" in outcome.result.line.text
+    ]
     return {
         "lines": len(texts),
+        "no_end_punctuation": [text for text in texts if text.rstrip()[-1:] not in ".!?"],
+        "s_apostrophe_s": [text for text in texts if re.search(r"\b[A-Z][\w-]*s['’]s\b", text)],
+        "consolation": [text for text in texts if "consolation" in text.casefold()],
+        "point_swing": [text for text in texts if re.search(r"\d+[- ]points?\s+swing", text)],
+        "tactical_nil_nil": tactical_nil_nil,
+        "repeated_fallback_lines": sorted(
+            {text for text in fallback_texts if fallback_texts.count(text) > 1}
+        ),
+        "wording_rejections": {"rejected": len(wording), "details": wording},
         "minute_and_minutes_left": both,
         "clock_lines": len(clock),
         "clock_share": round(len(clock) / len(texts), 3) if texts else 0.0,

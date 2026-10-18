@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import random
 import string
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 
 FallbackKind = str
 
@@ -68,23 +68,30 @@ FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
         "{score_phrase}.",
         "{team} have changed to a {new_formation} shape{back_line}. {score_phrase}.",
     ),
+    # A comparison names the period it compares with ("up from 45% in the 10 minutes before
+    # that"); no version restates a swing in points on its own.
     "possession_swing": (
         "{team} have had {after}% of the possession over the last {window} minutes. {score_phrase}.",
-        "{team} are seeing far more of the ball now: {after}% possession, up from {before}%.",
-        "The ball belongs to {team} at the moment, their possession up by {change} points.",
+        # {window_words} is the configured window length in words ("ten").
+        "{team} have taken over the ball: {after}% of the possession in the last "
+        "{window_words} minutes, up from {before}% before that.",
         "{team} have taken control of the ball in this spell. {score_phrase}.",
+        "{team} are seeing much more of the ball now. {score_phrase}.",
     ),
     "high_turnover_surge": (
         "{team} are winning the ball high up the pitch: {recent} high turnovers in this spell.",
         "{team} are pressing and it is working, with {recent} high turnovers recently.",
         "{team} keep winning it back in their opponents' half. {score_phrase}.",
         "Another turnover high up for {team}, and the press is biting. {score_phrase}.",
+        "{team} are forcing mistakes high up the pitch. {score_phrase}.",
     ),
     "xg_surge": (
         "{team} are creating {chance_descriptor} in this spell. {score_phrase}.",
         "The openings are falling to {team} at the moment. {score_phrase}.",
-        "{team} have had the better of the expected goals over the last {window} minutes.",
+        "{team} have had the better of the chances in this spell. {score_phrase}.",
         "{team} have the momentum, and the chances to go with it. {score_phrase}.",
+        "{team} are carving out the clearer openings now. {score_phrase}.",
+        "{team} are the side asking the questions in this spell. {score_phrase}.",
     ),
 }
 
@@ -104,24 +111,54 @@ def fallback_lines(
     *,
     line_id: str,
 ) -> Iterator[str]:
-    """Yield the usable variants for a kind, in an order seeded by the line ID.
+    """Yield the usable variants for a kind, in an order seeded by the line ID."""
+    for _, text in fallback_choices(kind, values, line_id=line_id):
+        yield text
+
+
+def fallback_choices(
+    kind: FallbackKind,
+    values: Mapping[str, object],
+    *,
+    line_id: str,
+    used: Collection[str] = (),
+) -> Iterator[tuple[str, str]]:
+    """Yield (template, text) for the usable variants, in an order seeded by the line ID.
 
     A variant is usable only when every placeholder it needs has a value. With no
     score_phrase, the line isn't meant to state the score, so the closing score sentence is
-    dropped rather than the variant.
+    dropped rather than the variant. Templates in ``used`` (this match's earlier fallback
+    lines) come last, so no version repeats while an unused one can be said.
     """
+    for template, text in _ordered_choices(kind, values, line_id=line_id):
+        if template not in used:
+            yield template, text
+    for template, text in _ordered_choices(kind, values, line_id=line_id):
+        if template in used:
+            yield template, text
+
+
+def _ordered_choices(
+    kind: FallbackKind,
+    values: Mapping[str, object],
+    *,
+    line_id: str,
+) -> Iterator[tuple[str, str]]:
     available = {
         **_OPTIONAL,
         **{key: value for key, value in values.items() if value not in (None, "")},
     }
-    templates = FALLBACK_VARIANTS[kind]
+    # (the template as written, which names it; the template as said)
+    templates = [(template, template) for template in FALLBACK_VARIANTS[kind]]
     if "score_phrase" not in available:
-        templates = tuple(template.replace(_SCORE_SENTENCE, "") for template in templates)
+        templates = [
+            (template, template.replace(_SCORE_SENTENCE, "")) for template, _ in templates
+        ]
     usable = [
-        template
-        for template in templates
-        if _placeholders(template) <= available.keys()
+        (template, said)
+        for template, said in templates
+        if _placeholders(said) <= available.keys()
     ]
     random.Random(line_id).shuffle(usable)
-    for template in usable:
-        yield template.format(**available)
+    for template, said in usable:
+        yield template, said.format(**available)

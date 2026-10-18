@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from functools import lru_cache
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from second_screen_pundit.agents.models import (
     Insight,
     Recap,
 )
-from second_screen_pundit.agents.tools.analytics import Fact, ToolResult
+from second_screen_pundit.agents.tools.analytics import Fact, ToolResult, _thresholds
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import label_side, name_mentioned, team_name
 
@@ -291,6 +292,29 @@ def _grounding_facts(
     return grounding
 
 
+# "the last 10 minutes" names a signal window, not a statistic: it is grounded when N is one
+# of the window lengths configured in engine/analytics.yaml, in digits or words. Any other N
+# still needs a fact.
+_WINDOW_PHRASE = re.compile(
+    r"\bthe\s+(?:last|previous|past)\s+"
+    r"(?P<n>\d{1,3}|zero|one|two|three|four|five|six|seven|eight|nine|ten)\s+minutes\b",
+    re.IGNORECASE,
+)
+
+
+@lru_cache(maxsize=1)
+def _configured_windows() -> frozenset[float]:
+    return frozenset(
+        float(value) for key, value in _thresholds().items() if key.endswith("_window_minutes")
+    )
+
+
+def _is_window_length(sentence: str, number: NumberMention, start: int) -> bool:
+    return number.value in _configured_windows() and any(
+        match.start("n") == start for match in _WINDOW_PHRASE.finditer(sentence)
+    )
+
+
 _PERCENT_AFTER = re.compile(r"\s*(?:%|per\s*cent\b|percent\b)", re.IGNORECASE)
 _MINUTE_WORD = re.compile(r"\bminutes?\b", re.IGNORECASE)
 _MINUTE_MARK_AFTER = re.compile(r"(?:\s*[-–]\s*\d{1,3})?['’]")
@@ -435,6 +459,10 @@ _FAILURE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("IDs or brackets in spoken text", r"must be plain spoken English"),
         ("line too long", r"text is (?P<subject>\d+) characters"),
         ("banned phrase", r"banned phrase (?P<subject>.+)"),
+        ("scoring phrase attached to the other team",
+         r"scorer phrase '(?P<subject>[^']+)' is attached"),
+        ("comparison without its period", r"comparison '(?P<subject>[^']+)' does not name"),
+        ("phase word does not fit the minute", r"phase words (?P<subject>.+?) don't fit"),
         ("duplicate fact ID", r"duplicate fact_id within run: (?P<subject>\S+)"),
     )
 )
@@ -596,6 +624,8 @@ def check_evidence(
                     number_start < span.end() and number_end > span.start()
                     for span in [*score_spans, *formation_spans, *back_line_spans]
                 ):
+                    continue
+                if _is_window_length(sentence, number, number_start):
                     continue
                 if number.value in cited_minutes and _is_minute_mention(
                     sentence, number, number_end

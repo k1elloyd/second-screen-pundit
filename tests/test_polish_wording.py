@@ -210,6 +210,8 @@ class _ClockyPipeline:
         is_stale: Callable[[], bool] | None = None,
         recent_lines: Sequence[str] = (),
         clock_allowed: bool = True,
+        late_clock_allowed: bool = False,
+        used_fallbacks: set[str] | None = None,
     ) -> LiveWindowResult:
         line = CommentaryLine(
             line_id=f"x-l{as_of}",

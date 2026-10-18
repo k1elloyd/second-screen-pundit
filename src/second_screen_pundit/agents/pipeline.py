@@ -58,7 +58,7 @@ from second_screen_pundit.agents.evidence import (
     classify_failure,
     mentions_score,
 )
-from second_screen_pundit.agents.fallbacks import fallback_lines
+from second_screen_pundit.agents.fallbacks import fallback_choices
 from second_screen_pundit.agents.models import (
     Claim,
     CommentaryLine,
@@ -79,11 +79,14 @@ from second_screen_pundit.agents.prompts import (
     RECAP_INSTRUCTIONS,
 )
 from second_screen_pundit.agents.signals import (
+    MATCH_AVERAGE,
+    RATE_DESCRIPTION,
     SIGNAL_TOOL,
     TacticalSignal,
     signal_prompt,
     signals_tool_result,
 )
+from second_screen_pundit.agents.spoken import number_words
 from second_screen_pundit.agents.tools.analytics import (
     Fact,
     ToolResult,
@@ -98,12 +101,18 @@ from second_screen_pundit.agents.tools.parameters import KeyMomentsParams, Match
 from second_screen_pundit.agents.tools.runtime import build_analytics_tools
 from second_screen_pundit.agents.wording import (
     CLOCK_TIERS,
+    LATE_DRAMA_MINUTE,
     apply_clock_rules,
+    apply_house_style,
+    apply_phase_rules,
     back_line_failures,
     back_line_note,
     banned_phrase_hits,
+    comparison_failures,
     mentions_clock,
     name_teams,
+    scorer_phrase_failures,
+    strip_withheld_score,
 )
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import label_side, short_form_variants, team_name
@@ -140,6 +149,9 @@ class LiveWindowResult:
     banned_phrases: tuple[str, ...] = ()
     # "role: rule: subject" for each failed check on any attempt in this window.
     evidence_failures: tuple[str, ...] = ()
+    # Every wording failure (banned phrase, scorer phrase, comparison, phase word) that sent a
+    # model line to the fallback.
+    wording_failures: tuple[str, ...] = ()
 
 
 AnswerSource = Literal["agent", "fallback", "out_of_scope", "cached"]
@@ -192,9 +204,14 @@ def score_phrase_allowed(
     *,
     goal_or_red_card: bool,
 ) -> bool:
-    """The score is said on goals and red cards, or when none of the last 3 lines said it."""
+    """The score is said on goals and red cards, or when none of the last 3 lines said it.
+
+    Other lines never restate an unchanged 0-0: with no goal yet, there's nothing to tell.
+    """
     if goal_or_red_card:
         return True
+    if phrase.endswith("level at 0-0"):
+        return False
     # A line names a team in full only the first time, so the phrase may carry the short form.
     forms = [form.casefold() for form in short_form_variants(phrase)]
     return not any(
@@ -238,6 +255,55 @@ def _log_failure_reasons(
         )
 
 
+def with_score_citation(
+    fact_ids: Sequence[str],
+    text: str,
+    score_phrase: str | None,
+    results: Sequence[ToolResult],
+    allowed_fact_ids: Sequence[str],
+) -> list[str]:
+    """A line that says the supplied score phrase cites the score fact it came from.
+
+    The model often states the phrase and leaves the score fact out of fact_ids, which the
+    evidence check needs. Only the exact supplied phrase (in full or with the team's short form,
+    as the house style writes it) earns the citation; a wrong score still fails.
+    """
+    if not score_phrase or not any(form in text for form in short_form_variants(score_phrase)):
+        return list(fact_ids)
+    score_fact = next(
+        (
+            fact.fact_id
+            for result in results
+            for fact in result.facts
+            if fact.label.startswith("Match-level score") and fact.fact_id in allowed_fact_ids
+        ),
+        None,
+    )
+    if score_fact is None or score_fact in fact_ids:
+        return list(fact_ids)
+    return [*fact_ids, score_fact]
+
+
+def is_raw_average(fact_id: str) -> bool:
+    return fact_id.endswith(f"_{MATCH_AVERAGE}")
+
+
+def with_rate_descriptions(insight: Insight, results: Sequence[ToolResult]) -> Insight:
+    """Each cited match average brings its signal's rate description ("well above their usual
+    rate") into the Insight. The average stays cited, so the Insight's own check still holds,
+    but the commentator never sees it (see the commentator prompt and its line's fact_ids)."""
+    known = {fact.fact_id for result in results for fact in result.facts}
+    descriptions = [
+        fact_id[: -len(MATCH_AVERAGE)] + RATE_DESCRIPTION
+        for fact_id in insight.fact_ids
+        if is_raw_average(fact_id)
+    ]
+    added = [fact_id for fact_id in descriptions if fact_id in known]
+    return insight.model_copy(
+        update={"fact_ids": list(dict.fromkeys([*insight.fact_ids, *added]))}
+    )
+
+
 def name_teams_in_recap(recap: Recap, info: MatchInfo) -> Recap:
     """Each recap text names a team in full once, then by its short form."""
     return recap.model_copy(
@@ -253,9 +319,25 @@ def name_teams_in_recap(recap: Recap, info: MatchInfo) -> Recap:
     )
 
 
-def polish_line_text(text: str, info: MatchInfo, *, clock_allowed: bool) -> str:
-    """The deterministic wording rules (agents/wording.py), applied before the evidence check."""
-    return name_teams(apply_clock_rules(tidy_spoken_text(text), clock_allowed=clock_allowed), info)
+def polish_line_text(
+    text: str,
+    info: MatchInfo,
+    *,
+    clock_allowed: bool,
+    minute: int,
+    period: int,
+    score_allowed: bool = True,
+) -> tuple[str, list[str]]:
+    """The deterministic wording rules (agents/wording.py), applied before the evidence check.
+
+    Returns the polished text and any failures: a phase word that doesn't fit the minute and
+    can't be removed without breaking the sentence.
+    """
+    text = apply_clock_rules(tidy_spoken_text(text), clock_allowed=clock_allowed)
+    if not score_allowed:
+        text = strip_withheld_score(text)
+    text, failures = apply_phase_rules(text, minute=minute, period=period)
+    return apply_house_style(text, info), failures
 
 
 _MUST_SAY_FALLBACK_KINDS = {
@@ -1055,9 +1137,14 @@ class PunditPipeline:
         is_stale: Callable[[], bool] | None = None,
         recent_lines: Sequence[str] = (),
         clock_allowed: bool = True,
+        late_clock_allowed: bool = False,
+        used_fallbacks: set[str] | None = None,
     ) -> LiveWindowResult:
         """``clock_allowed`` is the dispatcher's clock budget (agents/wording.py); routine
-        tiers never mention the clock whatever the budget."""
+        tiers never mention the clock whatever the budget. ``late_clock_allowed`` is the same
+        budget without the last-3-lines rule, for a peak goal from LATE_DRAMA_MINUTE.
+        ``used_fallbacks`` holds this match's fallback templates so far; a fallback line
+        avoids them and adds its own."""
         if not window:
             raise ValueError("A live window must contain at least one event")
         if self.settings.mode == "off":
@@ -1140,7 +1227,20 @@ class PunditPipeline:
             recent_lines,
             goal_or_red_card=delivery_tier in _SCORE_TIERS,
         )
-        line_clock_allowed = clock_allowed and delivery_tier in CLOCK_TIERS
+        line_clock_allowed = (clock_allowed and delivery_tier in CLOCK_TIERS) or (
+            late_clock_allowed and delivery_tier == "goal_peak" and clock >= LATE_DRAMA_MINUTE
+        )
+        latest_event = max(visible, key=lambda event: event.seq)
+        phase_clock = {"minute": latest_event.minute, "period": latest_event.period}
+
+        def polish(text: str) -> tuple[str, list[str]]:
+            return polish_line_text(
+                text,
+                info,
+                clock_allowed=line_clock_allowed,
+                score_allowed=score_allowed,
+                **phase_clock,
+            )
         output_failures: list[str] = []
 
         def record_invalid(role: AgentRole, attempt: int) -> Callable[[str], None]:
@@ -1273,6 +1373,8 @@ class PunditPipeline:
                         values[name] = (
                             fact.spoken_value if fact.spoken_value is not None else fact.value
                         )
+            if isinstance(values.get("window"), int | float):
+                values["window_words"] = number_words(int(values["window"]))  # type: ignore[arg-type]
             values["back_line"] = back_line_note(
                 values.get("previous_formation"),  # type: ignore[arg-type]
                 values.get("new_formation"),  # type: ignore[arg-type]
@@ -1310,10 +1412,12 @@ class PunditPipeline:
             kind, values, fact_ids, insight = plan
             line_id = live_line_id(info.match_id, as_of, lane)
             failures: tuple[str, ...] = ()
-            for text in fallback_lines(kind, values, line_id=line_id):
+            for template, text in fallback_choices(
+                kind, values, line_id=line_id, used=used_fallbacks or ()
+            ):
                 line = CommentaryLine(
                     line_id=line_id,
-                    text=polish_line_text(text, info, clock_allowed=line_clock_allowed),
+                    text=polish(text)[0],
                     insight_id=insight.insight_id,
                     fact_ids=list(dict.fromkeys(fact_ids)),
                     event_ids=insight.event_ids,
@@ -1334,6 +1438,8 @@ class PunditPipeline:
                     clock_allowed=line_clock_allowed,
                 )
                 if report.passed:
+                    if used_fallbacks is not None:
+                        used_fallbacks.add(template)
                     return LiveWindowResult(
                         "commentary",
                         line,
@@ -1569,7 +1675,7 @@ class PunditPipeline:
                         record_evidence("analyst", attempt, insight_report.failures)
                         feedback = "; ".join(insight_report.failures)
                         continue
-                    insight = candidate
+                    insight = with_rate_descriptions(candidate, accumulated_results)
                     cited_facts = {
                         fact.fact_id: fact
                         for result in accumulated_results
@@ -1603,17 +1709,32 @@ class PunditPipeline:
                             if key != "signals"
                         },
                         "events": event_contexts,
-                        "insight": insight.model_dump(
-                            mode="json", include={"headline", "fact_ids", "event_ids"}
-                        ),
+                        "insight": {
+                            **insight.model_dump(
+                                mode="json", include={"headline", "fact_ids", "event_ids"}
+                            ),
+                            # Raw match averages are never shown to the commentator.
+                            "fact_ids": [
+                                fact_id
+                                for fact_id in insight.fact_ids
+                                if not is_raw_average(fact_id)
+                            ],
+                        },
                         # Without a clock budget the clock facts are left out, so the model
                         # has no minute to say; any it says anyway is removed below.
+                        # The goal context "consolation" is shown as "a goal back": live
+                        # lines never say consolation (agents/wording.py bans it).
                         "facts": [
-                            fact
+                            {**fact, "value": "a goal back"}
+                            if fact.get("value") == "consolation"
+                            else fact
                             for fact in insight_facts
-                            if line_clock_allowed
-                            or not str(fact.get("label", "")).casefold().startswith(
-                                ("match-level clock", "match-level minutes remaining")
+                            if not is_raw_average(str(fact.get("fact_id", "")))
+                            and (
+                                line_clock_allowed
+                                or not str(fact.get("label", "")).casefold().startswith(
+                                    ("match-level clock", "match-level minutes remaining")
+                                )
                             )
                         ],
                         "recent_lines": list(recent_lines)[-3:],
@@ -1636,33 +1757,48 @@ class PunditPipeline:
                     invalid_output_roles.add("commentator")
                     feedback = _invalid_output("CommentaryReply")
                     continue
-                text = polish_line_text(reply.text, info, clock_allowed=line_clock_allowed)
+                text, phase_failures = polish(reply.text)
                 hits = banned_phrase_hits(
                     text, info, [str(event.team) for event in visible if event.type == "goal"]
                 )
-                if hits:
+                wording = [
+                    *(f"banned phrase {hit}" for hit in hits),
+                    *(
+                        scorer_phrase_failures(text, info, must_say_event.team)
+                        if must_say_event is not None
+                        and must_say_event.type == "goal"
+                        and must_say_event.team is not None
+                        else []
+                    ),
+                    *comparison_failures(text),
+                    *phase_failures,
+                ]
+                if wording:
                     logger.warning(
-                        "banned_phrase_rejected match_id=%s as_of=%d attempt=%d phrases=%s",
+                        "wording_rejected match_id=%s as_of=%d attempt=%d failures=%s",
                         info.match_id,
                         as_of,
                         attempt,
-                        "|".join(hits),
+                        " | ".join(wording),
                     )
-                    record_evidence(
-                        "commentator", attempt, [f"banned phrase {hit}" for hit in hits]
-                    )
-                    reason = "Banned phrase (" + ", ".join(hits) + "); deterministic line used."
+                    record_evidence("commentator", attempt, wording)
+                    reason = "Wording check (" + "; ".join(wording) + "); deterministic line used."
                     if fallback_plan() is not None:
-                        return replace(fallback_result(reason), banned_phrases=tuple(hits))
+                        return replace(
+                            fallback_result(reason),
+                            banned_phrases=tuple(hits),
+                            wording_failures=tuple(wording),
+                        )
                     return LiveWindowResult(
                         "rejected",
                         None,
                         None,
                         tuple(accumulated_results),
-                        EvidenceReport(False, tuple(f"banned phrase {hit}" for hit in hits)),
+                        EvidenceReport(False, tuple(wording)),
                         reason,
                         tuple(timings),
                         banned_phrases=tuple(hits),
+                        wording_failures=tuple(wording),
                     )
                 if len(text) > MAX_LINE_CHARS:
                     feedback = (
@@ -1674,7 +1810,14 @@ class PunditPipeline:
                     line_id=live_line_id(info.match_id, as_of, lane),
                     text=text,
                     insight_id=insight.insight_id,
-                    fact_ids=reply.fact_ids,
+                    fact_ids=with_score_citation(
+                        # A raw average can't ground a commentator's number.
+                        [fact_id for fact_id in reply.fact_ids if not is_raw_average(fact_id)],
+                        text,
+                        deterministic_score_phrase if score_allowed else None,
+                        accumulated_results,
+                        insight.fact_ids,
+                    ),
                     event_ids=reply.event_ids,
                     tone=TIER_TONES[delivery_tier],
                     source="agent",
@@ -1946,7 +2089,7 @@ class PunditPipeline:
                 None,
                 "No pre-generated line covers this event window.",
             )
-        line = line.model_copy(update={"text": name_teams(line.text, info)})
+        line = line.model_copy(update={"text": apply_house_style(line.text, info)})
         results = _cached_tool_results(events, as_of=as_of, fact_ids=line.fact_ids)
         report = check_evidence(
             line,

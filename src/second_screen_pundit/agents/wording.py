@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 
+from second_screen_pundit.agents.evidence import mentions_score
 from second_screen_pundit.engine.schema import MatchInfo
 from second_screen_pundit.engine.teams import team_name
 
@@ -29,6 +30,8 @@ RECENT_LINES_FOR_CLOCK = CLOCK_SHARE - 1
 CLOCK_TIERS = frozenset(
     {"goal_peak", "goal_equaliser", "goal", "red_card", "big_chance", "formation"}
 )
+# A peak goal from this minute may give its minute even soon after another clock line.
+LATE_DRAMA_MINUTE = 80
 
 _LEFT = r"(?:left|remaining|to go|to play)"
 _SPELLED = r"[a-z]+(?:-[a-z]+)?"
@@ -139,9 +142,13 @@ def remove_clock(text: str) -> str:
     return _keep_end(text, _tidy(removed))
 
 
-def clock_budget_allows(lines: Sequence[str]) -> bool:
-    """True when one more clock line keeps the rule: none in the last 3, at most 1 in 4 overall."""
-    if any(mentions_clock(line) for line in lines[-RECENT_LINES_FOR_CLOCK:]):
+def clock_budget_allows(lines: Sequence[str], *, late_drama: bool = False) -> bool:
+    """True when one more clock line keeps the rule: none in the last 3, at most 1 in 4 overall.
+
+    ``late_drama`` (a peak goal at LATE_DRAMA_MINUTE or later) skips the last-3 rule but not
+    the 1-in-4 cap, so the late winner can be given its minute.
+    """
+    if not late_drama and any(mentions_clock(line) for line in lines[-RECENT_LINES_FOR_CLOCK:]):
         return False
     used = sum(mentions_clock(line) for line in lines)
     return (used + 1) * CLOCK_SHARE <= len(lines) + 1
@@ -203,8 +210,17 @@ BANNED_PHRASES: dict[str, tuple[str, ...]] = {
         "the crowd", "the home supporters", "atmosphere", "this afternoon", "tonight", "VAR",
         "injury", "injured",
     ),
-    "live only": ("the winner",),
+    # The recap says "a goal back" for a goal that leaves a team behind; live, neither word.
+    "live only": ("the winner", "consolation"),
 }
+# Empty comparisons: a swing in points says nothing a viewer can place.
+_BANNED_PATTERNS = (
+    (
+        "comparison",
+        "N-point swing",
+        re.compile(r"\b\d+(?:\.\d+)?(?:-|\s)(?:percentage[- ])?points?\s+swing\b", re.IGNORECASE),
+    ),
+)
 # Allowed only for a team that trailed earlier and is now level or ahead.
 COMEBACK_PHRASES = ("comeback", "turnaround")
 BANNED_OPENERS = (
@@ -250,6 +266,9 @@ def banned_phrase_hits(text: str, info: MatchInfo, goals: Sequence[str]) -> list
     """Each banned phrase the line uses, as "group: phrase"."""
     hits = [f"{group}: {phrase}" for group, phrase, pattern in _BANNED if pattern.search(text)]
     hits.extend(
+        f"{group}: {label}" for group, label, pattern in _BANNED_PATTERNS if pattern.search(text)
+    )
+    hits.extend(
         f"opener: {opener}" for opener, pattern in _OPENERS if pattern.search(text)
     )
     allowed = comeback_sides(goals)
@@ -268,6 +287,173 @@ def banned_phrase_hits(text: str, info: MatchInfo, goals: Sequence[str]) -> list
             if not ok:
                 hits.append(f"comeback: {phrase}")
     return list(dict.fromkeys(hits))
+
+
+# Phrases that belong to the team that just scored: on a goal line, the nearest team named
+# before one of these must be the scorer.
+SCORER_PHRASES = (
+    "back on terms", "level it", "levelled it", "leveled it", "levels it", "draw level",
+    "drawn level", "pull level", "pulled level", "the equaliser", "their equaliser",
+    "an equaliser", "the opener", "opening goal", "strike first", "struck first",
+    "a goal back",
+)
+_SCORER = [(phrase, _phrase(phrase)) for phrase in SCORER_PHRASES]
+
+
+def _team_spans(text: str, info: MatchInfo) -> list[tuple[int, str]]:
+    """(start, side) for every team mention, full or short form, in text order."""
+    spans: list[tuple[int, int, str]] = []
+    for side in ("home", "away"):
+        for form in team_name(info, side).forms:
+            spans.extend((match.start(), match.end(), side) for match in _phrase(form).finditer(text))
+    # A short form inside a full-name match is the same mention.
+    kept: list[tuple[int, str]] = []
+    covered: list[tuple[int, int]] = []
+    for start, end, side in sorted(spans, key=lambda item: (item[0], -item[1])):
+        if any(start >= a and end <= b for a, b in covered):
+            continue
+        covered.append((start, end))
+        kept.append((start, side))
+    return kept
+
+
+def scorer_phrase_failures(text: str, info: MatchInfo, scoring_side: str) -> list[str]:
+    """A goal line must attach "back on terms", "the opener" and the like to the scorer."""
+    failures = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        teams = _team_spans(sentence, info)
+        for phrase, pattern in _SCORER:
+            for match in pattern.finditer(sentence):
+                before = [side for start, side in teams if start < match.start()]
+                if before and before[-1] != scoring_side:
+                    other = team_name(info, before[-1]).full
+                    failures.append(f"scorer phrase {phrase!r} is attached to {other}")
+    return failures
+
+
+_COMPARISON = re.compile(
+    r"\b(?:up|down)\s+from\s+\d+(?:\.\d+)?\s*(?:%|per\s*cent)", re.IGNORECASE
+)
+_COMPARED_PERIOD = re.compile(
+    r"\b(?:in|over|during|across|for)\s+the\s+(?:previous|preceding|first|last|earlier|"
+    r"opening|\d+)\b|\bbefore that\b|\bbefore the break\b|\bin the first half\b|\bearlier\b",
+    re.IGNORECASE,
+)
+
+
+def comparison_failures(text: str) -> list[str]:
+    """ "up from 45%" must say which period the 45% belongs to."""
+    failures = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        for match in _COMPARISON.finditer(sentence):
+            if not _COMPARED_PERIOD.search(sentence[match.end():]):
+                failures.append(
+                    f"comparison {match.group(0)!r} does not name the period it compares with"
+                )
+    return failures
+
+
+# Phase words and the clock they fit: (phrase pattern, fits(minute, period)). Longest first,
+# so "early in the second half" is judged before a bare "early".
+_PHASES: tuple[tuple[str, re.Pattern[str], object], ...] = tuple(
+    (label, re.compile(pattern, re.IGNORECASE), fits)
+    for label, pattern, fits in (
+        ("early in the second half", r"\bearly\s+in\s+the\s+second\s+half\b",
+         lambda minute, period: period == 2 and minute <= 55),
+        ("late in the half", r"\blate\s+in\s+the\s+(?:first\s+)?half\b",
+         lambda minute, period: period == 1 and minute >= 35),
+        ("before the break", r"\bbefore\s+the\s+break\b",
+         lambda minute, period: period == 1 and minute >= 35),
+        ("late in the game", r"\blate\s+in\s+the\s+(?:game|match)\b",
+         lambda minute, period: minute >= 80),
+        ("late on", r"\blate\s+on\b", lambda minute, period: minute >= 80),
+        ("early", r"\bearly(?:\s+on)?\b(?!\s+in\s+the\s+second\s+half)",
+         lambda minute, period: period == 1 and minute < 15),
+    )
+)
+_DANGLING = {
+    "and", "but", "or", "the", "a", "an", "of", "to", "from", "with", "as", "in", "on", "at",
+    "for", "by", "so", "is", "are", "was", "their", "his", "her",
+}
+
+
+def _broken(text: str) -> bool:
+    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
+        words = re.findall(r"[\w'’-]+", sentence)
+        if len(words) < 3 or words[-1].casefold() in _DANGLING:
+            return True
+        if re.search(r"\ban\s+[b-df-hj-np-tv-z]", sentence, re.IGNORECASE):
+            return True
+    return False
+
+
+def apply_phase_rules(text: str, *, minute: int, period: int) -> tuple[str, list[str]]:
+    """Remove phase words that don't fit the minute; failures when the removal breaks a sentence."""
+    removed: list[str] = []
+    for label, pattern, fits in _PHASES:
+        if fits(minute, period):  # type: ignore[operator]
+            continue
+        # The phase patterns have no capturing groups: 1 and 2 are the commas around them.
+        surround = re.compile(rf"(,\s*)?{pattern.pattern}(\s*,)?", re.IGNORECASE)
+        new = surround.sub(
+            lambda match: " " if match.group(1) and match.group(2) else "", text
+        )
+        if new != text:
+            removed.append(label)
+            text = new
+    if not removed:
+        return text, []
+    tidied = _tidy(text)
+    if _broken(tidied):
+        return tidied, [
+            f"phase words {', '.join(map(repr, removed))} don't fit {minute}' "
+            "and can't be removed cleanly"
+        ]
+    return tidied, []
+
+
+_POSSESSIVE = re.compile(r"\b([A-Z][\w-]*s)(['’])s\b")
+
+
+def fix_possessives(text: str) -> str:
+    """A name ending in s takes an apostrophe only: "Ashbridge Rovers'", not "Rovers's"."""
+    return _POSSESSIVE.sub(r"\1\2", text)
+
+
+def end_with_punctuation(text: str) -> str:
+    text = text.rstrip()
+    return text if not text or text[-1] in ".!?" else text + "."
+
+
+_A_MAN = re.compile(r"\ba man (short|down|light)\b", re.IGNORECASE)
+
+
+def fix_idioms(text: str) -> str:
+    """House wording: "a player short", never "a man short"."""
+    return _A_MAN.sub(lambda match: f"a player {match.group(1).lower()}", text)
+
+
+def apply_house_style(text: str, info: MatchInfo) -> str:
+    """The naming pass every published line gets: idioms, possessives, team names, a full stop."""
+    return end_with_punctuation(name_teams(fix_possessives(fix_idioms(text)), info))
+
+
+_SCORE_WORDS = re.compile(r"\b(?:lead|leads|level|ahead|all square)\b", re.IGNORECASE)
+
+
+def strip_withheld_score(text: str) -> str:
+    """With no score_phrase, a trailing score sentence ("The score is level at 0-0.") is removed
+    rather than the line rejected. A score anywhere else still fails the line check."""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    last = sentences[-1]
+    if (
+        len(sentences) > 1
+        and mentions_score(last)
+        and _SCORE_WORDS.search(last)
+        and len(last.split()) <= 8
+    ):
+        return " ".join(sentences[:-1])
+    return text
 
 
 def back_line_note(previous: str | None, new: str | None) -> str:

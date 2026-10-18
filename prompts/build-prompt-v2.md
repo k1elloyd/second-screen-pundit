@@ -140,7 +140,7 @@ Goals and own goals:
 - It streams events at a speed from 1x to 120x, set once at `/start`. It can be paused and resumed. There is no seek and no change of speed mid-replay.
 - While paused, it publishes no events and starts no new pipeline runs. Runs already in progress finish, SSE heartbeats continue, and viewer questions are still answered.
 - It publishes to an in-process async queue that feeds that replay's agents and its server-sent events (SSE) stream.
-- Each replay belongs to one browser tab. At most 3 replays run at once (configurable). A replay stops, and its agent runs are cancelled, as soon as its SSE client disconnects. There is no resume: reloading the tab starts a new replay.
+- Each replay belongs to one browser tab. At most 6 replays run at once, and at most 3 from one IP address (both configurable). The SSE stream resumes: a dropped connection reconnects with `Last-Event-ID` and receives every message after it, and each connection closes itself after 200 s so the page reconnects inside the ingress timeout. A replay stops, and its agent runs are cancelled, only when no stream has reconnected for 30 s. Reloading the tab starts a new replay.
 
 ## Analytics tools (`agents/tools/`)
 
@@ -262,9 +262,9 @@ STT and TTS time doesn't count against the model budgets. `/api/ask-audio` has a
 | :---- | :---- |
 | `GET /` | Static front end |
 | `GET /api/matches` | The three storylines |
-| `POST /api/matches/{id}/start?speed=` | Start a replay for this tab and return its `replay_id`. If 3 replays are already running, return 503 with `Retry-After` |
+| `POST /api/matches/{id}/start?speed=` | Start a replay for this tab and return its `replay_id`. If all 6 slots are in use, return 503 with `Retry-After: 60` and a "busy" message; if 3 replays are already running from the caller's IP address, return 429 with `Retry-After: 30` |
 | `POST /api/replays/{replay_id}/control` | `{ "action": "pause" \| "resume" }`. Returns the replay's state. Pausing a paused replay or resuming a running one is a no-op |
-| `GET /api/replays/{replay_id}/stream` | SSE: events, commentary lines (with `audio_id`), insights, recap. A heartbeat comment every 15 s. Disconnecting stops the replay |
+| `GET /api/replays/{replay_id}/stream` | SSE: events, commentary lines (with `audio_id`), insights, recap. A heartbeat comment every 15 s. Each message has an `id`; a reconnect with `Last-Event-ID` resumes after it. The replay stops if no stream reconnects within 30 s |
 | `POST /api/ask` | `{ replay_id, question }` → `Explanation`. The cut-off is the viewer's released event position on the server, never the agents' newer `as_of`; the client sends no minute |
 | `POST /api/ask-audio` | Multipart `replay_id` + WAV audio → `{ transcript, explanation, audio_id }`. Server-side STT, then the same viewer-released-position cut-off as `/api/ask`, then TTS of the answer |
 | `GET /api/lines/{line_id}/evidence` | The events and facts behind a commentary line |

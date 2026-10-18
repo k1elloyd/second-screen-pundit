@@ -10,7 +10,11 @@ from typing import Literal
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.pipeline import LiveWindowResult, PunditPipeline, is_must_say
 from second_screen_pundit.agents.signals import SignalTracker, TacticalSignal, formation_key
-from second_screen_pundit.agents.wording import apply_clock_rules, clock_budget_allows
+from second_screen_pundit.agents.wording import (
+    LATE_DRAMA_MINUTE,
+    apply_clock_rules,
+    clock_budget_allows,
+)
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.observability import record_result, turn_span
@@ -99,6 +103,8 @@ class LiveDispatcher:
             if event.type == "card" and event.detail.get("colour") == "red"
         }
         self._announced_red_cards: set[str] = set()
+        # Fallback templates said so far in this match, so no version repeats.
+        self._used_fallbacks: set[str] = set()
 
     async def run(
         self,
@@ -266,6 +272,8 @@ class LiveDispatcher:
                     is_stale=is_stale,
                     recent_lines=tuple(self._recent_lines[-RECENT_LINES_FOR_COMMENTATOR:]),
                     clock_allowed=clock_budget_allows(self._recent_lines),
+                    late_clock_allowed=clock_budget_allows(self._recent_lines, late_drama=True),
+                    used_fallbacks=self._used_fallbacks,
                 )
                 record_result(span, outcome.result)
             line = outcome.result.line if _has_line(outcome.result) else None
@@ -294,8 +302,12 @@ class LiveDispatcher:
                 self._announced_red_cards.update(red_cards)
                 # Both lanes run at once, so two lines can be written against the same
                 # budget; whichever is published second loses its clock words.
+                late_drama = (
+                    line.delivery_tier == "goal_peak" and outcome.minute >= LATE_DRAMA_MINUTE
+                )
                 text = apply_clock_rules(
-                    line.text, clock_allowed=clock_budget_allows(self._recent_lines)
+                    line.text,
+                    clock_allowed=clock_budget_allows(self._recent_lines, late_drama=late_drama),
                 )
                 if text != line.text:
                     line = line.model_copy(update={"text": text})
