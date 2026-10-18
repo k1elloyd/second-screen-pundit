@@ -55,7 +55,9 @@ def test_on_retry_is_called_only_when_the_first_answer_fails_the_evidence_check(
 
 
 class _RetryingPipeline:
-    async def answer_question(self, _info, _events, _question, *, as_of: int, on_retry=None):
+    async def answer_question(
+        self, _info, _events, _question, *, as_of: int, on_retry=None, profile=None
+    ):
         if on_retry is not None:
             await on_retry()
         return SimpleNamespace(explanation=Explanation(answer="Verified after a second look."))

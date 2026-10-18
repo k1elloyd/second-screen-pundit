@@ -144,9 +144,11 @@
           </div>
         </section>
 
-        <section class="info-block" aria-labelledby="stats-title">
+        <section class="info-block stats-block" id="stats-block" aria-labelledby="stats-title">
           <div class="info-heading"><h2 id="stats-title">Formations and stats</h2></div>
-          <table class="stats-table">
+          <!-- Casual mode keeps the numbers behind a tap; Analyst mode shows them. -->
+          <button class="stats-reveal" id="stats-reveal" type="button" aria-controls="stats-table">Tap to show the numbers</button>
+          <table class="stats-table" id="stats-table">
             <thead><tr><th scope="col" id="stats-home">Home</th><th scope="col"></th><th scope="col" id="stats-away">Away</th></tr></thead>
             <tbody>
               <tr><td id="formation-home">–</td><th scope="row">Formation</th><td id="formation-away">–</td></tr>
@@ -214,10 +216,14 @@
     </div>
     <p class="evidence-line" id="evidence-line"></p>
     <div class="evidence-badge" id="evidence-badge"></div>
-    <h3>Verified facts</h3>
-    <ul id="evidence-facts"></ul>
-    <h3>Events behind it</h3>
-    <ul id="evidence-events"></ul>
+    <!-- Open in Analyst mode; collapsed behind a tap in Casual mode. -->
+    <details class="evidence-details" id="evidence-details" open>
+      <summary>The facts and events behind it</summary>
+      <h3>Verified facts</h3>
+      <ul id="evidence-facts"></ul>
+      <h3>Events behind it</h3>
+      <ul id="evidence-events"></ul>
+    </details>
   </dialog>
 </body>
 </html>

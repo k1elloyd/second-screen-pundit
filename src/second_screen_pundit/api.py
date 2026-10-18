@@ -618,6 +618,14 @@ def create_app(
                     audio_task.cancel()
                 return False
         public_line_id = f"{session.replay_id}-{line.line_id}"
+        # The side the line is about, for the page's My team accent: a must-say event's team,
+        # or the one team behind a tactical window's signals. None for both or neither.
+        signal_teams = {signal.team for signal in outcome.signals}
+        line_team = (
+            outcome.event.team
+            if outcome.path == "fast_path"
+            else signal_teams.pop() if len(signal_teams) == 1 else None
+        )
         public_line = line.model_copy(update={"line_id": public_line_id})
         events_by_id = {event.event_id: event for event in session.events}
         cited_events = [
@@ -651,6 +659,7 @@ def create_app(
                     "commentary",
                     {
                         "line": public_line.model_dump(mode="json"),
+                        "line_team": line_team,
                         "audio_id": None,
                         "audio_available": False,
                         "audio_pending": False,
@@ -667,6 +676,7 @@ def create_app(
                     "commentary",
                     {
                         "line": public_line.model_dump(mode="json"),
+                        "line_team": line_team,
                         "audio_id": audio_id,
                         "audio_available": audio_id is not None,
                         "audio_pending": False,
@@ -681,6 +691,7 @@ def create_app(
                 "commentary",
                 {
                     "line": public_line.model_dump(mode="json"),
+                    "line_team": line_team,
                     "audio_id": None,
                     "audio_available": False,
                     "audio_pending": True,
@@ -725,6 +736,7 @@ def create_app(
                     session.info,
                     session.events,
                     as_of=as_of,
+                    profile=session.profile,
                 )
                 record_result(span, result)
             payload = {
@@ -827,6 +839,7 @@ def create_app(
                     ordinal=gate.count + 1,
                     used_versions=set(gate.used_versions),
                     used_statistics=set(gate.used_statistics),
+                    mode=session.profile.mode,
                 )
                 if candidate is None or session.stopped:
                     continue
@@ -1262,6 +1275,7 @@ def create_app(
                 question,
                 as_of=as_of,
                 on_retry=checking,
+                profile=session.profile,
             )
             explanation, blocked_reason = _safe_question_explanation(
                 pipeline,

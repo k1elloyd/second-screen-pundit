@@ -212,6 +212,7 @@ class _ClockyPipeline:
         clock_allowed: bool = True,
         late_clock_allowed: bool = False,
         used_fallbacks: set[str] | None = None,
+        profile: object = None,
     ) -> LiveWindowResult:
         line = CommentaryLine(
             line_id=f"x-l{as_of}",

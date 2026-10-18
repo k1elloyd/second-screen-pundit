@@ -29,3 +29,6 @@ class ViewerProfile:
 
 
 DEFAULT_PROFILE = ViewerProfile()
+# For callers with no viewer (the latency gate, the console, tests): the full detail, as the
+# pipeline wrote before profiles existed. A viewer's replay always has its own profile.
+NO_VIEWER_PROFILE = ViewerProfile(mode="analyst")

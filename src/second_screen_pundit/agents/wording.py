@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 
-from second_screen_pundit.agents.evidence import SCORE_PATTERN, mentions_score
+from second_screen_pundit.agents.evidence import SCORE_PATTERN, extract_numbers, mentions_score
 from second_screen_pundit.engine.schema import MatchInfo
 from second_screen_pundit.engine.teams import team_name
 
@@ -519,3 +519,61 @@ def back_line_failures(text: str, changes: Iterable[tuple[str, str]]) -> list[st
                 "or leave it out"
             )
     return failures
+
+
+# Viewer profile: Mode and My team (profile.py).
+
+_FORMATION_TEXT = re.compile(r"\b\d{1,2}(?:-\d{1,2}){2,4}\b")
+# A casual line states at most this many numbers; a score or a formation counts as one.
+CASUAL_MAX_NUMBERS = 1
+
+
+def count_numbers(text: str) -> int:
+    """How many numbers a line states: each score and each formation once, then each other
+    digit or number word (zero to ten) the evidence check would read."""
+    count = 0
+    for pattern in (_FORMATION_TEXT, SCORE_PATTERN):
+        count += len(pattern.findall(text))
+        text = pattern.sub(" ", text)
+    return count + len(extract_numbers(text))
+
+
+def casual_number_failures(text: str) -> list[str]:
+    """Casual mode: at most one number in a line (the score phrase counts as one)."""
+    count = count_numbers(text)
+    if count <= CASUAL_MAX_NUMBERS:
+        return []
+    return [
+        f"casual mode: the line states {count} numbers; keep at most one (the score phrase "
+        "counts as one) and say the rest in words, such as more of the ball or a change of shape"
+    ]
+
+
+# "Your side" and "your team" stand for My team in a framed answer, with an optional
+# possessive. They are framing only: the evidence check reads the team's own name instead.
+_FRAMING = re.compile(r"\b(?P<word>[Yy]our) (?:side|team)(?P<possessive>['’]s)?\b")
+
+
+def has_framing(text: str) -> bool:
+    return _FRAMING.search(text) is not None
+
+
+def unframe(text: str, info: MatchInfo, team: str) -> str:
+    """The answer as the evidence check reads it: "your side" becomes My team's name.
+
+    The check grounds a team number only when its team is named in the same sentence, so
+    the framed words must stand for the real name there, and nowhere else.
+    """
+    if team not in ("home", "away"):
+        return text
+    name = team_name(info, team).short
+
+    def replace(match: re.Match[str]) -> str:
+        possessive = match.group("possessive")
+        return name + (("'" if name.endswith("s") else "'s") if possessive else "")
+
+    return _FRAMING.sub(replace, text)
+
+
+def sentence_count(text: str) -> int:
+    return len([part for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part])

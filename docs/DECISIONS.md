@@ -936,3 +936,80 @@ The official rules' fifth pipeline stage is Personalize (§4.1(i)): the same int
 - **Traces.** Every `pundit.turn` span (live, question and recap) carries `app.profile.mode` and `app.profile.team`.
 - **Layout checked** in Chromium with the cached server, before Start: header plus controls 129 px at 360, 375, 390 and 430px (15.3% of 844, unchanged from before), and 136 px with fonts at 130% (unchanged), with no sideways overflow. At 130% text on 360–390px the longest team option ("♥ Port Calder") is 12–29 px wider than its select, so it is clipped when chosen. Desktop: one control row at 1280, 1366 and 1920px; two rows at 1024px.
 - Mode and My team change nothing the viewer sees yet; group 2 adds the differences.
+
+## Personalisation, group 2: the same facts, a different experience (18 Oct 2026)
+
+Every viewer-facing difference below runs through the same evidence and wording checks as before. A caller with no viewer profile (the latency gate without `--mode`, the console, tests) gets the full-detail writing it always had (`NO_VIEWER_PROFILE`: analyst, neutral). A viewer's replay always carries its own profile, Casual by default.
+
+### Commentary
+
+- **Mode reaches the Commentator** as a `mode` field in its prompt, with a MODE section in `COMMENTATOR_INSTRUCTIONS` (the instructions stay one cacheable string). Casual: the story, at most one number in the line, and the score phrase is that one. Analyst: the numbers within the existing rules, led by chance quality and shape.
+- **Casual is checked, not just asked.** `count_numbers` counts a score or a formation once, then every other digit or number word the evidence check reads. A casual model line with more than one is retried with the count as feedback (`casual line with more than one number`), then falls back. A casual line never gets a clock budget.
+- **Fallbacks.** `CASUAL_FALLBACK_VARIANTS` says shape, counts and shares in words ("a change of shape", "a player short", "more of the ball"); the one template with a share drops the score. The analyst set is the existing `FALLBACK_VARIANTS`. A test runs a whole m01 with every model line rejected, in both modes: the same beats, every line passing the evidence check, casual lines at most one number, analyst lines up to three and longer on average.
+- **Colour lines.** Casual possession and shots lines name only the leading team, with its one number ("Port Calder FC have had 57% of the possession so far."). The formation matchup (two formations) is analyst-only.
+
+### Q&A
+
+- The Explainer prompt gets `viewer: {mode, my_team}`. Casual: one or two short sentences, under 45 words, at most two numbers, no xG. Analyst: up to four sentences. With My team set, the answer says "your side" or "your team" at least once; without one, it never does. Each rule is checked and retried with feedback, like an evidence failure.
+- **Framing doesn't change the evidence.** The evidence check reads "your side" (and "your side's") as My team's name (`unframe`), so the number in "Your side have had 57% of the possession" is grounded exactly as in "Port Calder have had 57%…", and the answer shown keeps the framing. A test asks the same question neutral and as an away fan: the framing differs; the facts and events cited are the same.
+- **Words must follow the facts.** A live probe found casual answers swapping numbers for comparisons that were wrong ("your side have had more of the ball" for a side on 43%). The evidence check reads numbers, not comparisons in words. The Explainer now has a rule: more of the ball, more shots or the better of the chances only for the team whose fact is higher, and say when it is only the recent spell. In 6 casual probes after the rule, every comparison matched the facts. It is a prompt rule, not a check.
+
+### Recap, interface, crowd
+
+- **Recap.** The prompt gets `my_team`. With one set, the summary's first sentence must name that team (`recap does not lead with My team`, retried). The headline is still winner-first with the score phrase. The deterministic fallback recap stays neutral.
+- **Interface.** Casual: Why? opens with the facts and events collapsed under "The facts and events behind it", and the stats table's numbers sit behind "Tap to show the numbers" (switching back to Casual hides them again). Analyst: both open. My team: a ♥ before that team's name on the scoreboard, a 3 px left border in the team colour on its commentary cards, and a faint highlight on its key moments. The server sends `line_team` with each line: a must-say event's team, or the one team behind a tactical window's signals; none for colour lines. Cached mode keeps its neutral content and gets the same interface.
+- **Crowd.** A goal swells 1.4× for My team and 0.6× for the other side (neutral: unchanged).
+- **Team label.** When a team name doesn't fit its select (360–390px with 130% text), the options read "♥ Home" and "♥ Away". Measured in Chromium: every label fits at 360–430px at 100% and 130% text, with no overflow, and the header is unchanged (129 / 136 px).
+
+### Live gate: m01 at 20x
+
+`python -m second_screen_pundit.agents.gate --live-latency --match m01 --speed 20 --mode casual --team home`, then `--mode analyst --team away`.
+
+| | Casual + Home | Analyst + Away |
+| :-- | :-- | :-- |
+| Model-written lines | **10 of 13** | **11 of 13** |
+| Numbers per line | 0–1 | 0–3 |
+| Evidence failures by reason | event not supplied 6, casual line with more than one number 3, ungrounded number 1, fact not in the Insight 1 | event not supplied 6 |
+
+| Minute | Casual + Home | Analyst + Away |
+| :-- | :-- | :-- |
+| 21' | Ashbridge Rovers have more of the ball now, with longer spells under pressure against Port Calder FC. | Ashbridge Rovers have taken control, up to 53% of the possession from 31% before against Port Calder FC. |
+| 23' | Port Calder FC have taken the opener, and Ashbridge Rovers must respond. Port Calder lead 1-0. | Port Calder FC have taken the opener from a big chance, and Ashbridge Rovers must respond. Port Calder lead 1-0. |
+| 33' | Port Calder FC are having the better of the chances, and Ashbridge Rovers are under pressure. | Port Calder FC have had the better of the chances over the last 10 minutes, with Ashbridge Rovers being pressed back. |
+| 57' | Ashbridge Rovers are winning the turnover battle, with 4 high turnovers and a sharp lift in their press. Port Calder FC look under the cosh. | A big chance and four high turnovers in the last 10 minutes, with Ashbridge Rovers well above their usual rate. |
+| 61' | Port Calder FC have stretched their lead from a half-chance. Port Calder lead 2-0. | A half-chance and Port Calder FC stretch their lead, with Ashbridge Rovers still under pressure. Port Calder lead 2-0. |
+| 66' | Ashbridge Rovers change things up with Loran Mallowfen on for Halen Ironsage, a fresh pair of legs as they look to turn this. | Ashbridge Rovers make a change, with Loran Mallowfen on for Halen Ironsage. |
+| 67' | Ashbridge Rovers have changed shape, with the midfield tightened up as they chase this. | Ashbridge Rovers shift from a 4-3-3 to a 4-2-3-1, with the midfield tightened up and 23 minutes left. |
+| 72' tactical | *Fallback:* Ashbridge Rovers are forcing mistakes high up the pitch. | *Fallback:* Ashbridge Rovers are pressing and it is working, with 5 high turnovers recently. |
+| 72' fast path | *Fallback:* Ashbridge Rovers have changed their shape. | Ashbridge Rovers move to a 3-4-3, a back three now as they chase this after the earlier 4-2-3-1. |
+| 74' | Ashbridge Rovers have a goal back, and it's a big lift after that pressure. Port Calder FC lead 2-1. | A big chance, and Kiva Larkspur has given Ashbridge Rovers a goal back. Port Calder FC lead 2-1. |
+| 81' | Ivo Juniperby has brought Ashbridge Rovers back on terms from a half-chance. The score is level at 2-2. | A half-chance, and Ivo Juniperby has brought Ashbridge Rovers level. The score is level at 2-2. |
+| 84' | *Fallback:* Ashbridge Rovers are carving out the clearer openings now. | *Fallback:* Ashbridge Rovers are carving out the clearer openings now. |
+| 88' | Juno Kestrelane has put Ashbridge Rovers in front from a big chance. Ashbridge lead 3-2. | A big chance, and Juno Kestrelane has put Ashbridge Rovers in front again. Ashbridge lead 3-2. |
+
+Two of the casual line-count failures were on the 72' back-three switch: the model kept the formation numbers, so that line fell back to "changed their shape".
+
+**One question each, at the viewer's 60th minute** ("Who has had the better of the match so far, and why?"):
+- Casual + Home: agent-written on the first attempt: "Port Calder FC have had the better of it so far, because they lead 1-0 and have more possession. Your side, Ashbridge Rovers, have had plenty of the ball and nearly matched them for shots and xG, so it has been fairly even."
+- Analyst + Away: fell back to verified facts after two attempts. The first answer wrote the shot counts as "20-19", which the check reads as a wrong score; the second used numbers in sentences beginning "They", so no team was named. The Explainer rules were then tightened (each number's team named in its sentence, no "they", each team's numbers in their own sentence), and the casual answer checks added. A live probe of the same question afterwards: Analyst + Away, 4 of 4 model answers on the first attempt, all framed ("Port Calder FC lead 1-0, so your side has had the better of it overall. Port Calder FC have 57% possession, 20 shots and 2.044 xG…"). Casual + Home, 6 of 6 after the comparison rule (one needed a retry for three numbers), for example "Your side have had less of the ball, and Port Calder FC have just shaded the shot count too. Port Calder FC lead 1-0, so they have had the better of it so far."
+
+### Comparisons in words are checked (18 Oct 2026)
+
+`agents/comparisons.py`. The evidence check grounds numbers; this checks the comparisons said in words, which casual mode asks for.
+
+- **Phrases**: more or less of the ball or possession, the edge in possession, more or fewer shots or attempts, the better of the chances or clearer openings (each against its own measure); on top, dominating, dominant (true if the team leads on any of possession, shots or xG); under pressure, under the cosh, pinned back, pressed back, on the back foot (true if the other side leads on any of them).
+- **Which team**: the nearest team named before the phrase in its sentence, as the scorer-phrase check does; "your side" and "your team" are My team. A "not", "never", "no longer" or "n't" between the team and the phrase reverses it. A phrase with no team before it isn't checked.
+- **Against what**: possession share (successful passes), shots and xG, computed from the events up to the line's or answer's position (not from the cited facts). A comparison passes if it is true for the match so far or the current spell, and fails only if it is false for both. The current spell is the last 10 match minutes (the tactical signals' window) or the last 15 (the Q&A snapshot's), so a claim from either set of facts is judged on the same footing.
+- **Where**: every commentary line through `_check_line` (model lines, fallback variants and colour lines), Q&A answers (with My team for "your side") and every recap field. A model line or an answer is retried once with feedback naming the phrase, then falls back; a fallback variant that fails is skipped for the next; a recap retries, then falls back. Each case is logged as `comparison_failed route=… text=…`.
+- **Tests** (`tests/test_comparisons.py`), at m01's 59th minute: "your side have had more of the ball" for Ashbridge (43%) fails; "Port Calder FC have had more of the ball" passes; "Ashbridge Rovers have had the better of the chances" passes (Ashbridge's xG is lower for the match, higher over the last 15 minutes); a false comparison in a line, an answer and a recap is retried with the phrase named, and the line and the answer fall back after a second failure.
+
+**Gate rerun, m01 at 20x**
+
+| | Casual + Home | Analyst + Away |
+| :-- | :-- | :-- |
+| Model-written lines | **11 of 13** | **11 of 13** |
+| `comparison_failed` | 0 | 0 |
+| Evidence failures by reason | event not supplied 5, casual line with more than one number 1 | event not supplied 6 |
+| The 60' question | agent, first attempt: "Port Calder FC have had the better of it so far: they lead 1-0 and have had the slight edge in possession and shots. Your side, Ashbridge Rovers, have had plenty of volume, but not the advantage." | agent, second attempt: "Port Calder FC lead 1-0, and your team have had the slight edge overall: Port Calder FC have 57% possession, 20 shots and 2.044 xG. Ashbridge Rovers have 43% possession, 19 shots and 2.037 xG…" |
+
+The lines' comparisons ("Ashbridge Rovers have the edge in possession now, up to 53%", "Port Calder FC have had the better of the chances over this spell, with Ashbridge Rovers under pressure") all held. The analyst answer's first attempt failed before the evidence step (the reply couldn't be parsed or broke a reply limit such as the 80-word cap); that path isn't logged.

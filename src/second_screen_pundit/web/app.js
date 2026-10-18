@@ -81,6 +81,7 @@ function renderProfile() {
   for (const select of document.querySelectorAll('[data-profile="team"]')) select.value = state.profile.team;
   el("app-shell").dataset.mode = state.profile.mode;
   el("app-shell").dataset.team = state.profile.team;
+  crowdBed.setMyTeam(state.profile.team);
 }
 
 // "My team: Ashbridge" on wide screens; "♥ Ashbridge" below 1440px, so the control bar stays
@@ -88,19 +89,45 @@ function renderProfile() {
 // still says "My team" to screen readers).
 const wideTeamLabels = matchMedia("(min-width: 1440px)");
 const teamLabels = { home: "Home", away: "Away" };
+const measureContext = document.createElement("canvas").getContext("2d");
+
+// Whether `text` fits a select's text area at its current size and font.
+function fitsSelect(select, text) {
+  const style = getComputedStyle(select);
+  measureContext.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+  const room = select.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  return measureContext.measureText(text).width <= room;
+}
+
 function setTeamOptionLabels(homeShort = teamLabels.home, awayShort = teamLabels.away) {
   teamLabels.home = homeShort;
   teamLabels.away = awayShort;
   const wide = wideTeamLabels.matches;
-  for (const option of document.querySelectorAll('[data-profile="team"] option')) {
-    const side = option.dataset.side;
-    const name = side ? teamLabels[side] : "Neutral";
-    option.textContent = wide ? `My team: ${name}` : side ? `♥ ${name}` : name;
+  const label = (side, names) => {
+    const name = side ? names[side] : "Neutral";
+    return wide ? `My team: ${name}` : side ? `♥ ${name}` : name;
+  };
+  for (const select of document.querySelectorAll('[data-profile="team"]')) {
+    // A narrow phone with large text: "♥ Home" and "♥ Away" when a team name wouldn't fit.
+    // A hidden select (width 0) keeps the names until it is shown and measured again.
+    const tooLong = select.clientWidth > 0 && [...select.options].some(
+      (option) => !fitsSelect(select, label(option.dataset.side, teamLabels)),
+    );
+    const names = tooLong ? { home: "Home", away: "Away" } : teamLabels;
+    for (const option of select.options) option.textContent = label(option.dataset.side, names);
   }
 }
 wideTeamLabels.addEventListener("change", () => setTeamOptionLabels());
+// The selects' widths change with the layout, the drawer and text size; labels follow. A
+// select's own width doesn't depend on its labels on phones, so this settles at once.
+const teamSelectObserver = new ResizeObserver(() => setTeamOptionLabels());
+for (const select of document.querySelectorAll('[data-profile="team"]')) teamSelectObserver.observe(select);
 
 async function changeProfile(change) {
+  // Switching to Casual puts the stats back behind their tap.
+  if (change.mode === "casual" && state.profile.mode !== "casual") {
+    el("stats-block").classList.remove("revealed");
+  }
   state.profile = { ...state.profile, ...change };
   try {
     sessionStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile));
@@ -473,6 +500,9 @@ const WHISTLE_GAP_SECONDS = 0.12;
 const WHISTLE_PEAK_GAIN = 0.16;
 const WHISTLE_FREQUENCIES = [1850, 2250];
 
+const CROWD_MY_TEAM_FACTOR = 1.4;
+const CROWD_OTHER_TEAM_FACTOR = 0.6;
+
 class CrowdBed {
   constructor() {
     this.enabled = readStored("pundit-crowd-enabled") !== "0";
@@ -488,6 +518,18 @@ class CrowdBed {
     this.duckReleaseTimer = null;
     this.whistles = new Set();
     this.whistledKickoffs = new Set();
+    // "home", "away" or "neutral" (the viewer's My team): its goals swell more.
+    this.myTeam = "neutral";
+  }
+
+  setMyTeam(team) {
+    this.myTeam = team === "home" || team === "away" ? team : "neutral";
+  }
+
+  // A goal's swell: as before for a neutral viewer; bigger for My team, smaller for the other side.
+  goalSwellFactor(team) {
+    if (this.myTeam === "neutral" || !team) return 1;
+    return team === this.myTeam ? CROWD_MY_TEAM_FACTOR : CROWD_OTHER_TEAM_FACTOR;
   }
 
   create() {
@@ -646,7 +688,7 @@ class CrowdBed {
     }
 
     if (event.type === "goal") {
-      this.swell((event.clock || 0) >= 75 ? 0.14 : 0.09);
+      this.swell(((event.clock || 0) >= 75 ? 0.14 : 0.09) * this.goalSwellFactor(event.team));
     } else if (event.type === "card" && event.detail?.colour === "red") {
       this.swell(0.06);
     } else if (event.type === "shot" && event.xg != null && event.xg >= 0.3) {
@@ -1012,6 +1054,8 @@ function fillEvidence(title, text, badge, factTexts, events) {
   const list = el("evidence-events");
   list.replaceChildren(...events.map((event) => make("li", "", `${event.clock}' · ${eventText(event)}`)));
   if (!list.children.length) list.append(make("li", "", "No event references were attached."));
+  // Casual: the line and its badge first, the facts and events a tap away. Analyst: all open.
+  el("evidence-details").open = state.profile.mode === "analyst";
   el("evidence-dialog").showModal();
 }
 
@@ -1072,6 +1116,8 @@ function renderCommentary(payload) {
   card.append(top, make("p", "", line.text), actions);
   card.dataset.lineId = line.line_id;
   card.dataset.tier = line.delivery_tier || "routine";
+  // The side the line is about, for the My team accent (none for both sides or neither).
+  if (payload.line_team) card.dataset.team = payload.line_team;
   card.dataset.arrivedAt = String(Date.now());
   card.dataset.pausedAtArrival = String(audioQueue.pausedMs());
   if (payload.audio_id) {
@@ -1766,6 +1812,7 @@ for (const select of document.querySelectorAll("[data-profile]")) {
   select.addEventListener("change", () => changeProfile({ [select.dataset.profile]: select.value }));
 }
 renderProfile();
+el("stats-reveal").addEventListener("click", () => el("stats-block").classList.add("revealed"));
 el("start-button").addEventListener("click", () => {
   audioQueue.unlock(); // in the click itself, before any await, so autoplay is allowed
   startCrowdInGesture({ starting: true });

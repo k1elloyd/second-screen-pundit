@@ -20,6 +20,7 @@ from second_screen_pundit.agents.pipeline import (
 from second_screen_pundit.agents.speech import SpeechSynthesizer
 from second_screen_pundit.agents.voice_trial import run_voice_trial
 from second_screen_pundit.engine.generate import generate_match, get_match_info
+from second_screen_pundit.profile import ViewerProfile
 
 
 async def run_phase2_gate(output_path: Path) -> None:
@@ -171,11 +172,23 @@ def main() -> None:
     )
     parser.add_argument("--match", choices=("m01", "m02", "m03"), default="m01")
     parser.add_argument("--speed", type=int, default=20)
+    parser.add_argument(
+        "--mode",
+        choices=("casual", "analyst"),
+        help="With --live-latency: write for this viewer Mode (default: no viewer profile).",
+    )
+    parser.add_argument(
+        "--team",
+        choices=("home", "away", "neutral"),
+        default="neutral",
+        help="With --live-latency and --mode: the viewer's My team.",
+    )
     args = parser.parse_args()
     if args.voice_trial:
         run_voice_trial_gate()
     elif args.live_latency:
-        asyncio.run(run_live_latency_gate(args.match, args.speed))
+        profile = ViewerProfile(mode=args.mode, team=args.team) if args.mode else None
+        asyncio.run(run_live_latency_gate(args.match, args.speed, profile))
     else:
         asyncio.run(run_phase2_gate(args.output))
 

@@ -466,6 +466,13 @@ _FAILURE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("comparison without its period", r"comparison '(?P<subject>[^']+)' does not name"),
         ("phase word does not fit the minute", r"phase words (?P<subject>.+?) don't fit"),
         ("duplicate fact ID", r"duplicate fact_id within run: (?P<subject>\S+)"),
+        ("comparison not true of the match", r"comparison '(?P<subject>[^']+)' for .+? is not true"),
+        ("casual line with more than one number",
+         r"casual mode: the line states (?P<subject>\d+) numbers"),
+        ("answer longer than its mode allows", r"answer has (?P<subject>\d+) sentences"),
+        ("framing words with no team chosen", r"no My team is chosen"),
+        ("recap does not lead with My team", r"summary's first sentence must name"),
+        ("restricted content", r"restricted content: (?P<subject>.+)"),
     )
 )
 

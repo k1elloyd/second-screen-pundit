@@ -19,7 +19,9 @@ from second_screen_pundit.engine.generate import generate_match, get_match_info
 from second_screen_pundit.engine.replay import Replay
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import team_name
+from second_screen_pundit.profile import ViewerProfile
 from second_screen_pundit.agents.wording import (
+    count_numbers,
     mentions_clock,
     mentions_minute,
     mentions_minutes_left,
@@ -266,7 +268,18 @@ def _configure_logging() -> None:
     logger.propagate = False
 
 
-async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[str, object]:
+# The gate's question, asked after the replay at the viewer's 60th minute in the run's profile.
+GATE_QUESTION = "Who has had the better of the match so far, and why?"
+GATE_QUESTION_MINUTE = 60
+
+
+async def run_live_latency_gate(
+    match_id: str = "m01",
+    speed: int = 20,
+    profile: ViewerProfile | None = None,
+) -> dict[str, object]:
+    """``profile`` writes every line (and the gate's one question) for that viewer profile;
+    None keeps the full-detail writing the gate has always measured."""
     load_dotenv()
     settings = AgentSettings.from_environment()
     if settings.mode != "live":
@@ -290,7 +303,14 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
             async for _ in viewer:
                 viewer_count += 1
 
-        dispatcher = LiveDispatcher(pipeline, info, events, settings, delay=delay)
+        dispatcher = LiveDispatcher(
+            pipeline,
+            info,
+            events,
+            settings,
+            delay=delay,
+            profile=(lambda: profile) if profile is not None else None,
+        )
         viewer_task = asyncio.create_task(consume_viewer_stream())
         replay.start()
         started = perf_counter()
@@ -305,6 +325,14 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
             await replay.stop()
             viewer_task.cancel()
             await asyncio.gather(viewer_task, return_exceptions=True)
+        question_as_of = max(
+            event.seq for event in events if event.minute < GATE_QUESTION_MINUTE
+        )
+        question_started = perf_counter()
+        answer = await pipeline.answer_question(
+            info, events, GATE_QUESTION, as_of=question_as_of, profile=profile
+        )
+        question_ms = round((perf_counter() - question_started) * 1000)
 
     budget = settings.live_timeout_seconds
     outcomes = dispatcher.outcomes
@@ -344,6 +372,7 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
         "speed": speed,
         "budget_ms": round(budget * 1000),
         "commentator_reasoning_effort": settings.commentator_reasoning_effort,
+        "profile": profile.as_dict() if profile is not None else None,
         "replay_elapsed_ms": replay_ms,
         "fast_path": summarize_path(outcomes, "fast_path", budget),
         "tactical": tactical,
@@ -367,6 +396,8 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
                 "minute": outcome.minute,
                 "source": outcome.result.line.source,  # type: ignore[union-attr]
                 "delivery_tier": outcome.result.line.delivery_tier,  # type: ignore[union-attr]
+                "numbers": count_numbers(outcome.result.line.text),  # type: ignore[union-attr]
+                "characters": len(outcome.result.line.text),  # type: ignore[union-attr]
                 "text": outcome.result.line.text,  # type: ignore[union-attr]
             }
             for outcome in sorted(outcomes, key=lambda item: item.event.seq)
@@ -379,6 +410,16 @@ async def run_live_latency_gate(match_id: str = "m01", speed: int = 20) -> dict[
                 1 for outcome in lines if outcome.result.line.source == "agent"  # type: ignore[union-attr]
             ),
             "lines": len(lines),
+        },
+        "question": {
+            "viewer_minute": GATE_QUESTION_MINUTE,
+            "question": GATE_QUESTION,
+            "answer": answer.explanation.answer,
+            "source": answer.source,
+            "attempts": answer.attempts,
+            "duration_ms": question_ms,
+            "facts_cited": [claim.text for claim in answer.explanation.claims],
+            "notice": answer.explanation.notice,
         },
         "output_failures": [
             {"path": outcome.path, "minute": outcome.minute, "failure": failure}

@@ -243,6 +243,7 @@ def _possession_candidates(
     ordinal: int,
     used_versions: set[str],
     used_statistics: set[str],
+    mode: str = "analyst",
 ) -> list[ColourLineCandidate]:
     home_name = team_name(info, "home").full
     away_name = team_name(info, "away").full
@@ -271,7 +272,11 @@ def _possession_candidates(
         home, away = result.facts
         if not home.event_ids or not away.event_ids:
             continue
-        if phase == "first":
+        if mode == "casual":
+            text = _casual_leader_text("possession", phase, [home, away], (home_name, away_name))
+            if text is None:
+                continue
+        elif phase == "first":
             text = (
                 f"In the first half, {home_name} had {_number(home)}% of the possession, "
                 f"with {away_name} on {_number(away)}%."
@@ -303,6 +308,31 @@ def _possession_candidates(
     return candidates
 
 
+def _casual_leader_text(
+    statistic: str,
+    phase: str,
+    facts: list[Fact],
+    names: tuple[str, str],
+) -> str | None:
+    """Casual mode: one number, the leading team's, or nothing when the two are level."""
+    home, away = facts
+    if _number(home) == _number(away):
+        return None
+    leader, other = (0, 1) if float(home.value) > float(away.value) else (1, 0)
+    name, value = names[leader], _number(facts[leader])
+    if statistic == "possession":
+        if phase == "first":
+            return f"In the first half, {name} had {value}% of the possession."
+        if phase == "second":
+            return f"Since the break, {name} have had {value}% of the possession."
+        return f"{name} have had {value}% of the possession so far."
+    if phase == "first":
+        return f"In the first half, {name} had the most shots on target, with {value}."
+    if phase == "second":
+        return f"Since the break, {name} have {value} shots on target, more than {names[other]}."
+    return f"{name} have had the better of the shots on target, with {value}."
+
+
 def _shots_candidates(
     info: MatchInfo,
     events: list[Event],
@@ -312,6 +342,7 @@ def _shots_candidates(
     ordinal: int,
     used_versions: set[str],
     used_statistics: set[str],
+    mode: str = "analyst",
 ) -> list[ColourLineCandidate]:
     home_name = team_name(info, "home").full
     away_name = team_name(info, "away").full
@@ -364,7 +395,11 @@ def _shots_candidates(
             ToolResult(tool=result.tool, facts=[fact])
             for result, fact in zip(results, facts, strict=True)
         ]
-        if phase == "first":
+        if mode == "casual":
+            text = _casual_leader_text("shots_on_target", phase, facts, (home_name, away_name))
+            if text is None:
+                continue
+        elif phase == "first":
             text = (
                 f"In the first half, {home_name} registered {_number(facts[0])} shots on target; "
                 f"{away_name} had {_number(facts[1])}."
@@ -532,7 +567,10 @@ def build_colour_candidate(
     ordinal: int,
     used_versions: set[str],
     used_statistics: set[str],
+    mode: str = "analyst",
 ) -> ColourLineCandidate | None:
+    """The next colour line, or None. ``mode`` "casual" (profile.py) uses one number at most:
+    the leading team's share or count, and no formation matchup."""
     visible = [event for event in events if event.seq <= as_of]
     if not visible:
         return None
@@ -546,6 +584,7 @@ def build_colour_candidate(
             ordinal=ordinal,
             used_versions=used_versions,
             used_statistics=used_statistics,
+            mode=mode,
         ),
         "shots_on_target": _shots_candidates(
             info,
@@ -555,6 +594,7 @@ def build_colour_candidate(
             ordinal=ordinal,
             used_versions=used_versions,
             used_statistics=used_statistics,
+            mode=mode,
         ),
         "turnovers": _turnover_candidates(
             info,
@@ -565,7 +605,8 @@ def build_colour_candidate(
             used_versions=used_versions,
             used_statistics=used_statistics,
         ),
-        "formation_matchup": _formation_candidates(
+        # Two formations are two numbers: shape is for the analyst.
+        "formation_matchup": [] if mode == "casual" else _formation_candidates(
             info,
             events,
             as_of=as_of,

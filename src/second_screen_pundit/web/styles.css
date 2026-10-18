@@ -342,6 +342,34 @@ select { height: 34px; padding: 0 28px 0 10px; }
 .evidence-dialog h3 { margin: 20px 0 8px; color: var(--muted); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; }
 .evidence-dialog ul { display: grid; gap: 7px; margin: 0; padding-left: 18px; color: #d5e0dd; font-size: 12px; line-height: 1.5; }
 .evidence-dialog li::marker { color: var(--pitch); }
+.evidence-details { margin-top: 16px; }
+.evidence-details > summary { cursor: pointer; color: var(--pitch); font-size: 12px; font-weight: 700; }
+.evidence-details[open] > summary { margin-bottom: 4px; }
+
+/* Viewer profile: Casual keeps the stats behind a tap; My team gets an accent. */
+.stats-block { position: relative; }
+.stats-reveal { display: none; }
+.app-shell[data-mode="casual"] .stats-block:not(.revealed) .stats-table tbody td { visibility: hidden; }
+.app-shell[data-mode="casual"] .stats-block:not(.revealed) .stats-reveal {
+  display: block;
+  position: absolute;
+  inset: 36px 12px 10px;
+  z-index: 1;
+  border: 1px dashed rgba(189, 215, 210, .25);
+  border-radius: 9px;
+  background: rgba(10, 25, 33, .55);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+}
+.app-shell[data-team="home"] .team-home > span::before,
+.app-shell[data-team="away"] .team-away > span::before {
+  content: "♥ ";
+  font-size: .85em;
+}
+.app-shell[data-team="home"] .commentary-card[data-team="home"] { border-left: 3px solid var(--home); }
+.app-shell[data-team="away"] .commentary-card[data-team="away"] { border-left: 3px solid var(--away); }
+.app-shell[data-team="home"] .moments li.home, .app-shell[data-team="away"] .moments li.away { background: rgba(189, 215, 210, .06); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; clip-path: inset(50%); }
 @keyframes pulse { 50% { opacity: .55; } }
 

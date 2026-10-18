@@ -50,6 +50,9 @@ from second_screen_pundit.agents.commentator import (
     validate_plain_spoken_text,
 )
 from second_screen_pundit.agents.config import AgentSettings
+from second_screen_pundit.agents.comparisons import (
+    comparison_failures as team_comparison_failures,
+)
 from second_screen_pundit.agents.content_filter import (
     OUT_OF_SCOPE_ANSWER,
     question_scope_reason,
@@ -112,14 +115,20 @@ from second_screen_pundit.agents.wording import (
     back_line_failures,
     back_line_note,
     banned_phrase_hits,
+    casual_number_failures,
+    count_numbers,
     comparison_failures,
+    has_framing,
     mentions_clock,
     name_teams,
     scorer_phrase_failures,
+    sentence_count,
     strip_withheld_score,
+    unframe,
 )
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import label_side, short_form_variants, team_name
+from second_screen_pundit.profile import NO_VIEWER_PROFILE, ViewerProfile
 
 
 logger = logging.getLogger(__name__)
@@ -241,6 +250,22 @@ def formation_changes(info: MatchInfo, facts: Sequence[Fact]) -> list[tuple[str,
         ):
             new[side] = fact.value
     return [(previous[side], new[side]) for side in previous if side in new]
+
+
+def _log_comparisons(
+    route: str, match_id: str, as_of: int, source: str, text: str, failures: Sequence[str]
+) -> None:
+    """One comparison_failed log per false comparison, with the text that made it."""
+    for failure in failures:
+        logger.warning(
+            "comparison_failed route=%s match_id=%s as_of=%d source=%s failure=%r text=%r",
+            route,
+            match_id,
+            as_of,
+            source,
+            failure,
+            text,
+        )
 
 
 def _log_failure_reasons(
@@ -877,6 +902,53 @@ def _retry_feedback(failures: Sequence[str]) -> str:
     return "; ".join(failures) + (". " + " ".join(hints) if hints else "")
 
 
+# How long an answer may be in each mode (profile.py): casual is one or two short sentences.
+_ANSWER_SENTENCES = {"casual": 2, "analyst": 4}
+_CASUAL_ANSWER_WORDS = 45
+
+
+_CASUAL_ANSWER_NUMBERS = 2
+_XG_WORDS = re.compile(r"\bxG\b|\bexpected goals\b", re.IGNORECASE)
+
+
+def _answer_profile_failures(
+    answer: str, profile: ViewerProfile, info: MatchInfo | None = None
+) -> list[str]:
+    """The viewer profile's rules for an answer: its length and plainness, and framing with
+    My team (and only then)."""
+    failures = []
+    if profile.mode == "casual":
+        if (numbers := count_numbers(answer)) > _CASUAL_ANSWER_NUMBERS:
+            failures.append(
+                f"casual mode: the answer states {numbers} numbers; keep at most "
+                f"{_CASUAL_ANSWER_NUMBERS} (the score counts as one) and say the rest in words"
+            )
+        if _XG_WORDS.search(answer):
+            failures.append(
+                "casual mode: no xG; say who had the better of the chances in words"
+            )
+    if profile.team in ("home", "away") and not has_framing(answer):
+        name = team_name(info, profile.team).full if info is not None else "my_team"
+        failures.append(
+            f"my_team is {name}: call them your side or your team at least once"
+        )
+    limit = _ANSWER_SENTENCES[profile.mode]
+    if (sentences := sentence_count(answer)) > limit:
+        failures.append(
+            f"{profile.mode} mode: the answer has {sentences} sentences; the limit is {limit}"
+        )
+    if profile.mode == "casual" and (words := len(answer.split())) > _CASUAL_ANSWER_WORDS:
+        failures.append(
+            f"casual mode: the answer has {words} words; keep it under {_CASUAL_ANSWER_WORDS}, "
+            "in plain words"
+        )
+    if profile.team not in ("home", "away") and has_framing(answer):
+        failures.append(
+            "no My team is chosen, so don't write your side or your team; name the team"
+        )
+    return failures
+
+
 def _cite_used_facts(
     explanation: Explanation,
     report: EvidenceReport,
@@ -951,6 +1023,18 @@ def _snapshot_fact_ids(snapshot: Sequence[ToolResult]) -> list[str]:
     tool calls the model made must still be cited by the model.
     """
     return [fact.fact_id for result in snapshot for fact in result.facts]
+
+
+def recap_lead_failure(recap: Recap, info: MatchInfo, team: str) -> str | None:
+    """With My team set, the summary's first sentence names that team (either name form)."""
+    first = re.split(r"(?<=[.!?])\s+", recap.summary.strip(), maxsplit=1)[0].casefold()
+    name = team_name(info, team)
+    if any(form.casefold() in first for form in name.forms):
+        return None
+    return (
+        f"my_team is {name.full}: the summary's first sentence must name {name.full} and tell "
+        "their part in the story"
+    )
 
 
 def recap_wording_failures(recap: Recap, info: MatchInfo, goals: Sequence[str]) -> list[str]:
@@ -1165,14 +1249,17 @@ class PunditPipeline:
         clock_allowed: bool = True,
         late_clock_allowed: bool = False,
         used_fallbacks: set[str] | None = None,
+        profile: ViewerProfile | None = None,
     ) -> LiveWindowResult:
         """``clock_allowed`` is the dispatcher's clock budget (agents/wording.py); routine
         tiers never mention the clock whatever the budget. ``late_clock_allowed`` is the same
         budget without the last-3-lines rule, for a peak goal from LATE_DRAMA_MINUTE.
         ``used_fallbacks`` holds this match's fallback templates so far; a fallback line
-        avoids them and adds its own."""
+        avoids them and adds its own. ``profile`` is the viewer's Mode and My team, read as
+        this window runs: a casual line states at most one number and never the clock."""
         if not window:
             raise ValueError("A live window must contain at least one event")
+        mode = (profile or NO_VIEWER_PROFILE).mode
         if self.settings.mode == "off":
             return LiveWindowResult("off", None, None, (), None, "Narrative mode is off.")
         if self.settings.mode == "cached":
@@ -1253,8 +1340,10 @@ class PunditPipeline:
             recent_lines,
             goal_or_red_card=delivery_tier in _SCORE_TIERS,
         )
-        line_clock_allowed = (clock_allowed and delivery_tier in CLOCK_TIERS) or (
-            late_clock_allowed and delivery_tier == "goal_peak" and clock >= LATE_DRAMA_MINUTE
+        # A casual line tells the story without the clock: the score is its one number.
+        line_clock_allowed = mode != "casual" and (
+            (clock_allowed and delivery_tier in CLOCK_TIERS)
+            or (late_clock_allowed and delivery_tier == "goal_peak" and clock >= LATE_DRAMA_MINUTE)
         )
         latest_event = max(visible, key=lambda event: event.seq)
         phase_clock = {"minute": latest_event.minute, "period": latest_event.period}
@@ -1439,7 +1528,7 @@ class PunditPipeline:
             line_id = live_line_id(info.match_id, as_of, lane)
             failures: tuple[str, ...] = ()
             for template, text in fallback_choices(
-                kind, values, line_id=line_id, used=used_fallbacks or ()
+                kind, values, line_id=line_id, used=used_fallbacks or (), mode=mode
             ):
                 line = CommentaryLine(
                     line_id=line_id,
@@ -1764,6 +1853,7 @@ class PunditPipeline:
                             )
                         ],
                         "recent_lines": list(recent_lines)[-3:],
+                        "mode": mode,
                     }
                 )
                 commentator_response = await call(
@@ -1832,6 +1922,12 @@ class PunditPipeline:
                         f"text is {len(text)} characters; the limit is {MAX_LINE_CHARS}"
                     )
                     record_evidence("commentator", attempt, (feedback,))
+                    continue
+                if mode == "casual" and (too_many := casual_number_failures(text)):
+                    # Retried with the count, like an evidence failure, not sent straight to
+                    # the deterministic line: the model can usually say it in words.
+                    feedback = too_many[0]
+                    record_evidence("commentator", attempt, too_many)
                     continue
                 line = CommentaryLine(
                     line_id=live_line_id(info.match_id, as_of, lane),
@@ -2142,6 +2238,10 @@ class PunditPipeline:
         )
         if back_line:
             return EvidenceReport(False, tuple(back_line))
+        compared = team_comparison_failures(line.text, info, events, as_of)
+        if compared:
+            _log_comparisons("line", info.match_id, as_of, line.source, line.text, compared)
+            return EvidenceReport(False, tuple(compared))
         if line.line_id != live_line_id(info.match_id, as_of, lane):
             return EvidenceReport(
                 False,
@@ -2235,9 +2335,14 @@ class PunditPipeline:
         *,
         as_of: int,
         on_retry: Callable[[], Awaitable[None]] | None = None,
+        profile: ViewerProfile | None = None,
     ) -> QuestionResult:
         """``on_retry`` is awaited when the first answer fails the evidence check and a second
-        attempt starts, so the page can say it is checking the facts."""
+        attempt starts, so the page can say it is checking the facts. ``profile`` sets the
+        answer's length (casual or analyst) and, with My team, its framing ("your side"); the
+        evidence check reads the framed words as the team's name, so the facts cited don't
+        depend on the framing."""
+        viewer = profile or NO_VIEWER_PROFILE
         if len(question) > 300:
             raise ValueError("Question must not exceed 300 characters")
         if question_scope_reason(question) is not None:
@@ -2278,6 +2383,12 @@ class PunditPipeline:
             "facts": snapshot_facts,
             "key_moments": snapshot_moments,
             "question": question,
+            "viewer": {
+                "mode": viewer.mode,
+                "my_team": (
+                    team_name(info, viewer.team).full if viewer.team in ("home", "away") else None
+                ),
+            },
         }
         given_fact_ids = _snapshot_fact_ids(snapshot)
         accumulated_results: list[ToolResult] = list(snapshot)
@@ -2285,6 +2396,16 @@ class PunditPipeline:
         feedback = ""
         attempt_count = 0
         started = time.perf_counter()
+
+        def record_question_failures(attempt: int, failures: Sequence[str]) -> None:
+            logger.info(
+                "question_profile_failed match_id=%s as_of=%d attempt=%d failures=%s",
+                info.match_id,
+                as_of,
+                attempt,
+                "; ".join(failures),
+            )
+            _log_failure_reasons("question", info.match_id, as_of, attempt, tuple(failures))
 
         async def attempts() -> QuestionResult | None:
             nonlocal feedback, attempt_count
@@ -2346,6 +2467,26 @@ class PunditPipeline:
                 if explanation is None:
                     feedback = "; ".join(problems)
                     continue
+                framed_answer = explanation.answer
+                profile_problems = _answer_profile_failures(framed_answer, viewer, info)
+                if profile_problems:
+                    record_question_failures(attempt, profile_problems)
+                    feedback = "; ".join(profile_problems)
+                    continue
+                compared = team_comparison_failures(
+                    framed_answer, info, events, as_of, my_team=viewer.team
+                )
+                if compared:
+                    _log_comparisons(
+                        "question", info.match_id, as_of, "agent", framed_answer, compared
+                    )
+                    record_question_failures(attempt, compared)
+                    feedback = "; ".join(compared)
+                    continue
+                # Checked as if My team were named where the answer says "your side".
+                explanation = explanation.model_copy(
+                    update={"answer": unframe(framed_answer, info, viewer.team)}
+                )
                 report = check_evidence(
                     explanation,
                     events=events,
@@ -2369,7 +2510,7 @@ class PunditPipeline:
                         info=info,
                     )
                     return QuestionResult(
-                        explanation,
+                        explanation.model_copy(update={"answer": framed_answer}),
                         tuple(accumulated_results),
                         report,
                         attempt,
@@ -2545,9 +2686,12 @@ class PunditPipeline:
         events: list[Event],
         *,
         as_of: int,
+        profile: ViewerProfile | None = None,
     ) -> RecapResult:
+        """With My team set in ``profile``, the summary leads with that team's story."""
         if self.settings.mode == "cached":
             return self._cached_recap(info, events, as_of)
+        my_team = (profile or NO_VIEWER_PROFILE).team
         if self.settings.mode == "off":
             return self._fallback_recap_result(
                 info,
@@ -2585,6 +2729,9 @@ class PunditPipeline:
             "score_phrase": recap_score_phrase,
             "facts": stats_facts,
             "key_moments": moment_facts,
+            "my_team": (
+                team_name(info, my_team).full if my_team in ("home", "away") else None
+            ),
         }
         given_fact_ids = _snapshot_fact_ids(snapshot)
         accumulated_results: list[ToolResult] = list(snapshot)
@@ -2663,6 +2810,29 @@ class PunditPipeline:
                         f"the headline must contain score_phrase word for word: "
                         f"{recap_score_phrase!r}"
                     ]
+                if recap is not None and my_team in ("home", "away"):
+                    lead_problem = recap_lead_failure(recap, info, my_team)
+                    if lead_problem:
+                        recap, problems = None, [lead_problem]
+                if recap is not None:
+                    # Field by field: the headline has no full stop to end its sentence.
+                    compared = []
+                    for recap_text in (
+                        recap.headline,
+                        recap.summary,
+                        recap.audio_script,
+                        *(moment.text for moment in recap.key_moments),
+                    ):
+                        failed = team_comparison_failures(
+                            recap_text, info, events, as_of, my_team=my_team
+                        )
+                        if failed:
+                            _log_comparisons(
+                                "recap", info.match_id, as_of, "agent", recap_text, failed
+                            )
+                            compared.extend(failed)
+                    if compared:
+                        recap, problems = None, compared
                 if recap is not None and (wording := recap_wording_failures(recap, info, visible_goals)):
                     logger.warning(
                         "recap_wording_rejected match_id=%s attempt=%d failures=%s",

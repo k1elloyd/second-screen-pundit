@@ -137,6 +137,7 @@ class _StubPipeline:
         clock_allowed: bool = True,
         late_clock_allowed: bool = False,
         used_fallbacks: set[str] | None = None,
+        profile: object = None,
     ) -> LiveWindowResult:
         self.calls.append((as_of, tuple(signals)))
         self.recent_lines.append(tuple(recent_lines))

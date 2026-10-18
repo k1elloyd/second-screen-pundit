@@ -96,6 +96,53 @@ FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
 }
 
 
+# Casual mode (profile.py): the story in words, at most one number in a line, and the score
+# phrase counts as that one. Formations, counts and shares become words ("a change of shape",
+# "a player short", "more of the ball"); the one template with a share leaves out the score.
+# The analyst set is FALLBACK_VARIANTS above, which may use the numbers the facts give.
+CASUAL_FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
+    "goal": FALLBACK_VARIANTS["goal"],
+    "red_card": FALLBACK_VARIANTS["red_card"],
+    "booking": FALLBACK_VARIANTS["booking"],
+    "substitution": FALLBACK_VARIANTS["substitution"],
+    "formation_change": (
+        "{team} have changed their shape. {score_phrase}.",
+        "A change of shape from {team}. {score_phrase}.",
+        "{team} reorganise, with a new shape. {score_phrase}.",
+    ),
+    "big_chance": FALLBACK_VARIANTS["big_chance"],
+    "signal_red_card": (
+        "{team} must reorganise a player short. {score_phrase}.",
+        "A player light now, {team} must find a new balance. {score_phrase}.",
+    ),
+    "signal_red_card_formation": (
+        "A player short, {team} change their shape. {score_phrase}.",
+        "{team} must reorganise a player short, with a new shape. {score_phrase}.",
+    ),
+    "signal_formation_change": (
+        "{team} have changed their shape. {score_phrase}.",
+        "A change of shape from {team}. {score_phrase}.",
+        "{team} reorganise, with a new shape. {score_phrase}.",
+    ),
+    "possession_swing": (
+        "{team} have taken control of the ball in this spell. {score_phrase}.",
+        "{team} are seeing much more of the ball now. {score_phrase}.",
+        "{team} have had {after}% of the possession in this spell.",
+    ),
+    "high_turnover_surge": (
+        "{team} keep winning it back in their opponents' half. {score_phrase}.",
+        "Another turnover high up for {team}, and the press is biting. {score_phrase}.",
+        "{team} are forcing mistakes high up the pitch. {score_phrase}.",
+    ),
+    "xg_surge": FALLBACK_VARIANTS["xg_surge"],
+}
+FallbackMode = str  # "casual" or "analyst"
+
+
+def _variants(kind: FallbackKind, mode: FallbackMode | None) -> tuple[str, ...]:
+    return (CASUAL_FALLBACK_VARIANTS if mode == "casual" else FALLBACK_VARIANTS)[kind]
+
+
 _SCORE_SENTENCE = " {score_phrase}."
 # Placeholders that may be empty: the variant is still usable without them.
 _OPTIONAL = {"back_line": ""}
@@ -110,9 +157,10 @@ def fallback_lines(
     values: Mapping[str, object],
     *,
     line_id: str,
+    mode: FallbackMode | None = None,
 ) -> Iterator[str]:
     """Yield the usable variants for a kind, in an order seeded by the line ID."""
-    for _, text in fallback_choices(kind, values, line_id=line_id):
+    for _, text in fallback_choices(kind, values, line_id=line_id, mode=mode):
         yield text
 
 
@@ -122,18 +170,20 @@ def fallback_choices(
     *,
     line_id: str,
     used: Collection[str] = (),
+    mode: FallbackMode | None = None,
 ) -> Iterator[tuple[str, str]]:
     """Yield (template, text) for the usable variants, in an order seeded by the line ID.
 
     A variant is usable only when every placeholder it needs has a value. With no
     score_phrase, the line isn't meant to state the score, so the closing score sentence is
     dropped rather than the variant. Templates in ``used`` (this match's earlier fallback
-    lines) come last, so no version repeats while an unused one can be said.
+    lines) come last, so no version repeats while an unused one can be said. ``mode``
+    "casual" picks the casual set; anything else the analyst set.
     """
-    for template, text in _ordered_choices(kind, values, line_id=line_id):
+    for template, text in _ordered_choices(kind, values, line_id=line_id, mode=mode):
         if template not in used:
             yield template, text
-    for template, text in _ordered_choices(kind, values, line_id=line_id):
+    for template, text in _ordered_choices(kind, values, line_id=line_id, mode=mode):
         if template in used:
             yield template, text
 
@@ -143,13 +193,14 @@ def _ordered_choices(
     values: Mapping[str, object],
     *,
     line_id: str,
+    mode: FallbackMode | None = None,
 ) -> Iterator[tuple[str, str]]:
     available = {
         **_OPTIONAL,
         **{key: value for key, value in values.items() if value not in (None, "")},
     }
     # (the template as written, which names it; the template as said)
-    templates = [(template, template) for template in FALLBACK_VARIANTS[kind]]
+    templates = [(template, template) for template in _variants(kind, mode)]
     if "score_phrase" not in available:
         templates = [
             (template, template.replace(_SCORE_SENTENCE, "")) for template, _ in templates
