@@ -3,6 +3,24 @@ const el = (id) => document.getElementById(id);
 const clientId = sessionStorage.getItem("pundit-client-id") || crypto.randomUUID();
 sessionStorage.setItem("pundit-client-id", clientId);
 
+// Mode and My team: kept per viewer for the tab's life and sent with Start. A change while a
+// match runs goes to the replay and applies from the next line.
+const PROFILE_KEY = "pundit-profile";
+const PROFILE_MODES = ["casual", "analyst"];
+const PROFILE_TEAMS = ["neutral", "home", "away"];
+
+function loadProfile() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(PROFILE_KEY) || "{}");
+    return {
+      mode: PROFILE_MODES.includes(saved.mode) ? saved.mode : "casual",
+      team: PROFILE_TEAMS.includes(saved.team) ? saved.team : "neutral",
+    };
+  } catch {
+    return { mode: "casual", team: "neutral" };
+  }
+}
+
 const KEY_EVENT_TYPES = ["goal", "card", "substitution", "formation_change", "half_time", "full_time"];
 // The feed auto-scrolls only when the viewer is this close to the newest line.
 const STICK_TO_BOTTOM_PX = 80;
@@ -35,6 +53,7 @@ const state = {
   questionAudioSeconds: 15,
   questionAudioBytes: 1_000_000,
   questionLimit: 300,
+  profile: loadProfile(),
 };
 
 function freshStats() {
@@ -53,6 +72,56 @@ function showMessage(target, text, isError = false) {
 // picks which controls show and how much the header carries.
 function setPhase(phase) {
   el("app-shell").dataset.phase = phase;
+}
+
+// Every Mode and My team select (the control bar's, and Match info's on phones) shows the
+// same profile; the shell carries it for styling.
+function renderProfile() {
+  for (const select of document.querySelectorAll('[data-profile="mode"]')) select.value = state.profile.mode;
+  for (const select of document.querySelectorAll('[data-profile="team"]')) select.value = state.profile.team;
+  el("app-shell").dataset.mode = state.profile.mode;
+  el("app-shell").dataset.team = state.profile.team;
+}
+
+// "My team: Ashbridge" on wide screens; "♥ Ashbridge" below 1440px, so the control bar stays
+// one row at 1280px and Mode, My team and Start share one row on phones (the select's label
+// still says "My team" to screen readers).
+const wideTeamLabels = matchMedia("(min-width: 1440px)");
+const teamLabels = { home: "Home", away: "Away" };
+function setTeamOptionLabels(homeShort = teamLabels.home, awayShort = teamLabels.away) {
+  teamLabels.home = homeShort;
+  teamLabels.away = awayShort;
+  const wide = wideTeamLabels.matches;
+  for (const option of document.querySelectorAll('[data-profile="team"] option')) {
+    const side = option.dataset.side;
+    const name = side ? teamLabels[side] : "Neutral";
+    option.textContent = wide ? `My team: ${name}` : side ? `♥ ${name}` : name;
+  }
+}
+wideTeamLabels.addEventListener("change", () => setTeamOptionLabels());
+
+async function changeProfile(change) {
+  state.profile = { ...state.profile, ...change };
+  try {
+    sessionStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile));
+  } catch {
+    // Storage blocked: the choice still holds for this page and is sent with Start.
+  }
+  renderProfile();
+  if (!state.replayId || !state.replayToken) return;
+  try {
+    await responseJson(await fetch(`/api/replays/${state.replayId}/profile`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Replay-Token": state.replayToken },
+      body: JSON.stringify(state.profile),
+    }));
+    if (!state.replayComplete) {
+      const mode = state.profile.mode === "analyst" ? "Analyst" : "Casual";
+      showMessage(el("ask-message"), `${mode} view from the next line.`);
+    }
+  } catch {
+    showMessage(el("ask-message"), "Your view will apply from your next match.");
+  }
 }
 
 // One connection state for the scoreboard's dot, the desktop footer and the Match info panel.
@@ -127,6 +196,7 @@ function updateMatchLabels() {
   // The phone header shows the short forms (engine/teams.py), the same ones the lines use.
   el("home-short").textContent = selected.dataset.homeShort || home;
   el("away-short").textContent = selected.dataset.awayShort || away;
+  setTeamOptionLabels(selected.dataset.homeShort || home, selected.dataset.awayShort || away);
   el("stadium").textContent = selected.dataset.stadium || "";
 }
 
@@ -1404,12 +1474,17 @@ async function startReplay() {
     state.replayComplete = false;
     const matchId = el("match-picker").value;
     const speed = el("speed-picker").value;
-    const started = await responseJson(await fetch(`/api/matches/${matchId}/start?speed=${speed}`, {
+    const profile = new URLSearchParams({ speed, mode: state.profile.mode, team: state.profile.team });
+    const started = await responseJson(await fetch(`/api/matches/${matchId}/start?${profile}`, {
       method: "POST",
       headers: { "X-Client-ID": clientId },
     }));
     state.replayId = started.replay_id;
     state.replayToken = started.replay_token;
+    if (started.profile) {
+      state.profile = { mode: started.profile.mode, team: started.profile.team };
+      renderProfile();
+    }
     playbackStateRevision = 0;
     state.audio = started.audio !== false;
     el("match-picker").disabled = true;
@@ -1687,6 +1762,10 @@ function setDrawer(open) {
 }
 
 el("match-picker").addEventListener("change", updateMatchLabels);
+for (const select of document.querySelectorAll("[data-profile]")) {
+  select.addEventListener("change", () => changeProfile({ [select.dataset.profile]: select.value }));
+}
+renderProfile();
 el("start-button").addEventListener("click", () => {
   audioQueue.unlock(); // in the click itself, before any await, so autoplay is allowed
   startCrowdInGesture({ starting: true });

@@ -146,6 +146,11 @@ select, textarea {
 }
 select { height: 34px; padding: 0 28px 0 10px; }
 .match-picker { width: min(320px, 100%); }
+.profile-picker { min-width: 0; }
+/* "Your view" in Match info is for phones mid-match; the desktop keeps it in the control bar. */
+.profile-block { display: none; }
+.profile-row { display: flex; gap: 8px; }
+.profile-row .profile-picker { flex: 1 1 0; }
 .speed-picker { min-width: 72px; }
 .control-spacer { flex: 1; }
 .button {
@@ -342,6 +347,11 @@ select { height: 34px; padding: 0 28px 0 10px; }
 
 /* Under 1024px: one column, match info in a drawer, the ask bar at the bottom of the screen */
 
+/* Narrower desktops: a shorter fixture picker keeps the control bar to one row at 1280px. */
+@media (min-width: 1024px) and (max-width: 1439px) {
+  .match-picker { width: 250px; }
+}
+
 /* Short desktop screens: a smaller pitch leaves room for the key moments. */
 @media (min-width: 1024px) and (max-height: 860px) {
   .pitch { max-height: 21vh; }
@@ -374,12 +384,25 @@ select { height: 34px; padding: 0 28px 0 10px; }
   .setup-controls { flex: 1 1 240px; }
   .run-controls { flex: 1 1 auto; justify-content: flex-end; }
   .app-shell[data-phase="running"] .setup-controls { display: none; }
+  /* Your view: one compact row of two selects before Start and after full time; in Match
+     info while a match runs. */
+  .profile-controls { flex: 1 1 100%; flex-wrap: nowrap; }
+  .profile-controls .profile-picker { flex: 1 1 0; }
+  .app-shell[data-phase="running"] .profile-controls { display: none; }
+  .profile-block { display: block; }
   .app-shell[data-phase="idle"] .run-controls > :not(.info-toggle) { display: none; }
   .app-shell[data-phase="idle"] .run-controls { flex: none; }
   /* Before a match: picker and speed on one row, Start and Match info on the next. */
   .app-shell[data-phase="idle"] .setup-controls { display: contents; }
   .app-shell[data-phase="idle"] .match-picker { flex: 1 1 55%; }
   .app-shell[data-phase="idle"] #start-button { flex: 1 1 55%; }
+  /* Two rows before Start, as before: fixture, speed and Match info; then Mode, My team and
+     Start. */
+  .app-shell[data-phase="idle"] .run-controls { order: 1; }
+  .app-shell[data-phase="idle"] .profile-controls { order: 2; flex: 1 1 200px; }
+  .app-shell[data-phase="idle"] #start-button { order: 3; flex: 0 0 auto; }
+  .profile-controls .profile-picker, .speed-picker { padding: 0 22px 0 8px; }
+  .profile-controls #team-picker { flex-grow: 1.4; }
   /* No connection dot until there is a connection; the warm-up dot covers that time. */
   .app-shell[data-phase="idle"] .live-light { display: none; }
   .app-shell[data-phase="running"] .run-controls { justify-content: flex-start; }

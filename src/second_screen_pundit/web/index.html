@@ -49,6 +49,22 @@
         </select>
         <button class="button button-primary" id="start-button" disabled>Start replay</button>
       </div>
+      <!-- The viewer profile: sent with Start, changeable mid-match (from the next line). On
+           the desktop layout it stays in this row; under 1024px it shows before Start and
+           after full time, and in Match info ("Your view") while a match runs. -->
+      <div class="control-group profile-controls" role="group" aria-label="Your view">
+        <label class="sr-only" for="mode-picker">Mode</label>
+        <select id="mode-picker" class="profile-picker" data-profile="mode" title="Mode: how much detail the pundit gives">
+          <option value="casual" selected>Casual</option>
+          <option value="analyst">Analyst</option>
+        </select>
+        <label class="sr-only" for="team-picker">My team</label>
+        <select id="team-picker" class="profile-picker" data-profile="team" title="My team: the side you follow">
+          <option value="neutral" selected>Neutral</option>
+          <option value="home" data-side="home">My team: Home</option>
+          <option value="away" data-side="away">My team: Away</option>
+        </select>
+      </div>
       <div class="control-group run-controls">
         <!-- One toggle: data-paused switches the icon and the label between Pause and Resume. -->
         <button class="button button-quiet icon-button-labelled" id="pause-button" type="button" disabled data-paused="false">
@@ -84,6 +100,24 @@
 
     <main class="workspace">
       <aside class="match-info" id="match-info" aria-label="Match info">
+        <!-- Under 1024px only: the profile while a match runs, when the control bar shows icons. -->
+        <section class="info-block profile-block" aria-labelledby="profile-title">
+          <div class="info-heading">
+            <h2 id="profile-title">Your view</h2>
+            <span class="fixture-caption">Changes apply from the next line</span>
+          </div>
+          <div class="profile-row">
+            <select class="profile-picker" data-profile="mode" aria-label="Mode">
+              <option value="casual" selected>Casual</option>
+              <option value="analyst">Analyst</option>
+            </select>
+            <select class="profile-picker" data-profile="team" aria-label="My team">
+              <option value="neutral" selected>Neutral</option>
+              <option value="home" data-side="home">My team: Home</option>
+              <option value="away" data-side="away">My team: Away</option>
+            </select>
+          </div>
+        </section>
         <section class="info-block pitch-block" aria-labelledby="pitch-title">
           <div class="info-heading">
             <h2 id="pitch-title">On the pitch</h2>

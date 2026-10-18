@@ -42,6 +42,7 @@ from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.engine.teams import short_name, team_name
 from second_screen_pundit.observability import record_result, tracer, turn_span
 from second_screen_pundit.outbox import ViewerOutbox
+from second_screen_pundit.profile import ProfileMode, ProfileTeam, ViewerProfile
 from second_screen_pundit.spending import CACHED_NOTICE, SpendingGuard
 
 
@@ -72,6 +73,11 @@ class QuestionRequest(BaseModel):
     # Chosen by the page, so an "answer_checking" event on the stream can find its card
     # before the answer comes back.
     question_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,64}$")
+
+
+class ViewerProfileRequest(BaseModel):
+    mode: ProfileMode
+    team: ProfileTeam
 
 
 class ViewerPlaybackStateRequest(BaseModel):
@@ -134,6 +140,8 @@ class ReplaySession:
     pipeline: Any = None
     # Off for replays started after the spending guard tripped: no speech at all.
     audio_enabled: bool = True
+    # Mode and My team, sent with Start and changeable mid-match (from the next line).
+    profile: ViewerProfile = field(default_factory=ViewerProfile)
 
 
 class QuestionRateLimiter:
@@ -711,7 +719,7 @@ def create_app(
 
     async def make_recap(session: ReplaySession, as_of: int) -> None:
         try:
-            with turn_span("recap", session.info.match_id) as span:
+            with turn_span("recap", session.info.match_id, session.profile) as span:
                 span.set_attribute("app.as_of", as_of)
                 result = await session_pipeline(session).produce_recap(
                     session.info,
@@ -1051,6 +1059,8 @@ def create_app(
         match_id: str,
         request: Request,
         speed: int = 1,
+        mode: ProfileMode = "casual",
+        team: ProfileTeam = "neutral",
     ) -> dict[str, Any]:
         warmup = app.state.warmup
         # Cached mode, audio off, for either reason: today's spending cap, or a live model
@@ -1134,6 +1144,7 @@ def create_app(
             colour_gate=ColourLineGate(),
             pipeline=cached_pipeline() if limited else None,
             audio_enabled=not limited,
+            profile=ViewerProfile(mode=mode, team=team),
         )
         if limited:
             logger.warning(
@@ -1149,6 +1160,7 @@ def create_app(
             delay=delay,
             on_outcome=lambda outcome: publish_outcome(session, outcome),
             on_line_ready=lambda outcome: prepare_line_audio(session, outcome),
+            profile=lambda: session.profile,
         )
         session.dispatch_source = replay.subscribe()
         session.viewer_source = replay.subscribe()
@@ -1170,6 +1182,7 @@ def create_app(
             "notice": (
                 CACHED_NOTICE if spending_limited else WARMUP_NOTICE if limited else None
             ),
+            "profile": session.profile.as_dict(),
         }
 
     async def set_paused(session: ReplaySession, paused: bool) -> str:
@@ -1195,6 +1208,23 @@ def create_app(
         state = await set_paused(session, action == "pause")
         return {"replay_id": replay_id, "state": state}
 
+    @app.post("/api/replays/{replay_id}/profile")
+    async def set_profile(
+        replay_id: str,
+        payload: ViewerProfileRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Change Mode or My team mid-match; the next line, answer and recap use it."""
+        session = find_session(replay_id, request)
+        session.profile = ViewerProfile(mode=payload.mode, team=payload.team)
+        logger.info(
+            "viewer_profile_changed replay_id=%s mode=%s team=%s",
+            replay_id,
+            payload.mode,
+            payload.team,
+        )
+        return {"replay_id": replay_id, "profile": session.profile.as_dict()}
+
     @app.post("/api/replays/{replay_id}/playback-state")
     async def playback_state(
         replay_id: str,
@@ -1218,7 +1248,7 @@ def create_app(
         pipeline = session_pipeline(session)
         if guard.models_exhausted and pipeline is app.state.pipeline:
             pipeline = cached_pipeline()
-        with turn_span("question", session.info.match_id) as span:
+        with turn_span("question", session.info.match_id, session.profile) as span:
             span.set_attribute("app.as_of", as_of)
             span.set_attribute("app.question.characters", len(question))
             async def checking() -> None:

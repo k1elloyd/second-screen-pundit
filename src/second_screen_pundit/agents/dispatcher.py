@@ -19,6 +19,7 @@ from second_screen_pundit.agents.wording import (
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.schema import Event, MatchInfo
 from second_screen_pundit.observability import record_result, turn_span
+from second_screen_pundit.profile import DEFAULT_PROFILE, ViewerProfile
 
 
 WINDOW_MATCH_MINUTES = 3
@@ -80,6 +81,9 @@ class LiveDispatcher:
     # Called, without awaiting, as soon as a line is ready and before it waits for release,
     # so audio can be synthesised during the broadcast delay.
     on_line_ready: OutcomeHandler | None = None
+    # The viewer's current profile, read as each window runs, so a change mid-match applies
+    # from the next line. None means the default profile.
+    profile: Callable[[], ViewerProfile] | None = None
     outcomes: list[WindowOutcome] = field(default_factory=list)
     boundaries: list[BoundaryRecord] = field(default_factory=list)
 
@@ -268,7 +272,8 @@ class LiveDispatcher:
     ) -> None:
         started = time.monotonic()
         try:
-            with turn_span("live", self.info.match_id) as span:
+            profile = self.profile() if self.profile is not None else DEFAULT_PROFILE
+            with turn_span("live", self.info.match_id, profile) as span:
                 span.set_attribute("app.as_of", outcome.event.seq)
                 outcome.result = await self.pipeline.comment_on_window(
                     self.info,

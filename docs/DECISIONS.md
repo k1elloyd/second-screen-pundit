@@ -921,3 +921,18 @@ Screenshots: `docs/screenshots/mobile/` (1×). iPhone checks of groups 1 and 2 (
 The replay may release a colour line after 12 real seconds with no speech playing or queued, and at least 40 real seconds after its previous colour line. The viewer reports queue changes to the server. Colour lines are spread by match clock: none before 10', no more than one in any rolling 15-minute span, and none after 85'. The replay pauses its colour worker while paused or disconnected. A queued candidate is invalidated when a real event arrives; a must-say event still inside its broadcast delay also blocks publication.
 
 Possession, shots on target, turnovers with the existing “usual rate” description, and formation matchups each have up to three deterministic template versions. Versions and their underlying statistic windows or signatures are each used at most once, leaving valid second-half templates available. Every candidate passes the existing wording, team-name, banned-phrase, evidence, and plain-spoken checks, then uses the routine audio tier and `source="colour"`. Missing or unsupported facts simply make that version unavailable.
+
+## Review 3 fixes (18 Oct 2026)
+
+`docs/reviews/review-3-opus.md` has the findings. One change to group 4 above: the colour candidate is now built in a worker thread (each build is 0.6–2.4 s of CPU, which had blocked every viewer's stream). Events keep arriving while it builds, so a routine event no longer invalidates it; a real line or a change in the viewer's audio queue still does, and a candidate is dropped if a shot or a must-say event reached the viewer while it was being built. Attempts are at least 2 s apart. `tests/test_robustness.py` drives the real worker with a slowed build: a median loop gap of 26–39 ms, and 688 ms with the build put back on the loop.
+
+## Personalisation, group 1: the viewer profile (18 Oct 2026)
+
+The official rules' fifth pipeline stage is Personalize (§4.1(i)): the same intelligence should reach an analyst and a casual fan as two different experiences.
+
+- **Profile.** Mode (`casual`, the default, or `analyst`) and My team (`home`, `away` or `neutral`, the default), in `profile.py`. No personal data: two fixed choices.
+- **Page.** Two selects. On the desktop they sit in the control bar for the whole match. Under 1024px they share the second row with Start before a match and after full time; while a match runs they are in Match info ("Your view"), since the control bar shows only icons then. Both copies stay in sync. The choice is kept in `sessionStorage` (`pundit-profile`) and sent with Start as `mode` and `team`. Team options read "My team: Ashbridge" from 1440px and "♥ Ashbridge" below that, so the control bar stays one row at 1280px and two rows on phones.
+- **Server.** The replay holds the profile (`ReplaySession.profile`). `POST /api/replays/{id}/profile` (replay token required, 422 for an unknown value) changes it mid-match. The dispatcher reads it as each window runs, so a change applies from the next line; questions and the recap read it when they run. A reconnect doesn't touch it.
+- **Traces.** Every `pundit.turn` span (live, question and recap) carries `app.profile.mode` and `app.profile.team`.
+- **Layout checked** in Chromium with the cached server, before Start: header plus controls 129 px at 360, 375, 390 and 430px (15.3% of 844, unchanged from before), and 136 px with fonts at 130% (unchanged), with no sideways overflow. At 130% text on 360–390px the longest team option ("♥ Port Calder") is 12–29 px wider than its select, so it is clipped when chosen. Desktop: one control row at 1280, 1366 and 1920px; two rows at 1024px.
+- Mode and My team change nothing the viewer sees yet; group 2 adds the differences.

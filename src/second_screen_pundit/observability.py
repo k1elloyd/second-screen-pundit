@@ -93,11 +93,18 @@ def record_result(span: Span, result: Any) -> None:
 
 
 @contextmanager
-def turn_span(route: str, match_id: str) -> Iterator[Span]:
-    """The parent span of one pipeline run: `live`, `question` or `recap`."""
+def turn_span(route: str, match_id: str, profile: Any = None) -> Iterator[Span]:
+    """The parent span of one pipeline run: `live`, `question` or `recap`.
+
+    `profile` (a ViewerProfile) adds `app.profile.mode` and `app.profile.team`: two fixed
+    choices, no personal data.
+    """
     with tracer.start_as_current_span("pundit.turn") as span:
         span.set_attribute("app.route", route)
         span.set_attribute("app.match_id", match_id)
+        if profile is not None:
+            for name, value in profile.span_attributes().items():
+                span.set_attribute(name, value)
         try:
             yield span
         except Exception as exc:
