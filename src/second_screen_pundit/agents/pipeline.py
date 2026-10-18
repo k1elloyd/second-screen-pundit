@@ -1986,6 +1986,93 @@ class PunditPipeline:
                 tuple(output_failures),
             )
 
+    def validate_colour_line(
+        self,
+        line: CommentaryLine,
+        insight: Insight,
+        *,
+        info: MatchInfo,
+        events: list[Event],
+        as_of: int,
+        tool_results: list[ToolResult],
+        lane: str,
+    ) -> LiveWindowResult:
+        visible = [event for event in events if event.seq <= as_of]
+        if not visible:
+            raise ValueError("A colour line requires at least one visible event")
+        latest = max(visible, key=lambda event: event.seq)
+        minute = min(90, latest.minute + latest.added_minute)
+        text, phase_failures = polish_line_text(
+            line.text,
+            info,
+            clock_allowed=False,
+            score_allowed=False,
+            minute=minute,
+            period=latest.period,
+        )
+        hits = banned_phrase_hits(
+            text,
+            info,
+            [event.team for event in visible if event.type == "goal" and event.team],
+        )
+        wording = [
+            *(f"banned phrase {hit}" for hit in hits),
+            *comparison_failures(text),
+            *phase_failures,
+        ]
+        if wording:
+            report = EvidenceReport(False, tuple(wording))
+            logger.error(
+                "colour_line_wording_rejected match_id=%s as_of=%d failures=%s",
+                info.match_id,
+                as_of,
+                " | ".join(wording),
+            )
+            return LiveWindowResult(
+                "rejected",
+                None,
+                None,
+                tuple(tool_results),
+                report,
+                "A deterministic colour template failed its wording checks.",
+                wording_failures=tuple(wording),
+            )
+        line = line.model_copy(update={"text": text})
+        report = self._check_line(
+            line,
+            insight,
+            info=info,
+            events=events,
+            as_of=as_of,
+            tool_results=tool_results,
+            lane=lane,
+            score_allowed=False,
+            clock_allowed=False,
+        )
+        if not report.passed:
+            logger.error(
+                "colour_line_evidence_rejected match_id=%s as_of=%d failures=%s",
+                info.match_id,
+                as_of,
+                " | ".join(report.failures),
+            )
+            return LiveWindowResult(
+                "rejected",
+                None,
+                None,
+                tuple(tool_results),
+                report,
+                "A deterministic colour template failed the evidence check.",
+                evidence_failures=report.failures,
+            )
+        return LiveWindowResult(
+            "commentary",
+            line,
+            insight,
+            tuple(tool_results),
+            report,
+        )
+
     def _check_line(
         self,
         line: CommentaryLine,
@@ -2032,10 +2119,12 @@ class PunditPipeline:
                 False,
                 ("CommentaryLine.line_id does not match the dispatched event sequence",),
             )
-        if line.source != "agent" and not (allow_fallback and line.source == "fallback"):
+        if line.source not in {"agent", "colour"} and not (
+            allow_fallback and line.source == "fallback"
+        ):
             return EvidenceReport(
                 False,
-                ("CommentaryLine.source must be agent for model output",),
+                ("CommentaryLine.source is not allowed for this line",),
             )
         if line.insight_id != insight.insight_id:
             return EvidenceReport(

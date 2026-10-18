@@ -22,12 +22,17 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from second_screen_pundit.agents.colour import (
+    ColourLineCandidate,
+    ColourLineGate,
+    build_colour_candidate,
+)
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.content_filter import viewer_output_block_reason
 from second_screen_pundit.agents.dispatcher import LiveDispatcher, WindowOutcome
 from second_screen_pundit.agents.evidence import EvidenceReport
 from second_screen_pundit.agents.models import DeliveryTier, Explanation
-from second_screen_pundit.agents.pipeline import PunditPipeline, QuestionResult
+from second_screen_pundit.agents.pipeline import PunditPipeline, QuestionResult, is_must_say
 from second_screen_pundit.agents.tools.analytics import possession_pair
 from second_screen_pundit.agents.speech import SpeechRecognizer, SpeechSynthesizer
 from second_screen_pundit.engine.broadcast import BroadcastDelay
@@ -59,6 +64,11 @@ class QuestionRequest(BaseModel):
     # Chosen by the page, so an "answer_checking" event on the stream can find its card
     # before the answer comes back.
     question_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,64}$")
+
+
+class ViewerPlaybackStateRequest(BaseModel):
+    audio_busy: bool
+    revision: int = Field(ge=0)
 
 
 def _new_replay_token() -> str:
@@ -99,6 +109,10 @@ class ReplaySession:
     stream_deadline_task: asyncio.Task[None] | None = None
     # Line audio started while the line waits for release, keyed by the internal line ID.
     line_audio_tasks: dict[str, asyncio.Task[str | None]] = field(default_factory=dict)
+    colour_gate: ColourLineGate = field(default_factory=ColourLineGate)
+    colour_attempted_generation: int = -1
+    viewer_line_state_revision: int = -1
+    pending_real_events: set[int] = field(default_factory=set)
     dispatcher: LiveDispatcher | None = None
     dispatch_source: AsyncIterator[Event] | None = None
     viewer_source: AsyncIterator[Event] | None = None
@@ -391,6 +405,11 @@ def create_app(
     def session_pipeline(session: ReplaySession) -> Any:
         return session.pipeline if session.pipeline is not None else app.state.pipeline
 
+    def note_colour_event(session: ReplaySession, event: Event) -> None:
+        session.colour_gate.record_event()
+        if is_must_say(event, session.events):
+            session.pending_real_events.add(event.seq)
+
     def speech_services() -> tuple[SpeechRecognizer, SpeechSynthesizer]:
         if app.state.speech_recognizer is not None and app.state.speech_synthesizer is not None:
             return app.state.speech_recognizer, app.state.speech_synthesizer
@@ -468,9 +487,15 @@ def create_app(
             synthesize(session, line.text, tier=line.delivery_tier)
         )
 
-    async def publish_outcome(session: ReplaySession, outcome: WindowOutcome) -> None:
+    async def publish_outcome(
+        session: ReplaySession,
+        outcome: WindowOutcome,
+        *,
+        colour_generation: int | None = None,
+        colour_candidate: ColourLineCandidate | None = None,
+    ) -> bool:
         if outcome.result is None:
-            return
+            return False
         if outcome.result.insight is not None:
             await session.outbox.put(
                 (
@@ -484,13 +509,30 @@ def create_app(
             )
         line = outcome.result.line
         if line is None:
-            return
+            return False
         # A line never reaches the viewer before its event: wait for the viewer stream, not
         # only for the delay, since the two release loops can wake in either order.
         async with session.release_condition:
             await session.release_condition.wait_for(
                 lambda: session.viewer_released_as_of >= outcome.event.seq
             )
+            if colour_generation is not None and (
+                not session.colour_gate.candidate_is_current(colour_generation)
+                or bool(session.pending_real_events)
+                or not session.stream_open
+                or session.replay.state != "running"
+                or not session.colour_gate.is_due(
+                    time.monotonic(),
+                    outcome.minute,
+                    event_pending=False,
+                    stream_open=session.stream_open,
+                    replay_running=session.replay.state == "running",
+                )
+            ):
+                audio_task = session.line_audio_tasks.pop(line.line_id, None)
+                if audio_task is not None and not audio_task.done():
+                    audio_task.cancel()
+                return False
         public_line_id = f"{session.replay_id}-{line.line_id}"
         public_line = line.model_copy(update={"line_id": public_line_id})
         events_by_id = {event.event_id: event for event in session.events}
@@ -519,6 +561,7 @@ def create_app(
         }
         audio_task = session.line_audio_tasks.pop(line.line_id, None)
         if not session.audio_enabled:
+            record_commentary_release(session, outcome, colour_candidate)
             await session.outbox.put(
                 (
                     "commentary",
@@ -530,10 +573,11 @@ def create_app(
                     },
                 )
             )
-            return
+            return True
         if audio_task is not None and audio_task.done() and not audio_task.cancelled():
             # The usual case: the audio was ready before the line's release.
             audio_id = audio_task.result()
+            record_commentary_release(session, outcome, colour_candidate)
             await session.outbox.put(
                 (
                     "commentary",
@@ -545,8 +589,9 @@ def create_app(
                     },
                 )
             )
-            return
+            return True
         # The text never waits for its audio.
+        record_commentary_release(session, outcome, colour_candidate)
         await session.outbox.put(
             (
                 "commentary",
@@ -569,6 +614,24 @@ def create_app(
                 {"line_id": public_line_id, "audio_id": audio_id},
             )
         )
+        return True
+
+    def record_commentary_release(
+        session: ReplaySession,
+        outcome: WindowOutcome,
+        colour_candidate: ColourLineCandidate | None,
+    ) -> None:
+        now = time.monotonic()
+        if colour_candidate is None:
+            session.colour_gate.record_real_line(now, audio_enabled=session.audio_enabled)
+        else:
+            session.colour_gate.record_colour_release(
+                colour_candidate.version,
+                colour_candidate.statistic_keys,
+                outcome.minute,
+                now,
+                audio_enabled=session.audio_enabled,
+            )
 
     async def make_recap(session: ReplaySession, as_of: int) -> None:
         try:
@@ -616,21 +679,107 @@ def create_app(
                 payload = _event_payload(event, session.info)
                 payload["possession"] = _released_possession(session, event)
                 await session.outbox.put(("event", payload))
+                session.pending_real_events.discard(event.seq)
                 session.release_condition.notify_all()
             if event.type == "full_time":
                 session.recap_task = asyncio.create_task(make_recap(session, event.seq))
 
+    async def colour_lines(session: ReplaySession) -> None:
+        while not session.stopped and session.replay.state in {"running", "paused"}:
+            await asyncio.sleep(0.05)
+            if session.replay.state != "running" or not session.stream_open:
+                continue
+            as_of = session.viewer_released_as_of
+            if as_of <= 0:
+                continue
+            line_event = next(
+                (event for event in reversed(session.released_events) if event.seq == as_of),
+                None,
+            )
+            if line_event is None:
+                continue
+            match_minute = min(90, line_event.minute + line_event.added_minute)
+            generation = session.colour_gate.generation
+            if generation == session.colour_attempted_generation:
+                continue
+            if not session.colour_gate.is_due(
+                time.monotonic(),
+                match_minute,
+                event_pending=bool(session.pending_real_events),
+                stream_open=session.stream_open,
+                replay_running=session.replay.state == "running",
+            ):
+                continue
+            session.colour_attempted_generation = generation
+            line_pipeline = session_pipeline(session)
+            if not isinstance(line_pipeline, PunditPipeline):
+                continue
+            try:
+                candidate = build_colour_candidate(
+                    session.info,
+                    session.events,
+                    as_of=as_of,
+                    ordinal=session.colour_gate.count + 1,
+                    used_versions=session.colour_gate.used_versions,
+                    used_statistics=session.colour_gate.used_statistics,
+                )
+                if candidate is None:
+                    continue
+                result = line_pipeline.validate_colour_line(
+                    candidate.line,
+                    candidate.insight,
+                    info=session.info,
+                    events=session.events,
+                    as_of=as_of,
+                    tool_results=list(candidate.tool_results),
+                    lane=candidate.lane,
+                )
+            except Exception:
+                logger.exception(
+                    "colour_line_failed match_id=%s as_of=%d",
+                    session.info.match_id,
+                    as_of,
+                )
+                continue
+            if (
+                result.status != "commentary"
+                or result.line is None
+                or result.evidence is None
+            ):
+                continue
+            outcome = WindowOutcome(
+                path="tactical",
+                event=line_event,
+                minute=min(90, line_event.minute + line_event.added_minute),
+                result=replace(result, insight=None),
+            )
+            prepare_line_audio(session, outcome)
+            await publish_outcome(
+                session,
+                outcome,
+                colour_generation=generation,
+                colour_candidate=candidate,
+            )
+
     async def run_session(session: ReplaySession) -> None:
         if session.dispatcher is None or session.dispatch_source is None or session.viewer_source is None:
             raise RuntimeError("Replay session workers were not initialized")
+
+        async def observed_events(source: AsyncIterator[Event]) -> AsyncIterator[Event]:
+            async for event in source:
+                session.delay.stamp(event)
+                note_colour_event(session, event)
+                yield event
+
         dispatch_task = asyncio.create_task(
             session.dispatcher.run(
-                session.dispatch_source,
+                observed_events(session.dispatch_source),
                 replay_stopped=lambda: session.replay.state == "stopped",
             )
         )
         release_task = asyncio.create_task(release_events(session, session.viewer_source))
-        children = (dispatch_task, release_task)
+        colour_task = asyncio.create_task(colour_lines(session))
+        children = (dispatch_task, release_task, colour_task)
         try:
             results = await asyncio.gather(*children, return_exceptions=True)
             worker_errors = [
@@ -883,6 +1032,7 @@ def create_app(
             events=events,
             replay=replay,
             delay=delay,
+            colour_gate=ColourLineGate(),
             pipeline=cached_pipeline() if limited else None,
             audio_enabled=not limited,
         )
@@ -941,6 +1091,19 @@ def create_app(
             raise HTTPException(status_code=422, detail="Action must be pause or resume.")
         state = await set_paused(session, action == "pause")
         return {"replay_id": replay_id, "state": state}
+
+    @app.post("/api/replays/{replay_id}/playback-state")
+    async def playback_state(
+        replay_id: str,
+        payload: ViewerPlaybackStateRequest,
+        request: Request,
+    ) -> dict[str, bool]:
+        session = find_session(replay_id, request)
+        if payload.revision <= session.viewer_line_state_revision:
+            return {"accepted": False}
+        session.viewer_line_state_revision = payload.revision
+        session.colour_gate.update_viewer_queue(payload.audio_busy, time.monotonic())
+        return {"accepted": True}
 
     async def answer(
         session: ReplaySession,

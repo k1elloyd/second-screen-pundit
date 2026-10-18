@@ -58,6 +58,10 @@ class BroadcastDelay:
     def released_as_of(self) -> int:
         return max(self.released, default=0)
 
+    @property
+    def has_pending_events(self) -> bool:
+        return any(seq not in self.released for seq in self._seen)
+
     def stamp(self, event: Event) -> None:
         self._seen.setdefault(event.seq, self._clock())
 

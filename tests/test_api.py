@@ -100,6 +100,52 @@ def _session(
     )
 
 
+def test_playback_state_is_authenticated_and_ignores_stale_revisions() -> None:
+    settings = _settings()
+    app = create_app(settings=settings, pipeline=PunditPipeline(settings, None))
+    with TestClient(app) as client:
+        started = client.post(
+            "/api/matches/m01/start?speed=20",
+            headers={"X-Client-ID": "playback-state-test"},
+        )
+        assert started.status_code == 200
+        payload = started.json()
+        replay_id = payload["replay_id"]
+        token = payload["replay_token"]
+        headers = {"X-Replay-Token": token}
+
+        idle = client.post(
+            f"/api/replays/{replay_id}/playback-state",
+            headers=headers,
+            json={"audio_busy": False, "revision": 0},
+        )
+        assert idle.status_code == 200 and idle.json() == {"accepted": True}
+        session = app.state.sessions[replay_id]
+        assert session.colour_gate.viewer_state_received
+        assert not session.colour_gate.viewer_line_busy
+        assert session.colour_gate.silence_started_at is not None
+
+        busy = client.post(
+            f"/api/replays/{replay_id}/playback-state",
+            headers=headers,
+            json={"audio_busy": True, "revision": 2},
+        )
+        assert busy.status_code == 200 and busy.json() == {"accepted": True}
+        stale = client.post(
+            f"/api/replays/{replay_id}/playback-state",
+            headers=headers,
+            json={"audio_busy": False, "revision": 1},
+        )
+        assert stale.status_code == 200 and stale.json() == {"accepted": False}
+        assert session.colour_gate.viewer_line_busy
+
+        unauthorized = client.post(
+            f"/api/replays/{replay_id}/playback-state",
+            json={"audio_busy": False, "revision": 3},
+        )
+        assert unauthorized.status_code == 404
+
+
 def _get_request(client_ip: str, path: str = "/", *, token: str | None = None) -> Request:
     """A bare request from `client_ip`, for calling a route's endpoint directly."""
     headers = [] if token is None else [(b"x-replay-token", token.encode())]

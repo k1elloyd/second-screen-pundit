@@ -383,6 +383,263 @@ function silentAudioUrl() {
   return URL.createObjectURL(encodeWav(new Float32Array(1600), 16000));
 }
 
+const CROWD_BASE_GAIN = 0.04;
+const CROWD_DUCK_FACTOR = 0.25;
+const CROWD_SWELL_MS = 3000;
+const CROWD_DUCK_RELEASE_MS = 400;
+const CROWD_DUCK_FADE_SECONDS = 0.08;
+const CROWD_LEVEL_FADE_SECONDS = 0.14;
+const CROWD_LAYER_CUTOFFS = [400, 470, 540, 610];
+const CROWD_LAYER_PANS = [-0.6, -0.2, 0.2, 0.6];
+const CROWD_LAYER_GAIN = 0.38;
+const CROWD_SURGE_HZ = 0.012;
+const CROWD_SURGE_DEPTH = 0.1;
+const WHISTLE_SHORT_SECONDS = 0.16;
+const WHISTLE_LONG_SECONDS = 0.42;
+const WHISTLE_GAP_SECONDS = 0.12;
+const WHISTLE_PEAK_GAIN = 0.16;
+const WHISTLE_FREQUENCIES = [1850, 2250];
+
+class CrowdBed {
+  constructor() {
+    this.enabled = readStored("pundit-crowd-enabled") !== "0";
+    this.muted = readStored("pundit-muted") === "1";
+    this.ducked = false;
+    this.active = false;
+    this.context = null;
+    this.output = null;
+    this.effectsOutput = null;
+    this.swellLevel = 0;
+    this.swellUntil = 0;
+    this.swellTimer = null;
+    this.duckReleaseTimer = null;
+    this.whistles = new Set();
+    this.whistledKickoffs = new Set();
+  }
+
+  create() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) throw new Error("Web Audio is not supported in this browser.");
+    this.context = new AudioContextClass();
+    const sampleRate = this.context.sampleRate;
+    const output = this.context.createGain();
+    output.gain.value = 0;
+    const effectsOutput = this.context.createGain();
+    effectsOutput.gain.value = 0.65;
+    const surge = this.context.createGain();
+    surge.gain.value = 1;
+    surge.connect(output);
+    output.connect(this.context.destination);
+    effectsOutput.connect(this.context.destination);
+
+    for (let layer = 0; layer < CROWD_LAYER_CUTOFFS.length; layer += 1) {
+      const buffer = this.context.createBuffer(1, sampleRate * 2, sampleRate);
+      const samples = buffer.getChannelData(0);
+      let lowFrequencyNoise = 0;
+      const smoothing = 0.032 + Math.random() * 0.016;
+      for (let index = 0; index < samples.length; index += 1) {
+        const white = Math.random() * 2 - 1;
+        lowFrequencyNoise += (white - lowFrequencyNoise) * smoothing;
+        samples[index] = Math.max(-1, Math.min(1, lowFrequencyNoise * 4));
+      }
+
+      const source = this.context.createBufferSource();
+      source.buffer = buffer;
+      source.loop = true;
+      const highPass = this.context.createBiquadFilter();
+      highPass.type = "highpass";
+      highPass.frequency.value = 85 + layer * 8;
+      const lowPass = this.context.createBiquadFilter();
+      lowPass.type = "lowpass";
+      lowPass.frequency.value = CROWD_LAYER_CUTOFFS[layer];
+      const layerGain = this.context.createGain();
+      layerGain.gain.value = CROWD_LAYER_GAIN;
+      const panner = this.context.createStereoPanner();
+      panner.pan.value = CROWD_LAYER_PANS[layer];
+      source.connect(highPass);
+      highPass.connect(lowPass);
+      lowPass.connect(layerGain);
+      layerGain.connect(panner);
+      panner.connect(surge);
+
+      const lfo = this.context.createOscillator();
+      lfo.frequency.value = 0.018 + Math.random() * 0.02;
+      const levelModulation = this.context.createGain();
+      levelModulation.gain.value = 0.1;
+      const filterModulation = this.context.createGain();
+      filterModulation.gain.value = 28 + Math.random() * 20;
+      lfo.connect(levelModulation);
+      levelModulation.connect(layerGain.gain);
+      lfo.connect(filterModulation);
+      filterModulation.connect(lowPass.frequency);
+      source.start();
+      lfo.start(0, Math.random() * 20);
+    }
+
+    const surgeLfo = this.context.createOscillator();
+    surgeLfo.frequency.value = CROWD_SURGE_HZ;
+    const surgeModulation = this.context.createGain();
+    surgeModulation.gain.value = CROWD_SURGE_DEPTH;
+    surgeLfo.connect(surgeModulation);
+    surgeModulation.connect(surge.gain);
+    surgeLfo.start();
+    this.output = output;
+    this.effectsOutput = effectsOutput;
+  }
+
+  startInGesture() {
+    if (this.muted) return Promise.resolve();
+    if (!this.context) this.create();
+    this.active = true;
+    this.applyLevel();
+    if (this.context.state === "suspended") return this.context.resume();
+    return Promise.resolve();
+  }
+
+  resumeInGesture() {
+    return this.startInGesture();
+  }
+
+  applyLevel() {
+    if (!this.context || !this.output) return;
+    const now = Date.now();
+    let level = 0;
+    if (this.active && this.enabled && !this.muted) {
+      level = this.ducked
+        ? CROWD_BASE_GAIN * CROWD_DUCK_FACTOR
+        : this.swellUntil > now ? Math.max(CROWD_BASE_GAIN, this.swellLevel) : CROWD_BASE_GAIN;
+    }
+    const parameter = this.output.gain;
+    parameter.cancelScheduledValues(this.context.currentTime);
+    parameter.setTargetAtTime(
+      level,
+      this.context.currentTime,
+      this.ducked ? CROWD_DUCK_FADE_SECONDS : CROWD_LEVEL_FADE_SECONDS,
+    );
+  }
+
+  setDucked(ducked) {
+    clearTimeout(this.duckReleaseTimer);
+    this.duckReleaseTimer = null;
+    if (ducked) {
+      this.ducked = true;
+      this.applyLevel();
+      return;
+    }
+    this.duckReleaseTimer = setTimeout(() => {
+      this.ducked = false;
+      this.duckReleaseTimer = null;
+      this.applyLevel();
+    }, CROWD_DUCK_RELEASE_MS);
+  }
+
+  setMuted(muted) {
+    this.muted = muted;
+    if (muted) this.clearWhistles();
+    this.applyLevel();
+  }
+
+  setEnabled(enabled) {
+    this.enabled = enabled;
+    writeStored("pundit-crowd-enabled", enabled ? "1" : "0");
+    if (!enabled) this.clearWhistles();
+    this.applyLevel();
+  }
+
+  swell(level) {
+    if (!this.active || !this.enabled || this.muted) return;
+    this.swellLevel = Math.max(this.swellLevel, level);
+    this.swellUntil = Date.now() + CROWD_SWELL_MS;
+    clearTimeout(this.swellTimer);
+    this.swellTimer = setTimeout(() => {
+      this.swellLevel = 0;
+      this.swellUntil = 0;
+      this.swellTimer = null;
+      this.applyLevel();
+    }, CROWD_SWELL_MS);
+    this.applyLevel();
+  }
+
+  handleEvent(event) {
+    if (event.type === "kickoff" && !this.whistledKickoffs.has(event.period)) {
+      this.whistledKickoffs.add(event.period);
+      this.playWhistlePattern([WHISTLE_SHORT_SECONDS]);
+    } else if (event.type === "half_time") {
+      this.playWhistlePattern([WHISTLE_SHORT_SECONDS, WHISTLE_SHORT_SECONDS]);
+    } else if (event.type === "full_time") {
+      this.playWhistlePattern([
+        WHISTLE_SHORT_SECONDS, WHISTLE_SHORT_SECONDS, WHISTLE_LONG_SECONDS,
+      ]);
+    }
+
+    if (event.type === "goal") {
+      this.swell((event.clock || 0) >= 75 ? 0.14 : 0.09);
+    } else if (event.type === "card" && event.detail?.colour === "red") {
+      this.swell(0.06);
+    } else if (event.type === "shot" && event.xg != null && event.xg >= 0.3) {
+      this.swell(0.06);
+    }
+  }
+
+  playWhistlePattern(durations) {
+    if (!this.active || !this.enabled || this.muted || !this.context || !this.effectsOutput) return;
+    let startAt = this.context.currentTime;
+    for (const duration of durations) {
+      const envelope = this.context.createGain();
+      envelope.gain.setValueAtTime(0, startAt);
+      envelope.gain.linearRampToValueAtTime(WHISTLE_PEAK_GAIN, startAt + 0.025);
+      envelope.gain.setValueAtTime(WHISTLE_PEAK_GAIN, startAt + duration - 0.045);
+      envelope.gain.linearRampToValueAtTime(0, startAt + duration);
+      envelope.connect(this.effectsOutput);
+      this.whistles.add(envelope);
+
+      for (const frequency of WHISTLE_FREQUENCIES) {
+        const oscillator = this.context.createOscillator();
+        oscillator.type = "sine";
+        oscillator.frequency.value = frequency;
+        oscillator.connect(envelope);
+        oscillator.start(startAt);
+        oscillator.stop(startAt + duration);
+      }
+      startAt += duration + WHISTLE_GAP_SECONDS;
+    }
+  }
+
+  clearWhistles() {
+    if (this.context) {
+      for (const envelope of this.whistles) {
+        envelope.gain.cancelScheduledValues(this.context.currentTime);
+        envelope.gain.setValueAtTime(0, this.context.currentTime);
+      }
+    }
+    this.whistles.clear();
+  }
+
+  resetEventCues() {
+    this.clearWhistles();
+    this.whistledKickoffs.clear();
+  }
+
+  pause() {
+    this.active = false;
+    clearTimeout(this.duckReleaseTimer);
+    this.duckReleaseTimer = null;
+    this.ducked = false;
+    this.clearWhistles();
+    clearTimeout(this.swellTimer);
+    this.swellTimer = null;
+    this.swellLevel = 0;
+    this.swellUntil = 0;
+    if (!this.context || !this.output) return;
+    const parameter = this.output.gain;
+    parameter.cancelScheduledValues(this.context.currentTime);
+    parameter.setValueAtTime(0, this.context.currentTime);
+    if (this.context.state !== "suspended") {
+      this.context.suspend().catch((error) => console.error("Could not suspend crowd audio.", error));
+    }
+  }
+}
+
 // One <audio> element plays everything in turn, so lines never overlap. Lines wait in order;
 // normally at most one waits behind the line that is playing. Answers, the recap and replays
 // go to the front without cutting off the line that is playing.
@@ -390,6 +647,7 @@ function silentAudioUrl() {
 // oldest routine clip is dropped first, and a stale routine clip is skipped.
 const PRIORITY_AUDIO_TIERS = new Set(["goal_peak", "goal_equaliser", "goal", "red_card", "big_chance"]);
 const MAX_WAITING_LINES = 1;
+const AUDIO_PRE_DUCK_MS = 300;
 
 class AudioQueue {
   constructor() {
@@ -401,6 +659,12 @@ class AudioQueue {
     this.pausedAt = null;
     this.pausedTotal = 0;
     this.muted = readStored("pundit-muted") === "1";
+    this.onPlaybackChange = () => {};
+    this.onLineQueueChange = () => {};
+    this.pendingLines = new Set();
+    this.lineQueueBusy = false;
+    this.playTimer = null;
+    this.playbackStarted = false;
     this.el.addEventListener("ended", () => this.next());
     this.el.addEventListener("error", () => this.next());
   }
@@ -419,7 +683,11 @@ class AudioQueue {
   }
 
   enqueue({ id, kind, lineId = null, expiresAt = null, tier = null }) {
-    if (!id || this.muted) return;
+    if (kind === "line" && lineId) this.pendingLines.delete(lineId);
+    if (!id || this.muted) {
+      this.notifyLineQueueChange();
+      return;
+    }
     const priority = kind === "line" && PRIORITY_AUDIO_TIERS.has(tier);
     const item = { url: audioUrl(id), kind, lineId, expiresAt, priority };
     if (kind === "line") {
@@ -428,7 +696,23 @@ class AudioQueue {
     } else {
       this.items.unshift(item);
     }
+    this.notifyLineQueueChange();
     if (!this.playing && !this.paused) this.next();
+  }
+
+  setLinePending(lineId, pending) {
+    if (!lineId) return;
+    if (pending && !this.muted) this.pendingLines.add(lineId);
+    else this.pendingLines.delete(lineId);
+    this.notifyLineQueueChange();
+  }
+
+  notifyLineQueueChange(force = false) {
+    const busy = Boolean(this.playing || this.items.length || this.pendingLines.size);
+    if (force || busy !== this.lineQueueBusy) {
+      this.lineQueueBusy = busy;
+      this.onLineQueueChange(busy);
+    }
   }
 
   static stale(item) {
@@ -447,31 +731,58 @@ class AudioQueue {
   }
 
   next() {
+    clearTimeout(this.playTimer);
+    this.playTimer = null;
+    this.playbackStarted = false;
     this.playing = null;
     document.querySelector(".commentary-card.speaking")?.classList.remove("speaking");
-    if (this.paused) return;
+    if (this.paused) {
+      this.onPlaybackChange(false);
+      this.notifyLineQueueChange();
+      return;
+    }
     const item = this.items.shift();
-    if (!item) return;
+    if (!item) {
+      this.onPlaybackChange(false);
+      this.notifyLineQueueChange();
+      return;
+    }
     if (this.muted || AudioQueue.stale(item)) {
       this.next();
       return;
     }
     this.playing = item;
-    this.el.src = item.url;
-    if (item.lineId) {
-      [...document.querySelectorAll(".commentary-card")]
-        .find((card) => card.dataset.lineId === item.lineId)?.classList.add("speaking");
-    }
-    this.el.play().catch((error) => {
-      if (error.name === "NotAllowedError") {
-        // The unlock failed: keep the item and ask for a click.
-        this.items.unshift(item);
-        this.playing = null;
-        el("enable-audio").hidden = false;
-      } else {
+    this.notifyLineQueueChange();
+    this.schedulePlay(item);
+  }
+
+  schedulePlay(item) {
+    this.onPlaybackChange(true);
+    this.playTimer = setTimeout(() => {
+      this.playTimer = null;
+      if (this.paused || this.playing !== item) return;
+      if (this.muted || AudioQueue.stale(item)) {
         this.next();
+        return;
       }
-    });
+      this.playbackStarted = true;
+      this.el.src = item.url;
+      if (item.lineId) {
+        [...document.querySelectorAll(".commentary-card")]
+          .find((card) => card.dataset.lineId === item.lineId)?.classList.add("speaking");
+      }
+      this.el.play().catch((error) => {
+        if (error.name === "NotAllowedError") {
+          this.items.unshift(item);
+          this.playing = null;
+          this.playbackStarted = false;
+          this.onPlaybackChange(false);
+          el("enable-audio").hidden = false;
+        } else {
+          this.next();
+        }
+      });
+    }, AUDIO_PRE_DUCK_MS);
   }
 
   setMuted(muted) {
@@ -480,6 +791,7 @@ class AudioQueue {
     if (muted) {
       this.el.pause();
       this.items = [];
+      this.pendingLines.clear();
       this.next();
     }
   }
@@ -492,7 +804,10 @@ class AudioQueue {
   pause() {
     this.paused = true;
     if (this.pausedAt === null) this.pausedAt = Date.now();
+    clearTimeout(this.playTimer);
+    this.playTimer = null;
     this.el.pause();
+    this.onPlaybackChange(false);
   }
 
   resume() {
@@ -503,7 +818,7 @@ class AudioQueue {
       for (const item of this.items) if (item.expiresAt != null) item.expiresAt += away;
     }
     this.paused = false;
-    if (this.playing) this.el.play().catch(() => {});
+    if (this.playing) this.schedulePlay(this.playing);
     else this.next();
   }
 
@@ -520,13 +835,75 @@ class AudioQueue {
 
   clear() {
     this.items = [];
+    this.pendingLines.clear();
+    clearTimeout(this.playTimer);
+    this.playTimer = null;
+    this.playbackStarted = false;
     this.el.pause();
     this.playing = null;
+    this.onPlaybackChange(false);
+    this.notifyLineQueueChange();
     document.querySelector(".commentary-card.speaking")?.classList.remove("speaking");
   }
 }
 
 const audioQueue = new AudioQueue();
+const crowdBed = new CrowdBed();
+audioQueue.onPlaybackChange = (speaking) => crowdBed.setDucked(speaking);
+let playbackStateRevision = 0;
+let playbackStateRequests = Promise.resolve();
+
+function reportViewerPlaybackState(audioBusy) {
+  if (!state.replayId || !state.replayToken) return;
+  const replayId = state.replayId;
+  const token = state.replayToken;
+  const revision = ++playbackStateRevision;
+  playbackStateRequests = playbackStateRequests
+    .then(async () => {
+      const response = await fetch(`/api/replays/${replayId}/playback-state`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Replay-Token": token },
+        body: JSON.stringify({ audio_busy: audioBusy, revision }),
+      });
+      await responseJson(response);
+    })
+    .catch((error) => {
+      console.error("Could not report the viewer audio queue.", error);
+      if (revision === playbackStateRevision && state.replayId === replayId) {
+        setTimeout(() => reportViewerPlaybackState(audioBusy), 1000);
+      }
+    });
+}
+
+audioQueue.onLineQueueChange = reportViewerPlaybackState;
+
+function pausePlaybackAudio() {
+  audioQueue.pause();
+  crowdBed.pause();
+}
+
+function resumePlaybackAudioInGesture() {
+  audioQueue.resumeInGesture();
+  crowdBed.resumeInGesture().catch((error) => {
+    showMessage(el("ask-message"), `Crowd audio unavailable: ${error.message}`, true);
+  });
+}
+
+function startCrowdInGesture({ starting = false } = {}) {
+  if (!starting && state.replayId && (
+    state.userPaused || state.awayPaused || state.replayComplete || document.visibilityState === "hidden"
+  )) return;
+  crowdBed.startInGesture().catch((error) => {
+    showMessage(el("ask-message"), `Crowd audio unavailable: ${error.message}`, true);
+  });
+}
+
+function setCrowdButton(enabled) {
+  const button = el("crowd-button");
+  button.setAttribute("aria-pressed", String(enabled));
+  button.setAttribute("aria-label", `Crowd sound ${enabled ? "on" : "off"}`);
+  button.title = `Crowd sound ${enabled ? "on" : "off"}`;
+}
 
 function replayButton(onClick) {
   const button = make("button", "text-button replay-audio", "▶ Replay");
@@ -639,7 +1016,10 @@ function renderCommentary(payload) {
       tier: card.dataset.tier,
       expiresAt: Date.now() + LINE_AUDIO_STALE_MS,
     });
+  } else if (payload.audio_pending) {
+    audioQueue.setLinePending(line.line_id, true);
   }
+  audioQueue.notifyLineQueueChange(true);
 }
 
 function updateCommentaryAudio(payload) {
@@ -657,6 +1037,7 @@ function updateCommentaryAudio(payload) {
     tier: card.dataset.tier,
     expiresAt: Number(card.dataset.arrivedAt) + LINE_AUDIO_STALE_MS + pausedSince,
   });
+  audioQueue.notifyLineQueueChange(true);
 }
 
 // Q&A in the feed: a "YOU ASKED" card, then a Thinking… card that the answer replaces.
@@ -770,10 +1151,14 @@ function setRecapAudio(audioId) {
 }
 
 function handleSse(name, payload) {
-  if (name === "event") renderEvent(payload);
+  if (name === "event") {
+    renderEvent(payload);
+    crowdBed.handleEvent(payload);
+  }
   if (name === "commentary") renderCommentary(payload);
   if (name === "commentary_audio") updateCommentaryAudio(payload);
   if (name === "commentary_audio_unavailable") {
+    audioQueue.setLinePending(payload.line_id, false);
     const card = [...document.querySelectorAll(".commentary-card")]
       .find((item) => item.dataset.lineId === payload.line_id);
     const notice = card?.querySelector(".audio-status");
@@ -787,6 +1172,7 @@ function handleSse(name, payload) {
   }
   if (name === "complete") {
     state.replayComplete = true;
+    crowdBed.pause();
     setConnection("Replay complete · audio remains available");
     el("start-button").disabled = false;
     el("start-button").textContent = "Start another match";
@@ -887,6 +1273,7 @@ function resetMatch() {
   el("commentary").replaceChildren(empty);
   el("new-lines").hidden = true;
   audioQueue.clear();
+  crowdBed.resetEventCues();
   el("question-input").value = "";
   autosizeQuestion();
   updateCharacterCount();
@@ -918,6 +1305,7 @@ function showReplayEnded() {
   state.awayPaused = false;
   el("welcome-back")?.remove();
   audioQueue.clear();
+  crowdBed.pause();
   setPauseButton({ enabled: false });
   el("question-input").disabled = true;
   el("mic-button").disabled = true;
@@ -961,7 +1349,7 @@ function resumeFromAway() {
   el("welcome-back")?.remove();
   state.awayPaused = false;
   state.userPaused = false;
-  audioQueue.resumeInGesture();
+  resumePlaybackAudioInGesture();
   controlReplay("resume");
 }
 
@@ -975,7 +1363,7 @@ function pageHidden() {
   const running = !state.replayComplete && !state.userPaused && !state.awayPaused;
   if (running) {
     state.awayPaused = true;
-    audioQueue.pause();
+    pausePlaybackAudio();
     fetch(`/api/replays/${state.replayId}/control`, {
       method: "POST",
       keepalive: true,
@@ -984,7 +1372,7 @@ function pageHidden() {
     }).catch(() => {}); // if it doesn't arrive, the server pauses when the stream drops
     setPauseButton({ paused: true });
     el("live-tag").textContent = "PAUSED";
-  }
+  } else crowdBed.pause();
   // Close the stream ourselves rather than leave a frozen socket; it resumes on return.
   if (state.controller) state.controller.abort();
   state.controller = null;
@@ -1019,6 +1407,7 @@ async function startReplay() {
     }));
     state.replayId = started.replay_id;
     state.replayToken = started.replay_token;
+    playbackStateRevision = 0;
     state.audio = started.audio !== false;
     el("match-picker").disabled = true;
     el("start-button").disabled = true;
@@ -1035,8 +1424,10 @@ async function startReplay() {
     state.stream = { lastEventId: null, retryMs: 1000, connections: 0 };
     state.userPaused = false;
     state.awayPaused = false;
+    audioQueue.notifyLineQueueChange(true);
     openStream();
   } catch (error) {
+    crowdBed.pause();
     if (error.code === "busy") {
       showBusy(error.message);
       return;
@@ -1055,6 +1446,7 @@ function showBusy(message) {
   retry.type = "button";
   retry.addEventListener("click", () => {
     audioQueue.unlock(); // a click, so autoplay stays allowed
+    startCrowdInGesture({ starting: true });
     card.remove();
     startReplay();
   });
@@ -1294,6 +1686,7 @@ function setDrawer(open) {
 el("match-picker").addEventListener("change", updateMatchLabels);
 el("start-button").addEventListener("click", () => {
   audioQueue.unlock(); // in the click itself, before any await, so autoplay is allowed
+  startCrowdInGesture({ starting: true });
   startReplay();
 });
 el("pause-button").addEventListener("click", () => {
@@ -1301,7 +1694,7 @@ el("pause-button").addEventListener("click", () => {
     resumeFromAway(); // the same as the Welcome back tap: audio, then the match
   } else {
     state.userPaused = true;
-    audioQueue.pause();
+    pausePlaybackAudio();
     controlReplay("pause");
   }
 });
@@ -1360,7 +1753,16 @@ el("mute-button").setAttribute("aria-pressed", String(audioQueue.muted));
 el("mute-button").addEventListener("click", () => {
   const muted = !audioQueue.muted;
   audioQueue.setMuted(muted);
+  crowdBed.setMuted(muted);
+  if (!muted) startCrowdInGesture();
   el("mute-button").setAttribute("aria-pressed", String(muted));
+});
+setCrowdButton(crowdBed.enabled);
+el("crowd-button").addEventListener("click", () => {
+  const enabled = !crowdBed.enabled;
+  crowdBed.setEnabled(enabled);
+  setCrowdButton(enabled);
+  if (enabled) startCrowdInGesture();
 });
 el("close-evidence").addEventListener("click", () => el("evidence-dialog").close());
 el("evidence-dialog").addEventListener("click", (event) => {

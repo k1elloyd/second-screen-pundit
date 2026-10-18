@@ -435,6 +435,8 @@ There are no penalty events in the data, so penalties have no tier yet.
 
 - **Server.** The dispatcher's `on_line_ready` hook starts TTS as soon as a line passes its checks, while it waits out the broadcast delay. If the audio is ready at release, the `commentary` event carries `audio_id`; otherwise the text goes at once and `commentary_audio` follows.
 - **Browser.** One `Audio` element, unlocked with a silent clip inside the Start click. Lines play in order with no per-line player. At most one line waits behind the one playing, and a line's audio is dropped if it hasn't started 12 s after its text arrived. Answers, the recap and "▶ Replay" go to the front without cutting off the current line. Mute clears the queue and is kept in `localStorage`. Pause and Resume also pause and resume the queue. If the unlock failed, an "Enable audio" button appears.
+- The browser reports whether speech is playing or queued through the replay-token-protected `/playback-state` endpoint. Playback-state revisions make late requests harmless.
+- **Crowd bed.** Four low-mid, band-limited and independently modulated noise layers generate the browser-only ambience at about half the previous base level; no asset or server call is used. Start unlocks it, its on/off setting is kept in `localStorage`, and it follows Mute. Commentary pre-ducks it by 12 dB starting 300 ms before playback, holding until 400 ms after; goals swell it for about three seconds (more from 75'), and big chances and red cards give a smaller lift, all hidden under speech. Pause and page hide suspend it; the Welcome back tap resumes the context inside the gesture. Short, moderate-volume Web Audio whistles mark each half's kick-off, half-time (two short blasts), and full time (two short, one long); Mute and Crowd-off silence them.
 
 ## Phase 3 Session B, group 2: trust and accuracy
 
@@ -913,3 +915,9 @@ Left as they are: waits that check something *doesn't* happen (load only makes t
 | Full suite twice in a row | See the session report |
 
 Screenshots: `docs/screenshots/mobile/` (1×). iPhone checks of groups 1 and 2 (layout, 1-minute lock, app switch, airplane-mode blip) passed on the deployed app.
+
+### Group 4: deterministic colour lines
+
+The replay may release a colour line after 12 real seconds with no speech playing or queued, and at least 40 real seconds after its previous colour line. The viewer reports queue changes to the server. Colour lines are spread by match clock: none before 10', no more than one in any rolling 15-minute span, and none after 85'. The replay pauses its colour worker while paused or disconnected. A queued candidate is invalidated when a real event arrives; a must-say event still inside its broadcast delay also blocks publication.
+
+Possession, shots on target, turnovers with the existing “usual rate” description, and formation matchups each have up to three deterministic template versions. Versions and their underlying statistic windows or signatures are each used at most once, leaving valid second-half templates available. Every candidate passes the existing wording, team-name, banned-phrase, evidence, and plain-spoken checks, then uses the routine audio tier and `source="colour"`. Missing or unsupported facts simply make that version unavailable.

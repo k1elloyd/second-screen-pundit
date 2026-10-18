@@ -40,7 +40,7 @@ class CommentaryLine(AgentOutput):
     text: str = Field(max_length=200)
     insight_id: str
     tone: Tone
-    source: Literal["agent", "fallback"] = "agent"
+    source: Literal["agent", "fallback", "colour"] = "agent"
     delivery_tier: DeliveryTier = "tactical"
 
 

@@ -25,26 +25,48 @@ class Replay:
         self._running = asyncio.Event()
         self._running.set()
         self._task: asyncio.Task[None] | None = None
+        self._active_elapsed_seconds = 0.0
+        self._active_started_at: float | None = None
 
     def start(self) -> None:
         if self._task is not None:
             raise RuntimeError("Replay has already been started")
         self.state = "running"
+        self._active_started_at = time.monotonic()
         self._task = asyncio.create_task(self._publish())
 
     def pause(self) -> None:
         if self.state == "running":
+            self._freeze_active_clock()
             self.state = "paused"
             self._running.clear()
 
     def resume(self) -> None:
         if self.state == "paused":
             self.state = "running"
+            self._active_started_at = time.monotonic()
             self._running.set()
+
+    @property
+    def active_elapsed_seconds(self) -> float:
+        if self._active_started_at is None:
+            return self._active_elapsed_seconds
+        return self._active_elapsed_seconds + time.monotonic() - self._active_started_at
+
+    def _freeze_active_clock(self) -> None:
+        if self._active_started_at is not None:
+            self._active_elapsed_seconds += time.monotonic() - self._active_started_at
+            self._active_started_at = None
+
+    async def wait_match_seconds(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError("seconds must not be negative")
+        await self._wait_interval(seconds / self.speed)
 
     async def stop(self) -> None:
         if self.state in {"finished", "stopped"}:
             return
+        self._freeze_active_clock()
         self.state = "stopped"
         self._running.set()
         if self._task is not None:
@@ -110,8 +132,10 @@ class Replay:
                 for subscriber in tuple(self._subscribers):
                     await subscriber.put(event)
                 previous_clock = self._clock(event)
+            self._freeze_active_clock()
             self.state = "finished"
         except asyncio.CancelledError:
+            self._freeze_active_clock()
             self.state = "stopped"
             raise
         finally:

@@ -21,10 +21,18 @@ _HARNESS = r"""
 let now = 0;
 Date.now = () => now;
 const played = [];
+const timers = new Map();
+let nextTimer = 1;
+globalThis.setTimeout = (callback, delay) => {
+  const id = nextTimer++;
+  timers.set(id, { callback, at: now + delay });
+  return id;
+};
+globalThis.clearTimeout = (id) => timers.delete(id);
 class FakeAudio {
-  constructor() { this.handlers = {}; this.src = ""; }
+  constructor() { this.handlers = {}; this.src = ""; this.playCount = 0; }
   addEventListener(name, handler) { this.handlers[name] = handler; }
-  play() { played.push(this.src); return Promise.resolve(); }
+  play() { this.playCount += 1; played.push(this.src); return Promise.resolve(); }
   pause() {}
 }
 globalThis.Audio = FakeAudio;
@@ -38,15 +46,29 @@ const LINE_AUDIO_STALE_MS = 12000;
 __QUEUE__
 const scenario = JSON.parse(process.argv[process.argv.length - 1]);
 const queue = new AudioQueue();
+const queueChanges = [];
+queue.onLineQueueChange = (busy) => queueChanges.push({ at: now, busy });
+if (scenario.pending_line) {
+  queue.setLinePending("pending-line", true);
+  queue.enqueue({ id: "pending-audio", kind: "line", lineId: "pending-line",
+                  tier: "routine", expiresAt: LINE_AUDIO_STALE_MS });
+}
 const arrivals = scenario.lines.map((line, index) => ({ ...line, at: index * scenario.gap_ms }));
 let endsAt = null;
 let playingCount = 0;
-while (arrivals.length || endsAt !== null) {
+while (arrivals.length || endsAt !== null || timers.size) {
   const nextArrival = arrivals.length ? arrivals[0].at : Infinity;
-  if (endsAt !== null && endsAt <= nextArrival) {
+  const nextTimer = [...timers.entries()]
+    .sort((left, right) => left[1].at - right[1].at)[0] || null;
+  const nextTimerAt = nextTimer ? nextTimer[1].at : Infinity;
+  if (endsAt !== null && endsAt <= nextArrival && endsAt <= nextTimerAt) {
     now = endsAt;
     endsAt = null;
     queue.el.handlers.ended();
+  } else if (nextTimer && nextTimerAt <= nextArrival) {
+    now = nextTimerAt;
+    timers.delete(nextTimer[0]);
+    nextTimer[1].callback();
   } else {
     now = nextArrival;
     const line = arrivals.shift();
@@ -58,7 +80,7 @@ while (arrivals.length || endsAt !== null) {
     endsAt = now + scenario.clip_ms;
   }
 }
-console.log(JSON.stringify(played));
+console.log(JSON.stringify(scenario.report_queue ? { played, queueChanges } : played));
 """
 
 
@@ -74,6 +96,25 @@ def _play(lines: list[tuple[str, str]], *, gap_ms: int = 1000, clip_ms: int = 15
         "lines": [{"id": line_id, "tier": tier} for line_id, tier in lines],
         "gap_ms": gap_ms,
         "clip_ms": clip_ms,
+    }
+    script = _HARNESS.replace("__QUEUE__", _queue_source())
+    output = subprocess.run(
+        [NODE, "-e", script, json.dumps(scenario)],  # type: ignore[list-item]
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert output.returncode == 0, output.stderr[-2000:]
+    return json.loads(output.stdout)
+
+
+def _queue_state_observations() -> dict[str, object]:
+    scenario = {
+        "lines": [],
+        "gap_ms": 1000,
+        "clip_ms": 1000,
+        "pending_line": True,
+        "report_queue": True,
     }
     script = _HARNESS.replace("__QUEUE__", _queue_source())
     output = subprocess.run(
@@ -105,7 +146,7 @@ def test_two_priority_clips_in_a_burst_both_play_in_order() -> None:
 
 def test_routine_clips_are_dropped_oldest_first() -> None:
     played = _play([(f"l{index}", "tactical") for index in range(5)], clip_ms=4500)
-    # l0 plays at once; l1-l4 arrive while it plays and only the newest waiting one is kept.
+    # l0 starts after its pre-duck lead; l1-l4 arrive while it plays and only l4 waits.
     assert played[0] == "l0"
     assert "l4" in played
     assert "l1" not in played and "l2" not in played
@@ -115,3 +156,11 @@ def test_a_stale_routine_clip_is_skipped_but_a_late_goal_is_not() -> None:
     # Each clip is 15 s, so anything waiting behind one clip is past the 12 s limit.
     assert _play([("l0", "tactical"), ("l1", "tactical")]) == ["l0"]
     assert _play([("l0", "tactical"), ("goal", "goal")]) == ["l0", "goal"]
+
+
+def test_audio_queue_reports_pending_and_playing_lines_until_idle() -> None:
+    observation = _queue_state_observations()
+    assert observation["played"] == ["pending-audio"]
+    states = observation["queueChanges"]
+    assert states[0]["busy"] is True
+    assert states[-1]["busy"] is False
