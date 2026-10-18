@@ -10,48 +10,69 @@
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <div class="app-shell" id="app-shell">
+  <div class="app-shell" id="app-shell" data-phase="idle">
     <header class="topbar">
       <a class="brand" href="/" aria-label="Second Screen Pundit home">
         <span class="brand-mark">SS</span>
         <span class="brand-name">SECOND SCREEN <b>PUNDIT</b></span>
       </a>
       <section class="scoreboard" aria-label="Scoreboard">
-        <span class="team-name team-home" id="home-name">Home</span>
+        <span class="team-name team-home"><span class="name-full" id="home-name">Home</span><span class="name-short" id="home-short" aria-hidden="true">Home</span></span>
         <div class="score-center">
           <div class="scoreline"><span id="home-score">0</span><i>–</i><span id="away-score">0</span></div>
-          <div class="match-clock"><span class="live-light" id="live-light"></span><span id="clock">PRE-MATCH</span></div>
+          <div class="match-clock">
+            <!-- The connection dot: grey before a match, green connected, gold reconnecting, red lost. -->
+            <span class="live-light" id="live-light" role="img" aria-label="Not connected" title="Not connected"></span>
+            <span id="clock">PRE-MATCH</span>
+          </div>
         </div>
-        <span class="team-name team-away" id="away-name">Away</span>
+        <span class="team-name team-away"><span class="name-full" id="away-name">Away</span><span class="name-short" id="away-short" aria-hidden="true">Away</span></span>
       </section>
       <div class="warm-status" id="warm-status" role="status" aria-live="polite">
         <span class="status-dot"></span><span>Warming up the pundit…</span>
       </div>
     </header>
 
+    <!-- Two groups. On the desktop layout both show in one row. Under 1024px the setup group
+         shows before Start (and after full time), the run group while a match is running. -->
     <section class="control-bar" aria-label="Match controls">
-      <label class="sr-only" for="match-picker">Choose a fixture</label>
-      <select id="match-picker" class="match-picker" disabled></select>
-      <label class="sr-only" for="speed-picker">Replay speed</label>
-      <select id="speed-picker" class="speed-picker" title="Replay speed">
-        <option value="1">1×</option>
-        <option value="5">5×</option>
-        <option value="10">10×</option>
-        <option value="20" selected>20×</option>
-        <option value="60">60×</option>
-      </select>
-      <button class="button button-primary" id="start-button" disabled>Start replay</button>
-      <button class="button button-quiet" id="pause-button" disabled>Pause</button>
-      <button class="button button-quiet" id="resume-button" disabled>Resume</button>
-      <span class="live-tag" id="live-tag">STANDBY</span>
-      <div class="control-spacer"></div>
-      <button class="text-button" id="enable-audio" type="button" hidden>Enable audio</button>
-      <label class="toggle"><input id="mute-audio" type="checkbox"> Mute</label>
-      <label class="toggle toggle-soon" title="Crowd sound is coming soon">
-        <input id="crowd-audio" type="checkbox" disabled> Crowd <span class="soon">soon</span>
-      </label>
-      <button class="button button-quiet info-toggle" id="info-toggle" type="button"
-        aria-expanded="false" aria-controls="match-info">Match info</button>
+      <div class="control-group setup-controls">
+        <label class="sr-only" for="match-picker">Choose a fixture</label>
+        <select id="match-picker" class="match-picker" disabled></select>
+        <label class="sr-only" for="speed-picker">Replay speed</label>
+        <select id="speed-picker" class="speed-picker" title="Replay speed">
+          <option value="1">1×</option>
+          <option value="5">5×</option>
+          <option value="10">10×</option>
+          <option value="20" selected>20×</option>
+          <option value="60">60×</option>
+        </select>
+        <button class="button button-primary" id="start-button" disabled>Start replay</button>
+      </div>
+      <div class="control-group run-controls">
+        <!-- One toggle: data-paused switches the icon and the label between Pause and Resume. -->
+        <button class="button button-quiet icon-button-labelled" id="pause-button" type="button" disabled data-paused="false">
+          <svg class="icon icon-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+          <svg class="icon icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/></svg>
+          <span class="button-label" id="pause-label">Pause</span>
+        </button>
+        <span class="live-tag" id="live-tag">STANDBY</span>
+        <div class="control-spacer"></div>
+        <button class="text-button" id="enable-audio" type="button" hidden>Enable audio</button>
+        <button class="button button-quiet icon-button-labelled" id="mute-button" type="button" aria-pressed="false">
+          <svg class="icon icon-sound" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path class="icon-stroke" d="M15.5 9a4.2 4.2 0 0 1 0 6M18 6.5a7.8 7.8 0 0 1 0 11"/></svg>
+          <svg class="icon icon-muted" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path class="icon-stroke" d="M15.5 9.5l5 5M20.5 9.5l-5 5"/></svg>
+          <span class="button-label">Mute</span>
+        </button>
+        <label class="toggle toggle-soon" title="Crowd sound is coming soon">
+          <input id="crowd-audio" type="checkbox" disabled> Crowd <span class="soon">soon</span>
+        </label>
+        <button class="button button-quiet icon-button-labelled info-toggle" id="info-toggle" type="button"
+          aria-expanded="false" aria-controls="match-info">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle class="icon-stroke" cx="12" cy="12" r="8.5"/><rect x="11" y="10.5" width="2" height="6.5" rx="1"/><circle cx="12" cy="7.8" r="1.2"/></svg>
+          <span class="button-label">Match info</span>
+        </button>
+      </div>
     </section>
 
     <main class="workspace">
@@ -88,6 +109,7 @@
             <thead><tr><th scope="col" id="stats-home">Home</th><th scope="col"></th><th scope="col" id="stats-away">Away</th></tr></thead>
             <tbody>
               <tr><td id="formation-home">–</td><th scope="row">Formation</th><td id="formation-away">–</td></tr>
+              <tr><td id="possession-home">–</td><th scope="row">Possession</th><td id="possession-away">–</td></tr>
               <tr><td id="shots-home">0</td><th scope="row">Shots</th><td id="shots-away">0</td></tr>
               <tr><td id="target-home">0</td><th scope="row">On target</th><td id="target-away">0</td></tr>
               <tr><td id="fouls-home">0</td><th scope="row">Fouls</th><td id="fouls-away">0</td></tr>
@@ -102,6 +124,11 @@
             <li class="empty-state">Goals, cards, substitutions and changes of shape appear here.</li>
           </ol>
         </section>
+
+        <footer class="info-footer">
+          <span class="connection-detail" id="connection-detail">Waiting for a fixture</span>
+          <span>All fixtures and players are fictional.</span>
+        </footer>
       </aside>
 
       <section class="feed-column" aria-label="Commentary and questions">
@@ -116,18 +143,22 @@
             <label class="sr-only" for="question-input">Ask a question about the match</label>
             <textarea id="question-input" maxlength="300" rows="1"
               placeholder="Ask the pundit about this match…" disabled></textarea>
-            <button class="button button-quiet mic-button" id="mic-button" type="button" disabled aria-pressed="false" title="Push to talk">
-              <span aria-hidden="true">●</span> <span id="mic-label">Talk</span>
+            <button class="button button-quiet mic-button icon-button-labelled" id="mic-button" type="button" disabled aria-pressed="false" title="Push to talk">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path class="icon-stroke" d="M6 11.5a6 6 0 0 0 12 0M12 17.5V21"/></svg>
+              <span class="button-label" id="mic-label">Talk</span>
             </button>
-            <button class="button button-primary" id="ask-button" type="submit" disabled>Ask</button>
+            <button class="button button-primary send-button icon-button-labelled" id="ask-button" type="submit" disabled>
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 11.2 18.8 4.6a.6.6 0 0 1 .8.8L13 19.6a.6.6 0 0 1-1.1-.1l-1.6-5.3-5.3-1.7a.6.6 0 0 1-.5-1.3z"/></svg>
+              <span class="button-label">Ask</span>
+            </button>
           </div>
           <div class="ask-meta">
             <p class="inline-message" id="ask-message" role="status" aria-live="polite"></p>
             <span class="character-count" id="character-count">0 / 300</span>
             <span class="limit-note">6 questions / minute</span>
           </div>
+          <!-- Desktop only; under 1024px the connection shows as the scoreboard's dot and in Match info. -->
           <div class="ask-footer">
-            <span>All fixtures and players are fictional.</span>
             <span id="connection-state">Waiting for a fixture</span>
           </div>
         </form>

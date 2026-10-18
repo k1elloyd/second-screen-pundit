@@ -32,13 +32,42 @@ const state = {
 
 function freshStats() {
   const side = () => ({ shots: 0, target: 0, fouls: 0, cards: 0, formation: "–" });
-  return { home: side(), away: side() };
+  // Whole-number shares from the server's possession_pair, so the two always add up to 100.
+  return { home: side(), away: side(), possession: null };
 }
 state.stats = freshStats();
 
 function showMessage(target, text, isError = false) {
   target.textContent = text || "";
   target.classList.toggle("error", isError);
+}
+
+// "idle" before a match, "running" while one plays, "done" after full time. Under 1024px it
+// picks which controls show and how much the header carries.
+function setPhase(phase) {
+  el("app-shell").dataset.phase = phase;
+}
+
+// One connection state for the scoreboard's dot, the desktop footer and the Match info panel.
+// kind: "idle" (grey), "connected" (green), "reconnecting" (gold) or "lost" (red).
+function setConnection(text, kind = "connected") {
+  el("connection-state").textContent = text;
+  el("connection-detail").textContent = text;
+  const dot = el("live-light");
+  dot.classList.toggle("connected", kind === "connected");
+  dot.classList.toggle("reconnecting", kind === "reconnecting");
+  dot.classList.toggle("lost", kind === "lost");
+  dot.setAttribute("aria-label", text);
+  dot.title = text;
+}
+
+// Pause and Resume are one button; data-paused picks its icon and label.
+function setPauseButton({ paused = false, enabled = true } = {}) {
+  const button = el("pause-button");
+  button.disabled = !enabled;
+  button.dataset.paused = String(paused);
+  el("pause-label").textContent = paused ? "Resume" : "Pause";
+  button.title = paused ? "Resume" : "Pause";
 }
 
 async function responseJson(response) {
@@ -73,6 +102,8 @@ async function loadMatches() {
     option.textContent = match.label;
     option.dataset.home = match.home;
     option.dataset.away = match.away;
+    option.dataset.homeShort = match.home_short || match.home;
+    option.dataset.awayShort = match.away_short || match.away;
     option.dataset.stadium = match.stadium;
     picker.append(option);
   }
@@ -86,6 +117,9 @@ function updateMatchLabels() {
   const away = selected.dataset.away || "Away";
   for (const id of ["home-name", "stats-home", "legend-home"]) el(id).textContent = home;
   for (const id of ["away-name", "stats-away", "legend-away"]) el(id).textContent = away;
+  // The phone header shows the short forms (engine/teams.py), the same ones the lines use.
+  el("home-short").textContent = selected.dataset.homeShort || home;
+  el("away-short").textContent = selected.dataset.awayShort || away;
   el("stadium").textContent = selected.dataset.stadium || "";
 }
 
@@ -192,10 +226,13 @@ function renderStats() {
     el(`target-${side}`).textContent = String(stats.target);
     el(`fouls-${side}`).textContent = String(stats.fouls);
     el(`cards-${side}`).textContent = String(stats.cards);
+    const possession = state.stats.possession;
+    el(`possession-${side}`).textContent = possession ? `${possession[side]}%` : "–";
   }
 }
 
 function countEvent(event) {
+  if (event.possession) state.stats.possession = event.possession;
   const stats = event.team ? state.stats[event.team] : null;
   if (!stats) return;
   if (event.type === "shot") {
@@ -264,7 +301,6 @@ function renderEvent(event) {
   el("away-score").textContent = String(state.score.away);
   el("clock").textContent = event.type === "full_time" ? "FULL TIME" :
     event.type === "half_time" ? "HALF-TIME" : `${event.clock}'`;
-  el("live-light").classList.add("active");
   if (event.type === "full_time") el("live-tag").textContent = "FULL TIME";
   else if (event.type !== "half_time") {
     el("live-tag").textContent = "ON AIR";
@@ -275,9 +311,7 @@ function renderEvent(event) {
   renderStats();
   addKeyMoment(event);
   renderPitch(event);
-  if (event.type === "full_time") {
-    el("connection-state").textContent = "Full time · recap pending";
-  }
+  if (event.type === "full_time") setConnection("Full time · recap pending");
 }
 
 // The feed: commentary, questions, answers and the recap, newest at the bottom.
@@ -684,7 +718,7 @@ function renderRecap(payload) {
   if (payload.audio_id) setRecapAudio(payload.audio_id);
   else if (payload.audio_pending) actions.append(make("span", "line-clock audio-status", "Preparing audio…"));
   else actions.append(make("span", "line-clock audio-status", "Audio unavailable · text recap shown"));
-  el("connection-state").textContent = "Full time · recap ready";
+  setConnection("Full time · recap ready");
 }
 
 function setRecapAudio(audioId) {
@@ -717,12 +751,12 @@ function handleSse(name, payload) {
   }
   if (name === "complete") {
     state.replayComplete = true;
-    el("connection-state").textContent = "Replay complete · audio remains available";
+    setConnection("Replay complete · audio remains available");
     el("start-button").disabled = false;
     el("start-button").textContent = "Start another match";
     el("match-picker").disabled = false;
-    el("pause-button").disabled = true;
-    el("resume-button").disabled = true;
+    setPauseButton({ enabled: false });
+    setPhase("done");
   }
   if (name === "error") showMessage(el("ask-message"), payload.message, true);
   if (name.startsWith("answer")) handleAnswerEvent(name, payload);
@@ -739,7 +773,7 @@ async function readStream(url, controller, stream) {
     error.status = response.status;
     throw error;
   }
-  if (el("connection-state").textContent === "Reconnecting…") el("connection-state").textContent = "Reconnected";
+  if (el("connection-state").textContent === "Reconnecting…") setConnection("Reconnected");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -781,7 +815,7 @@ async function consumeStream(url, controller) {
       // 404: the replay has gone (stopped, or not reconnected in time). 400/409: don't retry.
       if (error.status && error.status < 500) throw error;
       failures += 1;
-      el("connection-state").textContent = "Reconnecting…";
+      setConnection("Reconnecting…", "reconnecting");
     }
     if (controller.signal.aborted) return;
     await new Promise((resolve) => setTimeout(resolve, stream.retryMs * Math.min(failures + 1, 5)));
@@ -837,21 +871,21 @@ async function startReplay() {
     el("match-picker").disabled = true;
     el("start-button").disabled = true;
     el("start-button").textContent = "Replay running";
-    el("pause-button").disabled = false;
-    el("resume-button").disabled = true;
+    setPauseButton({ paused: false });
+    setPhase("running");
     el("question-input").disabled = false;
     el("mic-button").disabled = !state.audio;
     el("ask-button").disabled = false;
-    el("connection-state").textContent = started.mode === "cached"
+    setConnection(started.mode === "cached"
       ? `Connected · ${speed}× replay · pre-written commentary`
-      : `Connected · ${speed}× replay`;
+      : `Connected · ${speed}× replay`);
     if (started.notice) placeInFeed(errorCard(started.notice));
     const controller = new AbortController();
     state.controller = controller;
     consumeStream(`/api/replays/${started.replay_id}/stream`, controller).catch((error) => {
       if (error.name !== "AbortError") {
         showMessage(el("ask-message"), error.message, true);
-        el("connection-state").textContent = "Stream disconnected";
+        setConnection("Stream disconnected", "lost");
       }
     });
   } catch (error) {
@@ -878,9 +912,10 @@ function showBusy(message) {
   });
   card.append(retry);
   placeInFeed(card, { forceScroll: true });
-  el("connection-state").textContent = "The pundit is busy";
+  setConnection("The pundit is busy", "idle");
   el("start-button").disabled = false;
   el("match-picker").disabled = false;
+  setPhase("idle");
 }
 
 async function controlReplay(action) {
@@ -892,17 +927,15 @@ async function controlReplay(action) {
       body: JSON.stringify({ action }),
     }));
     if (body.state === "finished" || body.state === "stopped") {
-      el("pause-button").disabled = true;
-      el("resume-button").disabled = true;
-      el("connection-state").textContent = body.state === "finished"
+      setPauseButton({ enabled: false });
+      setConnection(body.state === "finished"
         ? "Replay finished · waiting for final updates"
-        : "Replay stopped";
+        : "Replay stopped");
       return;
     }
-    el("pause-button").disabled = body.state !== "running";
-    el("resume-button").disabled = body.state !== "paused";
+    setPauseButton({ paused: body.state === "paused" });
     el("live-tag").textContent = body.state === "paused" ? "PAUSED" : "ON AIR";
-    el("connection-state").textContent = body.state === "paused" ? "Replay paused" : "Replay resumed";
+    setConnection(body.state === "paused" ? "Replay paused" : "Replay resumed");
   } catch (error) {
     showMessage(el("ask-message"), error.message, true);
   }
@@ -1114,12 +1147,13 @@ el("start-button").addEventListener("click", () => {
   startReplay();
 });
 el("pause-button").addEventListener("click", () => {
-  audioQueue.pause();
-  controlReplay("pause");
-});
-el("resume-button").addEventListener("click", () => {
-  audioQueue.resume();
-  controlReplay("resume");
+  if (el("pause-button").dataset.paused === "true") {
+    audioQueue.resume();
+    controlReplay("resume");
+  } else {
+    audioQueue.pause();
+    controlReplay("pause");
+  }
 });
 el("enable-audio").addEventListener("click", () => {
   audioQueue.unlock().then(() => audioQueue.next());
@@ -1158,15 +1192,19 @@ const desktopLayout = matchMedia("(min-width: 1024px)");
 function setQuestionPlaceholder() {
   el("question-input").placeholder = desktopLayout.matches
     ? "Ask the pundit about this match…  (press / )"
-    : "Ask the pundit about this match…";
+    : "Ask about this match…"; // short enough for one line on a narrow phone
 }
 desktopLayout.addEventListener("change", setQuestionPlaceholder);
 setQuestionPlaceholder();
 el("new-lines").addEventListener("click", scrollFeedToBottom);
 el("info-toggle").addEventListener("click", () => setDrawer(!el("match-info").classList.contains("open")));
 el("mic-button").addEventListener("click", toggleRecording);
-el("mute-audio").checked = audioQueue.muted;
-el("mute-audio").addEventListener("change", () => audioQueue.setMuted(el("mute-audio").checked));
+el("mute-button").setAttribute("aria-pressed", String(audioQueue.muted));
+el("mute-button").addEventListener("click", () => {
+  const muted = !audioQueue.muted;
+  audioQueue.setMuted(muted);
+  el("mute-button").setAttribute("aria-pressed", String(muted));
+});
 el("close-evidence").addEventListener("click", () => el("evidence-dialog").close());
 el("evidence-dialog").addEventListener("click", (event) => {
   if (event.target === el("evidence-dialog")) el("evidence-dialog").close();

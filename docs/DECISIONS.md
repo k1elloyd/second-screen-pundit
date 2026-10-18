@@ -823,3 +823,34 @@ Live, 20x: m01 11 of 13 lines from the model (target 9), m02 8 of 11 (target 8).
 Live, 20x: m01 10 of 13 lines from the model, m02 8 of 11; both m02 goal lines are model lines now. No raw average was spoken; the m02 red-card line gave the consequence. The scorer-phrase check sent one m01 line (81', the equaliser) to its fallback.
 
 This ends the commentary changes for the polish session.
+
+## Mobile session, 18 Oct 2026
+
+### Group 1: phone layout (under 1024px)
+
+**The overflow.** `.app-shell` is a grid with no `grid-template-columns`, so its one column was the implicit `auto` track, which grows to its widest child's min-content width. A `nowrap` row (the footer's "All fixtures and players are fictional." beside the connection text, the ask row's Talk and Ask, the control buttons) set that width. At 390px with 130% text the shell was 431px wide. `html, body { overflow: hidden }` hid this from `scrollWidth` (390) in Chromium; iOS Safari doesn't clip it the same way, which is why the Resume button, card text, the send button and the footer were cut off on the right. Fixes:
+- `.app-shell { grid-template-columns: minmax(0, 1fr) }`: no child can widen the page.
+- `body { min-width: 320px }` removed: Safari's 130% page zoom on a 360px phone is a 277px CSS viewport.
+- `min-width: 0` on the control bar's and the ask row's flex children; card tops and card actions wrap; `.feed-card { overflow-wrap: anywhere }` breaks long words.
+
+**Header.** Under 1024px it is one row: short team names (from `engine/teams.py`, now on `/api/matches` as `home_short` / `away_short`), the score, the clock and a connection dot. The brand badge is hidden. The live light is now the connection dot: grey before a match (hidden on phones until there is a connection; the warm-up dot covers that time), green when connected, pulsing gold while reconnecting, red when lost. Its label and title carry the connection text.
+
+**Controls.** Two groups: setup (picker, speed, Start) and run (Pause/Resume, Mute, Crowd, Match info). On the desktop layout they are one row, as before. Under 1024px the page's `data-phase` picks what shows: `idle` shows picker and speed on one row, then Start and Match info; `running` shows only the icon row (labels kept for screen readers); `done` (after full time) shows both, so "Start another match" sits beside Mute and Match info. Crowd is hidden on phones until it's built.
+
+**Pause/Resume is one toggle on every screen size** (`#pause-button`, `data-paused` switches icon and label). Mute is a button with `aria-pressed` instead of a checkbox, on every size.
+
+**Ask bar.** The box shrinks (`min-width: 0`); Talk and Ask are icons on phones, with text labels kept for screen readers and shown on the desktop; the buttons don't shrink, so the send button is always whole. An empty box is one line with an ellipsis, and the phone placeholder is "Ask about this match…".
+
+**Footer.** "All fixtures and players are fictional." moved to the foot of Match info (the left column on the desktop, the drawer on phones), with the connection text beside it on phones. The footer row under the ask bar is dropped on phones; on the desktop it keeps only the connection text.
+
+**Possession.** The stats panel (and so the drawer) has a Possession row. The server adds `possession` to every released event: each side's share of successful passes among released events (the analytics' measure), as whole numbers from `possession_pair`, so the two always add up to 100. It is `null` before the first successful pass, shown as "–".
+
+**Checked** in Playwright Chromium (mobile emulation, 3x) against the cached-mode server, before Start and while running with a long unbreakable word added to a card and a long question typed. 130% text was checked two ways: every stylesheet font size times 1.3 (Android's text scaling) and 130% page zoom (Safari's aA control, which narrows the CSS viewport to width / 1.3). `scrollWidth` was also read with the overflow clip lifted from `html`, `body` and the shell, so hidden overflow couldn't pass.
+
+| Width | Text | `scrollWidth` (clip lifted) vs `innerWidth` | Header + controls, before Start / running |
+| :-- | :-- | :-- | :-- |
+| 360, 375, 390, 430 | 100% | equal at every width | 129 / 89 px |
+| 360, 375, 390, 430 | fonts 130% | equal at every width | 136 / 96 px |
+| 360, 375, 390, 430 | page zoom 130% (277–331px) | equal at every width | 129 / 89 px |
+
+At 390×844 that is 15.3% before Start and 10.6% running (limit 20%). No element's right edge passed the screen in any case. 1366×768 and 1920×1080 keep the two-column layout with no overflow.

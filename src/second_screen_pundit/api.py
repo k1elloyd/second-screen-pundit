@@ -28,12 +28,13 @@ from second_screen_pundit.agents.dispatcher import LiveDispatcher, WindowOutcome
 from second_screen_pundit.agents.evidence import EvidenceReport
 from second_screen_pundit.agents.models import DeliveryTier, Explanation
 from second_screen_pundit.agents.pipeline import PunditPipeline, QuestionResult
+from second_screen_pundit.agents.tools.analytics import possession_pair
 from second_screen_pundit.agents.speech import SpeechRecognizer, SpeechSynthesizer
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.generate import generate_match, get_match_info
 from second_screen_pundit.engine.replay import Replay, ReplayManager
 from second_screen_pundit.engine.schema import Event, MatchInfo
-from second_screen_pundit.engine.teams import team_name
+from second_screen_pundit.engine.teams import short_name, team_name
 from second_screen_pundit.observability import record_result, tracer, turn_span
 from second_screen_pundit.outbox import ViewerOutbox
 from second_screen_pundit.spending import CACHED_NOTICE, SpendingGuard
@@ -79,6 +80,8 @@ class ReplaySession:
     release_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     released_events: list[Event] = field(default_factory=list)
     viewer_released_as_of: int = 0
+    # Successful passes per side among released events: the match possession the page shows.
+    released_passes: dict[str, int] = field(default_factory=lambda: {"home": 0, "away": 0})
     lines: dict[str, dict[str, Any]] = field(default_factory=dict)
     audio: dict[str, bytes] = field(default_factory=dict)
     stream_open: bool = False
@@ -162,6 +165,21 @@ def _event_payload(event: Event, info: MatchInfo) -> dict[str, Any]:
         "player_name": player_name,
         "clock": event.minute + event.added_minute,
     }
+
+
+def _released_possession(session: ReplaySession, event: Event) -> dict[str, int] | None:
+    """Match possession as of this event, whole numbers from possession_pair (they sum to 100).
+
+    The same measure as the analytics: each side's share of successful passes. None before the
+    first successful pass.
+    """
+    if event.type == "pass" and event.outcome == "success" and event.team is not None:
+        session.released_passes[event.team] += 1
+    total = sum(session.released_passes.values())
+    if not total:
+        return None
+    pair = possession_pair(session.released_passes["home"] / total * 100)
+    return {side: whole for side, (_, whole) in pair.items()}
 
 
 def _safe_explanation(explanation: Explanation, info: MatchInfo) -> tuple[Explanation, str | None]:
@@ -592,7 +610,9 @@ def create_app(
             async with session.release_condition:
                 session.viewer_released_as_of = session.delay.released_as_of
                 session.released_events.append(event)
-                await session.outbox.put(("event", _event_payload(event, session.info)))
+                payload = _event_payload(event, session.info)
+                payload["possession"] = _released_possession(session, event)
+                await session.outbox.put(("event", payload))
                 session.release_condition.notify_all()
             if event.type == "full_time":
                 session.recap_task = asyncio.create_task(make_recap(session, event.seq))
@@ -729,6 +749,8 @@ def create_app(
                     "label": f"{info.home.name} v {info.away.name}",
                     "home": info.home.name,
                     "away": info.away.name,
+                    "home_short": short_name(info.home.name),
+                    "away_short": short_name(info.away.name),
                     "stadium": info.stadium,
                 }
             )
@@ -884,7 +906,7 @@ def create_app(
             span.set_attribute("app.question.characters", len(question))
             async def checking() -> None:
                 # The first answer failed the evidence check; the page shows
-                # "Checking the facts…" until the second attempt's answer arrives.
+                # "Checking the factsâ€¦" until the second attempt's answer arrives.
                 await session.outbox.put(("answer_checking", {"question_id": question_id}))
 
             result = await pipeline.answer_question(

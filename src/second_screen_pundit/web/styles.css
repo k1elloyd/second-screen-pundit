@@ -23,7 +23,6 @@
 html, body { height: 100%; overflow: hidden; }
 body {
   margin: 0;
-  min-width: 320px;
   background:
     radial-gradient(ellipse at 72% 0%, rgba(45, 91, 75, .23), transparent 38rem),
     var(--night);
@@ -38,6 +37,9 @@ button:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opaci
   /* app.js sets --app-height from visualViewport, so the shell ends above the keyboard. */
   height: var(--app-height, 100dvh);
   display: grid;
+  /* minmax(0, 1fr), not the implicit auto column: no child's min-content width (a nowrap row,
+     a long word) can make the page wider than the screen. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr);
   overflow: hidden;
 }
@@ -88,7 +90,8 @@ button:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opaci
   gap: clamp(10px, 2vw, 26px);
   min-width: min(560px, 52vw);
 }
-.team-name { font-size: clamp(14px, 1.4vw, 18px); font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.team-name { min-width: 0; font-size: clamp(14px, 1.4vw, 18px); font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.name-short { display: none; }
 .team-home { text-align: right; color: var(--home); }
 .team-away { color: var(--away); }
 .score-center { text-align: center; }
@@ -114,8 +117,10 @@ button:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opaci
   box-shadow: 0 0 12px rgba(244, 199, 110, .5);
 }
 .live-light { width: 6px; height: 6px; background: var(--muted-2); box-shadow: none; }
+.live-light.reconnecting { background: var(--gold); box-shadow: 0 0 10px rgba(244, 199, 110, .55); animation: pulse 1s ease-in-out infinite; }
+.live-light.lost { background: var(--red); box-shadow: none; }
 .warm-status.ready { color: var(--pitch); }
-.warm-status.ready .status-dot, .live-light.active { background: var(--pitch); box-shadow: 0 0 12px rgba(180, 230, 106, .6); }
+.warm-status.ready .status-dot, .live-light.connected { background: var(--pitch); box-shadow: 0 0 12px rgba(180, 230, 106, .6); }
 .warm-status.failed { color: var(--red); }
 .warm-status.failed .status-dot { background: var(--red); box-shadow: none; }
 
@@ -130,6 +135,9 @@ button:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opaci
   border-bottom: 1px solid var(--line);
   background: rgba(16, 33, 42, .82);
 }
+.control-bar > *, .control-group > * { min-width: 0; }
+/* On the desktop layout the two groups are one row. */
+.control-group { display: contents; }
 select, textarea {
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -153,6 +161,12 @@ select { height: 34px; padding: 0 28px 0 10px; }
 .button:hover:not(:disabled) { filter: brightness(1.12); }
 .button-primary { background: var(--pitch); color: #102018; }
 .button-quiet { border-color: var(--line); background: transparent; color: var(--ink); }
+.icon-button-labelled { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 6px; }
+.icon { flex: none; width: 18px; height: 18px; fill: currentColor; }
+.icon .icon-stroke { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+#pause-button[data-paused="false"] .icon-play, #pause-button[data-paused="true"] .icon-pause { display: none; }
+#mute-button[aria-pressed="false"] .icon-muted, #mute-button[aria-pressed="true"] .icon-sound { display: none; }
+#mute-button[aria-pressed="true"] { border-color: rgba(244, 199, 110, .5); color: var(--gold); }
 .text-button { padding: 0; border: 0; background: transparent; color: var(--pitch); font-size: 11px; font-weight: 700; }
 .live-tag { padding: 4px 8px; border: 1px solid var(--line); border-radius: 30px; font-size: 9px; font-weight: 800; letter-spacing: .1em; }
 .live-tag.on-air { border-color: rgba(180, 230, 106, .35); color: var(--pitch); }
@@ -175,7 +189,7 @@ select { height: 34px; padding: 0 28px 0 10px; }
 }
 .match-info {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 10px;
   min-height: 0;
   overflow: hidden;
@@ -212,6 +226,9 @@ select { height: 34px; padding: 0 28px 0 10px; }
 .stats-table thead th:last-child, .stats-table td:last-child { text-align: right; color: var(--away); }
 .stats-table tbody th { color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; text-align: center; }
 .stats-table tbody tr + tr { border-top: 1px solid rgba(189, 215, 210, .07); }
+
+.info-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; padding: 0 4px; color: var(--muted-2); font-size: 10px; }
+.connection-detail { display: none; }
 
 .moments-block { display: flex; flex-direction: column; min-height: 0; }
 .moments { flex: 1; min-height: 0; overflow-y: auto; margin: 0; padding: 0; list-style: none; scrollbar-color: #314a50 transparent; }
@@ -261,14 +278,15 @@ select { height: 34px; padding: 0 28px 0 10px; }
   box-shadow: 0 6px 20px rgba(0, 0, 0, .4);
 }
 
-.feed-card { flex: none; padding: 11px 12px; border: 1px solid rgba(189, 215, 210, .1); border-radius: 8px; background: rgba(5, 17, 24, .42); }
-.card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+/* Long words (a URL, a run-on name) break instead of widening the card. */
+.feed-card { flex: none; min-width: 0; overflow-wrap: anywhere; padding: 11px 12px; border: 1px solid rgba(189, 215, 210, .1); border-radius: 8px; background: rgba(5, 17, 24, .42); }
+.card-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 8px; margin-bottom: 6px; }
 .source-badge, .eyebrow { color: var(--pitch); font-size: 9px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
 .source-badge.fallback { color: var(--gold); }
 .line-clock { color: var(--muted-2); font-size: 10px; font-variant-numeric: tabular-nums; }
 .commentary-card p { margin: 0 0 8px; font-family: Georgia, "Times New Roman", serif; font-size: 15px; line-height: 1.5; }
 .commentary-card.speaking { border-color: rgba(120, 220, 170, .7); box-shadow: 0 0 0 1px rgba(120, 220, 170, .35); }
-.line-actions { display: flex; align-items: center; gap: 14px; }
+.line-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
 .line-actions .audio-status { margin-left: auto; }
 
 .question-card { align-self: flex-end; max-width: 85%; border-color: rgba(124, 199, 255, .28); background: rgba(124, 199, 255, .07); }
@@ -297,14 +315,16 @@ select { height: 34px; padding: 0 28px 0 10px; }
 .ask-row { display: flex; align-items: flex-end; gap: 8px; }
 .ask-row textarea { flex: 1; min-width: 0; height: 38px; max-height: 110px; resize: none; overflow-y: hidden; padding: 9px 11px; font-size: 14px; line-height: 1.35; }
 .ask-row textarea::placeholder { color: #71817f; }
-.ask-row .button { min-height: 38px; }
+/* An empty box is one line: the placeholder is cut with an ellipsis, never wrapped. */
+.ask-row textarea:placeholder-shown { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ask-row .button { flex: none; min-height: 38px; }
 .mic-button { color: var(--gold); }
 .mic-button[aria-pressed="true"] { border-color: var(--red); color: var(--red); animation: pulse 1s ease-in-out infinite; }
-.ask-meta { display: flex; align-items: center; gap: 10px; min-height: 18px; margin-top: 5px; }
+.ask-meta { display: flex; align-items: center; gap: 10px; min-width: 0; min-height: 18px; margin-top: 5px; }
 .inline-message { flex: 1; min-width: 0; margin: 0; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .inline-message.error { color: var(--gold); }
 .character-count, .limit-note { flex: none; color: var(--muted-2); font-size: 10px; }
-.ask-footer { display: flex; justify-content: space-between; gap: 10px; margin-top: 2px; color: var(--muted-2); font-size: 10px; }
+.ask-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 2px; color: var(--muted-2); font-size: 10px; }
 
 /* Evidence dialog */
 
@@ -335,7 +355,47 @@ select { height: 34px; padding: 0 28px 0 10px; }
 @media (max-width: 1023px) {
   .workspace { grid-template-columns: minmax(0, 1fr); padding: 0; gap: 0; }
   .feed-column { border: 0; border-radius: 0; }
-  .info-toggle { display: inline-flex; align-items: center; }
+  .info-toggle { display: inline-flex; }
+
+  /* Header: one row of short team names, score, clock and the connection dot. */
+  .brand { display: none; }
+  .topbar { grid-template-columns: minmax(0, 1fr) auto; min-height: 0; gap: 8px; padding-block: 6px; }
+  .app-shell:not([data-phase="idle"]) .topbar { grid-template-columns: minmax(0, 1fr); }
+  .app-shell:not([data-phase="idle"]) .warm-status { display: none; }
+  .scoreboard { min-width: 0; gap: 8px; }
+  .name-full { display: none; }
+  .name-short { display: inline; }
+  .score-center { display: flex; align-items: center; gap: 8px; }
+  .scoreline { gap: 6px; font-size: 22px; }
+  .match-clock { flex-direction: row-reverse; margin-top: 0; font-size: 12px; }
+
+  /* Controls: picker, speed and Start before a match; icon buttons while it runs; both after
+     full time, so "Start another match" sits beside Mute and Match info. */
+  .control-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+  .setup-controls { flex: 1 1 240px; }
+  .run-controls { flex: 1 1 auto; justify-content: flex-end; }
+  .app-shell[data-phase="running"] .setup-controls { display: none; }
+  .app-shell[data-phase="idle"] .run-controls > :not(.info-toggle) { display: none; }
+  .app-shell[data-phase="idle"] .run-controls { flex: none; }
+  /* Before a match: picker and speed on one row, Start and Match info on the next. */
+  .app-shell[data-phase="idle"] .setup-controls { display: contents; }
+  .app-shell[data-phase="idle"] .match-picker { flex: 1 1 55%; }
+  .app-shell[data-phase="idle"] #start-button { flex: 1 1 55%; }
+  /* No connection dot until there is a connection; the warm-up dot covers that time. */
+  .app-shell[data-phase="idle"] .live-light { display: none; }
+  .app-shell[data-phase="running"] .run-controls { justify-content: flex-start; }
+  .run-controls .button-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .run-controls .icon-button-labelled { width: 42px; min-height: 40px; padding: 0; }
+  .toggle-soon { display: none; } /* Crowd: hidden on phones until it's built */
+  .match-picker { flex: 1 1 140px; width: auto; }
+  .speed-picker { flex: none; min-width: 0; }
+  #start-button { flex: 1 0 auto; }
+
+  /* Ask bar: the box shrinks, Talk and Ask are icons, nothing is cut off. */
+  .ask-row .icon-button-labelled { width: 42px; padding: 0; }
+  .ask-row .button-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .ask-footer { display: none; }
+  .connection-detail { display: inline; }
   .match-info {
     position: absolute;
     inset: 0 0 auto 0;
@@ -354,16 +414,10 @@ select { height: 34px; padding: 0 28px 0 10px; }
 }
 
 @media (max-width: 640px) {
-  .topbar { grid-template-columns: auto minmax(0, 1fr) auto; min-height: 56px; gap: 8px; }
-  .brand-name { display: none; }
-  .scoreboard { min-width: 0; gap: 8px; }
-  .team-name { font-size: 13px; }
-  .scoreline { font-size: 24px; gap: 6px; }
+  .topbar { padding-inline: 10px; }
+  .team-name { font-size: 14px; }
   .warm-status span:last-child { display: none; }
-  .control-bar { gap: 6px 8px; padding: 7px 10px; }
-  .match-picker { flex: 1 1 calc(100% - 88px); width: auto; }
-  .speed-picker { flex: none; }
-  #start-button { flex: 1 1 auto; }
+  .control-bar { gap: 6px 8px; padding: 6px 10px; }
   .live-tag, .control-spacer { display: none; }
   .button { padding: 0 11px; }
   .feed { padding: 10px; }
