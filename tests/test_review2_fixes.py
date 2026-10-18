@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -421,3 +422,36 @@ def test_live_m01_recap_is_agent_written() -> None:
     print(result.recap.model_dump_json(indent=2))
     print([(timing.attempt, timing.duration_ms, timing.finish_reason) for timing in result.timings])
     assert result.source == "agent", result.evidence.failures
+
+
+# Answers rejected before the evidence check are logged
+
+
+def _rejections(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("answer_rejected")]
+
+
+def test_answers_rejected_before_the_evidence_check_are_logged_with_reason_and_attempt(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="second_screen_pundit")
+    events = generate_match("m02")
+    info = get_match_info("m02")
+    as_of = _as_of_at(events, 50)
+    long = ExplainerReply(answer=" ".join(["word"] * 81), fact_ids=[])
+
+    pipeline, _, _ = _scripted_pipeline(monkeypatch, [long, _truncated_reply_error()])
+    result = asyncio.run(pipeline.answer_question(info, events, "Who is on top?", as_of=as_of))
+    assert result.source == "fallback"
+    logs = _rejections(caplog)
+    assert len(logs) == 2
+    assert "reason=word_limit attempt=1" in logs[0]
+    assert "reason=truncated attempt=2" in logs[1]
+
+    caplog.clear()
+    bad = ExplainerReply(answer="Merehaven have 99 shots.", fact_ids=["F999"])
+    pipeline, _, _ = _scripted_pipeline(monkeypatch, [{"wrong": 1}, bad])
+    asyncio.run(pipeline.answer_question(info, events, "Who is on top?", as_of=as_of))
+    logs = _rejections(caplog)
+    assert "reason=parse attempt=1" in logs[0]
+    assert "reason=unknown_fact_id attempt=2" in logs[1]

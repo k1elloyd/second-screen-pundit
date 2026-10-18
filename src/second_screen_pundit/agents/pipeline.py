@@ -911,6 +911,17 @@ _CASUAL_ANSWER_NUMBERS = 2
 _XG_WORDS = re.compile(r"\bxG\b|\bexpected goals\b", re.IGNORECASE)
 
 
+def _reply_problem_reason(problem: str) -> str:
+    """The ``answer_rejected`` reason for one of ``_explanation_from_reply``'s problems."""
+    if problem == "answer is empty":
+        return "empty"
+    if problem.endswith("the limit is 80"):
+        return "word_limit"
+    if problem.startswith("fact_id "):
+        return "unknown_fact_id"
+    return "reply"
+
+
 def _answer_profile_failures(
     answer: str, profile: ViewerProfile, info: MatchInfo | None = None
 ) -> list[str]:
@@ -2407,6 +2418,17 @@ class PunditPipeline:
             )
             _log_failure_reasons("question", info.match_id, as_of, attempt, tuple(failures))
 
+        def record_rejection(attempt: int, reasons: Sequence[str], detail: str) -> None:
+            # A reply that fails before the evidence check: no answer to check yet.
+            logger.warning(
+                "answer_rejected match_id=%s as_of=%d reason=%s attempt=%d detail=%s",
+                info.match_id,
+                as_of,
+                ",".join(dict.fromkeys(reasons)),
+                attempt,
+                detail,
+            )
+
         async def attempts() -> QuestionResult | None:
             nonlocal feedback, attempt_count
             for attempt in (1, 2):
@@ -2446,6 +2468,9 @@ class PunditPipeline:
                         attempt,
                         type(exc).__name__,
                     )
+                    record_rejection(
+                        attempt, ["truncated" if truncated else "agent_error"], detail
+                    )
                     feedback = (
                         "The previous reply was cut off; keep the answer short and list each "
                         "fact ID once."
@@ -2459,12 +2484,16 @@ class PunditPipeline:
                         accumulated_results.extend(capture.results)
                 reply = _parsed(response, ExplainerReply)
                 if reply is None:
+                    record_rejection(attempt, ["parse"], "reply is not a valid ExplainerReply")
                     feedback = _invalid_output("ExplainerReply")
                     continue
                 explanation, problems = self._explanation_from_reply(
                     reply, aliases, accumulated_results, given_fact_ids
                 )
                 if explanation is None:
+                    record_rejection(
+                        attempt, [_reply_problem_reason(p) for p in problems], "; ".join(problems)
+                    )
                     feedback = "; ".join(problems)
                     continue
                 framed_answer = explanation.answer
