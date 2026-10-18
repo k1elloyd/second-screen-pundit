@@ -16,6 +16,13 @@ const state = {
   // False when the server started this replay with audio off (the daily spending cap).
   audio: true,
   controller: null,
+  // The replay's stream position, kept across connections so a reconnect resumes after the
+  // last message handled.
+  stream: null,
+  // The viewer paused (the toggle), or the page paused while hidden and is waiting for the
+  // Welcome back tap. Either way a reconnect must not resume the match.
+  userPaused: false,
+  awayPaused: false,
   match: null,
   replayComplete: false,
   score: { home: 0, away: 0 },
@@ -390,6 +397,9 @@ class AudioQueue {
     this.items = [];
     this.playing = null;
     this.paused = false;
+    // While paused the match is paused too, so waiting clips don't go stale meanwhile.
+    this.pausedAt = null;
+    this.pausedTotal = 0;
     this.muted = readStored("pundit-muted") === "1";
     this.el.addEventListener("ended", () => this.next());
     this.el.addEventListener("error", () => this.next());
@@ -474,15 +484,38 @@ class AudioQueue {
     }
   }
 
+  // Milliseconds spent paused so far, the current pause included.
+  pausedMs() {
+    return this.pausedTotal + (this.pausedAt === null ? 0 : Date.now() - this.pausedAt);
+  }
+
   pause() {
     this.paused = true;
+    if (this.pausedAt === null) this.pausedAt = Date.now();
     this.el.pause();
   }
 
   resume() {
+    if (this.pausedAt !== null) {
+      const away = Date.now() - this.pausedAt;
+      this.pausedTotal += away;
+      this.pausedAt = null;
+      for (const item of this.items) if (item.expiresAt != null) item.expiresAt += away;
+    }
     this.paused = false;
     if (this.playing) this.el.play().catch(() => {});
     else this.next();
+  }
+
+  // Resume from a tap. iOS needs a play() inside the gesture after the screen was locked:
+  // the clip that was playing, the next one, or (with nothing queued) a silent unlock.
+  resumeInGesture() {
+    if (this.playing || this.items.length) {
+      this.resume();
+      return;
+    }
+    this.unlock();
+    this.resume();
   }
 
   clear() {
@@ -590,6 +623,7 @@ function renderCommentary(payload) {
   card.dataset.lineId = line.line_id;
   card.dataset.tier = line.delivery_tier || "routine";
   card.dataset.arrivedAt = String(Date.now());
+  card.dataset.pausedAtArrival = String(audioQueue.pausedMs());
   if (payload.audio_id) {
     attachLineAudio(card, line.line_id, payload.audio_id);
   } else {
@@ -613,13 +647,15 @@ function updateCommentaryAudio(payload) {
     .find((item) => item.dataset.lineId === payload.line_id);
   if (!card) return;
   attachLineAudio(card, payload.line_id, payload.audio_id);
-  // Staleness counts from when the line's text arrived, not from when its audio did.
+  // Staleness counts from when the line's text arrived, not from when its audio did, and
+  // leaves out any time paused since.
+  const pausedSince = audioQueue.pausedMs() - Number(card.dataset.pausedAtArrival || 0);
   audioQueue.enqueue({
     id: payload.audio_id,
     kind: "line",
     lineId: payload.line_id,
     tier: card.dataset.tier,
-    expiresAt: Number(card.dataset.arrivedAt) + LINE_AUDIO_STALE_MS,
+    expiresAt: Number(card.dataset.arrivedAt) + LINE_AUDIO_STALE_MS + pausedSince,
   });
 }
 
@@ -774,6 +810,12 @@ async function readStream(url, controller, stream) {
     throw error;
   }
   if (el("connection-state").textContent === "Reconnecting…") setConnection("Reconnected");
+  // A dropped stream pauses the match on the server. If this page didn't mean to pause
+  // (a blip, or the ingress cut), carry on; resuming a running replay changes nothing.
+  if (stream.connections > 0 && !state.userPaused && !state.awayPaused && !state.replayComplete) {
+    controlReplay("resume", { quiet: true });
+  }
+  stream.connections += 1;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -804,7 +846,7 @@ async function readStream(url, controller, stream) {
 // Keeps the replay's stream open: on a clean close or a dropped connection it reconnects
 // with Last-Event-ID, and the server resumes after the last message this page handled.
 async function consumeStream(url, controller) {
-  const stream = { lastEventId: null, retryMs: 1000 };
+  const stream = state.stream;
   let failures = 0;
   while (!controller.signal.aborted) {
     try {
@@ -850,6 +892,115 @@ function resetMatch() {
   updateCharacterCount();
 }
 
+// Opens (or reopens, after the page was hidden) the replay's stream from where it left off.
+function openStream() {
+  if (state.controller) state.controller.abort();
+  const controller = new AbortController();
+  state.controller = controller;
+  const replayId = state.replayId;
+  consumeStream(`/api/replays/${replayId}/stream`, controller).catch((error) => {
+    if (error.name === "AbortError" || state.replayId !== replayId) return;
+    if (error.status === 404) {
+      showReplayEnded();
+      return;
+    }
+    showMessage(el("ask-message"), error.message, true);
+    setConnection("Stream disconnected", "lost");
+  });
+}
+
+// The replay has gone (stopped after too long away, or replaced): say so, never stop silently.
+function showReplayEnded() {
+  if (state.controller) state.controller.abort();
+  state.controller = null;
+  state.replayId = null;
+  state.replayToken = null;
+  state.awayPaused = false;
+  el("welcome-back")?.remove();
+  audioQueue.clear();
+  setPauseButton({ enabled: false });
+  el("question-input").disabled = true;
+  el("mic-button").disabled = true;
+  el("ask-button").disabled = true;
+  el("match-picker").disabled = false;
+  el("start-button").disabled = false;
+  el("start-button").textContent = "Start replay";
+  el("live-tag").textContent = "ENDED";
+  el("live-tag").classList.remove("on-air");
+  setConnection("This replay has ended", "lost");
+  setPhase("done");
+  if (el("replay-ended")) return;
+  const card = make("article", "feed-card answer-card notice-card");
+  card.id = "replay-ended";
+  card.append(make("p", "", "This replay has ended."));
+  const again = make("button", "button button-primary", "Start again");
+  again.type = "button";
+  again.addEventListener("click", () => {
+    audioQueue.unlock(); // a click, so autoplay stays allowed
+    startReplay();
+  });
+  card.append(again);
+  placeInFeed(card, { forceScroll: true });
+}
+
+// The viewer is back after the page was hidden while the match ran.
+function showWelcomeBack() {
+  if (el("welcome-back")) return;
+  const card = make("article", "feed-card answer-card notice-card");
+  card.id = "welcome-back";
+  card.append(make("p", "", "Welcome back. The match paused while you were away."));
+  const resume = make("button", "button button-primary", "Tap to resume");
+  resume.type = "button";
+  resume.addEventListener("click", resumeFromAway);
+  card.append(resume);
+  placeInFeed(card, { forceScroll: true });
+}
+
+// Inside the tap: audio first (iOS unlock), then the match.
+function resumeFromAway() {
+  el("welcome-back")?.remove();
+  state.awayPaused = false;
+  state.userPaused = false;
+  audioQueue.resumeInGesture();
+  controlReplay("resume");
+}
+
+let closedWhileHidden = false;
+
+// Leaving (lock screen, app switch, tab switch): pause the match before the connection goes.
+// keepalive lets the request finish while the page is being frozen.
+function pageHidden() {
+  if (!state.replayId || closedWhileHidden) return;
+  closedWhileHidden = true;
+  const running = !state.replayComplete && !state.userPaused && !state.awayPaused;
+  if (running) {
+    state.awayPaused = true;
+    audioQueue.pause();
+    fetch(`/api/replays/${state.replayId}/control`, {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json", "X-Replay-Token": state.replayToken },
+      body: JSON.stringify({ action: "pause" }),
+    }).catch(() => {}); // if it doesn't arrive, the server pauses when the stream drops
+    setPauseButton({ paused: true });
+    el("live-tag").textContent = "PAUSED";
+  }
+  // Close the stream ourselves rather than leave a frozen socket; it resumes on return.
+  if (state.controller) state.controller.abort();
+  state.controller = null;
+}
+
+function pageShown() {
+  if (!closedWhileHidden) return;
+  closedWhileHidden = false;
+  if (!state.replayId) return;
+  if (state.awayPaused) {
+    setConnection("Paused while you were away");
+    showWelcomeBack();
+  }
+  openStream();
+}
+
 async function startReplay() {
   showMessage(el("ask-message"), "");
   try {
@@ -858,6 +1009,7 @@ async function startReplay() {
       await new Promise((resolve) => setTimeout(resolve, 180));
     }
     resetMatch();
+    el("replay-ended")?.remove();
     state.replayComplete = false;
     const matchId = el("match-picker").value;
     const speed = el("speed-picker").value;
@@ -880,14 +1032,10 @@ async function startReplay() {
       ? `Connected · ${speed}× replay · pre-written commentary`
       : `Connected · ${speed}× replay`);
     if (started.notice) placeInFeed(errorCard(started.notice));
-    const controller = new AbortController();
-    state.controller = controller;
-    consumeStream(`/api/replays/${started.replay_id}/stream`, controller).catch((error) => {
-      if (error.name !== "AbortError") {
-        showMessage(el("ask-message"), error.message, true);
-        setConnection("Stream disconnected", "lost");
-      }
-    });
+    state.stream = { lastEventId: null, retryMs: 1000, connections: 0 };
+    state.userPaused = false;
+    state.awayPaused = false;
+    openStream();
   } catch (error) {
     if (error.code === "busy") {
       showBusy(error.message);
@@ -918,7 +1066,7 @@ function showBusy(message) {
   setPhase("idle");
 }
 
-async function controlReplay(action) {
+async function controlReplay(action, { quiet = false } = {}) {
   if (!state.replayId) return;
   try {
     const body = await responseJson(await fetch(`/api/replays/${state.replayId}/control`, {
@@ -933,11 +1081,13 @@ async function controlReplay(action) {
         : "Replay stopped");
       return;
     }
+    if (quiet && body.state !== "running") return;
     setPauseButton({ paused: body.state === "paused" });
     el("live-tag").textContent = body.state === "paused" ? "PAUSED" : "ON AIR";
-    setConnection(body.state === "paused" ? "Replay paused" : "Replay resumed");
+    if (!quiet) setConnection(body.state === "paused" ? "Replay paused" : "Replay resumed");
   } catch (error) {
-    showMessage(el("ask-message"), error.message, true);
+    if (error.status === 404) showReplayEnded();
+    else if (!quiet) showMessage(el("ask-message"), error.message, true);
   }
 }
 
@@ -1148,13 +1298,20 @@ el("start-button").addEventListener("click", () => {
 });
 el("pause-button").addEventListener("click", () => {
   if (el("pause-button").dataset.paused === "true") {
-    audioQueue.resume();
-    controlReplay("resume");
+    resumeFromAway(); // the same as the Welcome back tap: audio, then the match
   } else {
+    state.userPaused = true;
     audioQueue.pause();
     controlReplay("pause");
   }
 });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") pageHidden();
+  else pageShown();
+});
+// Safari can skip visibilitychange when a page goes into the back-forward cache.
+window.addEventListener("pagehide", pageHidden);
+window.addEventListener("pageshow", (event) => { if (event.persisted) pageShown(); });
 el("enable-audio").addEventListener("click", () => {
   audioQueue.unlock().then(() => audioQueue.next());
 });

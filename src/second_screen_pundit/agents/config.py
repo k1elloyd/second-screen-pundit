@@ -83,8 +83,11 @@ class AgentSettings:
     # Container Apps ingress ends a request after 240 s, so each stream closes itself sooner
     # and the browser reconnects with Last-Event-ID.
     stream_max_seconds: float = 200
-    # A replay whose stream dropped is kept this long for the browser to reconnect.
+    # A running replay whose stream dropped is kept this long for the browser to reconnect.
     stream_reconnect_grace_seconds: float = 30
+    # A paused (or finished) replay with no stream is kept this long: a locked phone or a
+    # hidden tab comes back to it. Paused, it makes no model or speech calls.
+    stream_paused_grace_seconds: float = 600
     # Global daily caps (UTC). When either is reached, new viewers get cached mode with audio
     # off. 0 trips the guard at once.
     model_calls_per_day: int = 900
@@ -143,6 +146,7 @@ class AgentSettings:
             stream_reconnect_grace_seconds=_positive_float(
                 "STREAM_RECONNECT_GRACE_SECONDS", 30
             ),
+            stream_paused_grace_seconds=_positive_float("STREAM_PAUSED_GRACE_SECONDS", 600),
             model_calls_per_day=_non_negative_int("MODEL_CALLS_PER_DAY", 900),
             tts_characters_per_day=_non_negative_int("TTS_CHARACTERS_PER_DAY", 45_000),
         )

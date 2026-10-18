@@ -1,8 +1,10 @@
 """Phase 4: the viewer stream survives a dropped connection and the ingress request timeout.
 
 Each test drops the stream (closes the response body, as a lost socket does) and reconnects
-with Last-Event-ID, the way the page does. The match runs in cached mode, so the lines are
-real pre-generated lines with real citations and no model is called.
+with Last-Event-ID, the way the page does. A drop pauses a running replay (mobile session,
+group 2), so after an unplanned drop a test resumes it, as the page does when it didn't mean
+to pause. The match runs in cached mode, so the lines are real pre-generated lines with real
+citations and no model is called.
 """
 
 from __future__ import annotations
@@ -151,10 +153,18 @@ def test_reconnect_mid_match_resumes_with_no_duplicates_gaps_or_early_lines(
             await first.drop()
             session = app.state.sessions[replay_id]
             sent_at_drop = before[-1][0]
-            await asyncio.sleep(0.5)  # the match carries on while the page is away
+            # The drop paused the match clock and the viewer's stream.
+            assert session.replay.state == "paused" and session.delay.paused
+            # The page didn't mean to pause, so it resumes; here the resume lands before the
+            # stream is back, so messages pile up with no stream to send them on.
+            resumed = await routes["/api/replays/{replay_id}/control"](
+                replay_id, _json_request({"action": "resume"}, ip, replay_id)
+            )
+            assert resumed["state"] == "running"
+            await asyncio.sleep(0.5)
             missed = len(session.outbox) - sent_at_drop
             second = _Connection(
-                await _stream(routes, ip, 
+                await _stream(routes, ip,
                     replay_id, last_event_id=str(sent_at_drop)
                 )
             )
@@ -453,6 +463,9 @@ def test_a_reconnect_from_a_new_address_with_the_token_resumes(
             await asyncio.sleep(0.3)
             # The phone is now on another network: a different address, the same token.
             second = _Connection(await _stream(routes, mobile, replay_id, str(before[-1][0])))
+            await routes["/api/replays/{replay_id}/control"](
+                replay_id, _json_request({"action": "resume"}, mobile, replay_id)
+            )
             after = await second.read(lambda got: sum(n == "event" for _, n, _ in got) >= 30)
             await second.drop()
             ids = [i for i, _, _ in before + after]

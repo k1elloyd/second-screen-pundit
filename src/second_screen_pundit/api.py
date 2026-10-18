@@ -873,6 +873,16 @@ def create_app(
             "notice": CACHED_NOTICE if limited else None,
         }
 
+    async def set_paused(session: ReplaySession, paused: bool) -> str:
+        """Pause or resume the match clock and the viewer's delayed stream together."""
+        state = await session.replay.control("pause" if paused else "resume")
+        # The viewer's delayed stream pauses with the replay, so nothing more arrives.
+        if state == "paused":
+            session.delay.pause()
+        elif state == "running":
+            session.delay.resume()
+        return state
+
     @app.post("/api/replays/{replay_id}/control")
     async def control(replay_id: str, request: Request) -> dict[str, str]:
         session = find_session(replay_id, request)
@@ -883,12 +893,7 @@ def create_app(
         action = body.get("action") if isinstance(body, dict) else None
         if action not in {"pause", "resume"}:
             raise HTTPException(status_code=422, detail="Action must be pause or resume.")
-        state = await session.replay.control(action)
-        # The viewer's delayed stream pauses with the replay, so nothing more arrives.
-        if state == "paused":
-            session.delay.pause()
-        elif state == "running":
-            session.delay.resume()
+        state = await set_paused(session, action == "pause")
         return {"replay_id": replay_id, "state": state}
 
     async def answer(
@@ -1135,9 +1140,12 @@ def create_app(
     ) -> StreamingResponse:
         """The replay's viewer stream; a reconnect with Last-Event-ID resumes after it.
 
-        Every message has an `id:` (its outbox position). A dropped stream doesn't stop the
-        replay: it keeps running, paused or not, for STREAM_RECONNECT_GRACE_SECONDS. Each
-        connection closes itself after STREAM_MAX_SECONDS, inside the ingress request timeout.
+        Every message has an `id:` (its outbox position). A dropped stream pauses a running
+        replay at once (a locked phone shouldn't miss the match), and the paused replay is kept
+        for STREAM_PAUSED_GRACE_SECONDS. Each connection closes itself after
+        STREAM_MAX_SECONDS, inside the ingress request timeout; that planned close doesn't
+        pause, and the replay keeps running for STREAM_RECONNECT_GRACE_SECONDS while the
+        browser reconnects.
         """
         session = find_session(replay_id, request)
         position = _resume_position(last_event_id, len(session.outbox))
@@ -1156,12 +1164,14 @@ def create_app(
         async def events() -> AsyncIterator[bytes]:
             nonlocal position
             closes_at = time.monotonic() + configured_settings.stream_max_seconds
+            planned_close = False
             try:
                 yield f"retry: {SSE_RETRY_MILLISECONDS}\n\n".encode()
                 while session.stream_generation == generation and not session.outbox.closed:
                     remaining = closes_at - time.monotonic()
                     if remaining <= 0:
                         # Close cleanly before ingress cuts the request; the browser reconnects.
+                        planned_close = True
                         return
                     try:
                         messages = await session.outbox.read(
@@ -1177,10 +1187,21 @@ def create_app(
             finally:
                 if session.stream_generation == generation and not session.stopped:
                     session.stream_open = False
+                    if not planned_close and session.replay.state == "running":
+                        # The viewer has gone (lock screen, app switch, lost signal): stop the
+                        # match clock now rather than let it run on unseen. The page resumes
+                        # it when the viewer is back.
+                        await set_paused(session, True)
+                        logger.info("replay_paused_on_disconnect replay_id=%s", replay_id)
+                    # Paused (or finished), it makes no model or speech calls, so it can wait
+                    # longer for the viewer to come back.
+                    held = session.replay.state != "running"
                     session.stream_deadline_task = asyncio.create_task(
                         stop_without_stream(
                             session,
-                            configured_settings.stream_reconnect_grace_seconds,
+                            configured_settings.stream_paused_grace_seconds
+                            if held
+                            else configured_settings.stream_reconnect_grace_seconds,
                             "replay_stream_not_reconnected",
                         )
                     )

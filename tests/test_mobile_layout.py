@@ -14,7 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from second_screen_pundit.agents.pipeline import PunditPipeline
-from second_screen_pundit.agents.tools.analytics import possession_pair
+from second_screen_pundit.agents.tools.analytics import _possession_split, match_snapshot
 from second_screen_pundit.api import _released_possession, create_app
 from second_screen_pundit.engine.generate import generate_match
 from tests.test_api import _settings
@@ -27,21 +27,36 @@ STYLES = (WEB / "styles.css").read_text(encoding="utf-8")
 @pytest.mark.parametrize("match_id", ["m01", "m02", "m03"])
 def test_every_released_event_carries_a_possession_pair_that_sums_to_100(match_id: str) -> None:
     session = SimpleNamespace(released_passes={"home": 0, "away": 0})
-    passes = {"home": 0, "away": 0}
+    events = generate_match(match_id)
     seen = 0
-    for event in generate_match(match_id):
+    for index, event in enumerate(events):
         pair = _released_possession(session, event)  # type: ignore[arg-type]
-        if event.type == "pass" and event.outcome == "success":
-            passes[event.team] += 1
-        if not sum(passes.values()):
-            assert pair is None
+        if pair is None:
             continue
         seen += 1
         assert pair["home"] + pair["away"] == 100
-        # Exactly the analytics' rounding: home half up, away the rest.
-        expected = possession_pair(passes["home"] / sum(passes.values()) * 100)
-        assert pair == {"home": expected["home"][1], "away": expected["away"][1]}
+        # The same definition as the commentary and Q&A possession facts: the analytics'
+        # split (share of successful passes) over the events released so far. Sampled, since
+        # the split is recomputed from scratch each time.
+        if index % 25 == 0 or index == len(events) - 1:
+            split, _ = _possession_split(events[: index + 1])
+            assert pair == {"home": split["home"][1], "away": split["away"][1]}
     assert seen > 1000
+
+
+def test_the_panel_matches_the_snapshot_fact_the_explainer_cites() -> None:
+    events = generate_match("m02")
+    session = SimpleNamespace(released_passes={"home": 0, "away": 0})
+    for event in events[:900]:
+        pair = _released_possession(session, event)  # type: ignore[arg-type]
+    as_of = events[899].seq
+    facts = match_snapshot(events, as_of=as_of)[0].facts
+    whole = [
+        fact.spoken_value if fact.spoken_value is not None else fact.value
+        for fact in facts
+        if " possession through " in fact.label
+    ]
+    assert [round(float(value)) for value in whole] == [pair["home"], pair["away"]]
 
 
 def test_matches_list_gives_each_teams_short_form() -> None:

@@ -854,3 +854,29 @@ This ends the commentary changes for the polish session.
 | 360, 375, 390, 430 | page zoom 130% (277–331px) | equal at every width | 129 / 89 px |
 
 At 390×844 that is 15.3% before Start and 10.6% running (limit 20%). No element's right edge passed the screen in any case. 1366×768 and 1920×1080 keep the two-column layout with no overflow.
+
+**Possession definition (checked after group 1).** The panel's figure and every possession fact the commentary and Q&A use come from the same definition: each side's share of successful passes, through `possession_pair`. `match_snapshot`'s whole-match fact is over the events up to `as_of`, the same prefix as the released events the panel counts. `tests/test_mobile_layout.py` compares the panel's pair with `_possession_split` along all three matches and with the snapshot fact the Explainer cites.
+
+### Group 2: leaving and coming back (lock screen, app switch, tab switch)
+
+On a real iPhone, locking the screen stopped the match and it never came back. The stream died with the page; after the 30 s reconnect grace the replay was stopped, and the page's reader gave up silently on the 404.
+
+**Server (changes Phase 4 group 1's "a drop doesn't stop the replay").**
+- **A dropped stream pauses a running replay at once** (`replay_paused_on_disconnect`), match clock and broadcast delay together, through the same `set_paused` as `/control`. A locked phone no longer misses the match.
+- **The planned close is not a drop.** The stream's own close every `STREAM_MAX_SECONDS` (inside the ingress timeout) leaves the replay running, with the 30 s `STREAM_RECONNECT_GRACE_SECONDS`, because the page reconnects a second later.
+- **A paused (or finished) replay with no stream is kept for `STREAM_PAUSED_GRACE_SECONDS`** (default 600, configurable) before it is stopped and freed. A paused replay releases no events, so no window starts and no model or speech call is made. A call already in flight when the pause lands finishes; a window whose line is written waits for its event's release and calls nothing more.
+
+**Page.**
+- **Hidden** (`visibilitychange`, and `pagehide` for Safari's back-forward cache): if the match is running and the viewer hadn't paused it, the page pauses its audio queue and sends `/control` pause with `keepalive: true`, so the request finishes while the page is frozen. If it doesn't arrive, the server pauses when the stream drops. The page then closes its own stream rather than leave a frozen socket.
+- **Shown again:** the page reopens the stream with `Last-Event-ID`, and if it paused the match it shows a "Welcome back. The match paused while you were away." card with **Tap to resume**. The tap resumes audio first, inside the gesture (the clip that was playing, the next one, or a silent unlock if nothing is queued), as iOS requires after a lock, then resumes the match. The Pause/Resume toggle does the same.
+- **An unplanned drop while visible** (a signal blip, the ingress cut) also pauses the match on the server. After any reconnect the page sends a quiet resume unless the viewer paused or the Welcome back card is waiting, so a blip costs about a second, not a tap.
+- **Gone:** a 404 from the stream or from `/control` (the replay was freed after 10 minutes) shows "This replay has ended." with **Start again**, sets the connection dot red, and disables the controls. It never stops silently.
+- **Audio staleness leaves out time paused.** A routine clip is dropped if it hasn't started 12 s after its line arrived; time spent paused no longer counts, so lines waiting when the phone was locked still play.
+
+**Tests** (`tests/test_away.py`, in-process, cached mode): a drop pauses at once and the match clock doesn't move; the planned close doesn't pause; a paused replay outlives the running grace and is freed after the paused grace, then the stream gets 404; coming back within the grace resumes with contiguous message IDs and each line once; no pipeline or speech calls while paused (counted over 2 s, about 40 match minutes at the test clock), and calls start again on resume. `tests/test_stream_resume.py`'s mid-match and new-address tests now resume after reconnecting, as the page does. Mutation checks: with the disconnect pause removed, 4 of the 5 away tests fail; with the planned close treated as a drop, the planned-close test fails.
+
+**Checked in a browser** (Playwright Chromium, 390×844 phone emulation, m01 at 20x, cached mode with real Azure Speech). The lock was simulated by firing `visibilitychange` with `visibilityState` hidden, taking the browser offline for the lock, then online and visible again. Two viewers ran side by side.
+- **2-minute lock.** Hidden at 23' with a line clip played. The keepalive pause reached the server. On return the Welcome back card showed, and for 5 s before the tap nothing moved: no events, no clock. The clock read 24' rather than 23', from events already sent between the page closing its stream and the pause landing (at 20x one match minute is about 3 s). After the tap the match resumed: 448 messages handled with last ID 448 (no gap, no duplicate), event seqs contiguous and unique, each line once, and a line clip played after the tap (`play()` resolved, `playing` fired). No page errors.
+- **11-minute lock.** The server freed the replay at 600 s (`replay_stream_not_reconnected … seconds=600`). On return the page showed "This replay has ended." with Start again, the dot red. Start again ran a new replay.
+
+Not covered here: a real iPhone. In particular, whether iOS delivers the keepalive request before freezing the page, and whether Safari fires `visibilitychange` on lock. The server pause on the dropped stream covers the first case.
