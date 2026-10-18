@@ -241,3 +241,79 @@ def test_a_full_match_of_tactical_checks_leaves_the_loop_responsive(
     with capsys.disabled():
         print(f"\nm02's 30 boundaries: {_describe(gaps, notes)}")
     assert gap < 0.2, f"event loop blocked for {gap * 1000:.0f} ms (median); {_describe(gaps, notes)}"
+
+
+# The colour-line worker builds its candidate off the event loop
+
+
+def test_colour_lines_are_built_without_blocking_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real colour worker, through the app: a slow candidate build must not stall the loop.
+
+    A build is about a second of CPU over the match so far (review 3). Here each one also
+    sleeps 0.25 s, as the slow tactical check above does, so a build run on the loop again
+    shows as a gap of at least that. A colour line must still reach the viewer.
+    """
+    from second_screen_pundit import api
+    from second_screen_pundit.agents import colour
+    from tests.test_stream_resume import _TOKENS, _Connection, _json_request, _scope, _stream
+
+    # Colour lines due at once and often; the match clock otherwise as at 120x.
+    monkeypatch.setattr(colour, "COLOUR_FIRST_MINUTE", 0)
+    monkeypatch.setattr(colour, "COLOUR_IDLE_REAL_SECONDS", 0.2)
+    monkeypatch.setattr(colour, "COLOUR_SPACING_REAL_SECONDS", 1.0)
+    monkeypatch.setattr(api, "COLOUR_RETRY_SECONDS", 0.3)
+    real_build = api.build_colour_candidate
+    builds: list[float] = []
+
+    def slow_build(*args, **kwargs):
+        builds.append(time.perf_counter())
+        time.sleep(0.25)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(api, "build_colour_candidate", slow_build)
+    published: list[int] = []
+
+    def work():
+        # The spending cap at 0: cached lines, audio off, so the viewer's queue is never busy.
+        settings = replace(_settings(delay=0.2), model_calls_per_day=0)
+        app = create_app(settings=settings, pipeline=PunditPipeline(settings, None))
+        routes = {r.path: r.endpoint for r in app.routes if hasattr(r, "endpoint")}
+
+        async def run() -> None:
+            async with app.router.lifespan_context(app):
+                ip = "198.51.100.150"
+                started = await routes["/api/matches/{match_id}/start"](
+                    "m01", Request(_scope("/api/matches/m01/start", ip)), speed=120
+                )
+                replay_id = started["replay_id"]
+                _TOKENS[replay_id] = started["replay_token"]
+                connection = _Connection(await _stream(routes, ip, replay_id))
+                await connection.read(lambda got: any(n == "event" for _, n, _ in got))
+                await routes["/api/replays/{replay_id}/playback-state"](
+                    replay_id,
+                    api.ViewerPlaybackStateRequest(audio_busy=False, revision=1),
+                    _json_request({}, ip, replay_id),
+                )
+                colour_lines = await connection.read(
+                    lambda got: any(
+                        n == "commentary" and p["line"]["source"] == "colour" for _, n, p in got
+                    ),
+                    timeout=30,
+                )
+                published.append(
+                    sum(
+                        n == "commentary" and p["line"]["source"] == "colour"
+                        for _, n, p in colour_lines
+                    )
+                )
+                await connection.drop()
+
+        return run()
+
+    gap, gaps, notes = _median_loop_gap(work, runs=3)
+    with capsys.disabled():
+        print(f"\ncolour-line builds ({len(builds)} in 3 runs): {_describe(gaps, notes)}")
+    assert len(published) == 3 and all(count >= 1 for count in published)
+    assert gap < 0.1, f"event loop blocked for {gap * 1000:.0f} ms (median); {_describe(gaps, notes)}"

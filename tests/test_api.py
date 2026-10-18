@@ -722,3 +722,76 @@ def test_live_model_warmup_runs_in_background_and_gates_start() -> None:
         while client.get("/healthz").json()["warmup"] != "ready" and time.monotonic() < deadline:
             time.sleep(0.02)
         assert client.get("/healthz").json()["warmup"] == "ready"
+
+
+def test_a_failed_warm_up_serves_cached_mode_and_retries_until_it_recovers() -> None:
+    live_settings = replace(
+        _settings(),
+        mode="live",
+        endpoint="configured",
+        model_fast="fast",
+        model_deep="deep",
+    )
+
+    class FlakyPipeline:
+        """Fails its first two warm-ups (a slow model or identity endpoint), then works."""
+
+        def __init__(self) -> None:
+            self.attempts: list[float] = []
+
+        async def warm_up(self) -> None:
+            self.attempts.append(time.monotonic())
+            if len(self.attempts) <= 2:
+                raise TimeoutError("model call timed out")
+
+        async def comment_on_window(self, *_args, **_kwargs):
+            from second_screen_pundit.agents.pipeline import LiveWindowResult
+
+            return LiveWindowResult("skipped", None, None, (), None)
+
+    pipeline = FlakyPipeline()
+    app = create_app(
+        settings=live_settings,
+        pipeline=pipeline,  # type: ignore[arg-type]
+        credential=object(),
+        warmup_retry_seconds=(0.4, 0.8),
+    )
+
+    def health() -> dict:
+        return client.get("/healthz").json()
+
+    def wait_for(condition) -> None:
+        deadline = time.monotonic() + 10
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert condition()
+
+    with TestClient(app) as client:
+        wait_for(lambda: health()["warmup"] == "failed")
+        failed = health()
+        # Not "Pundit unavailable": Start works, in cached mode, while the warm-up retries.
+        assert failed["ready"] and failed["limited"]
+        assert failed["error"] == "Warm-up failed; retrying."
+        started = client.post(
+            "/api/matches/m02/start?speed=20", headers={"X-Client-ID": "warmup-failed"}
+        )
+        assert started.status_code == 200
+        body = started.json()
+        assert body["mode"] == "cached" and body["audio"] is False
+        assert "isn't available right now" in body["notice"]
+        assert "today's limit" not in body["notice"]
+        assert app.state.sessions[body["replay_id"]].pipeline is not app.state.pipeline
+
+        wait_for(lambda: health()["warmup"] == "ready")
+        recovered = health()
+        assert recovered["ready"] and not recovered["limited"]
+        assert len(pipeline.attempts) == 3
+        # The backoff grows: the second wait is longer than the first.
+        first_wait = pipeline.attempts[1] - pipeline.attempts[0]
+        second_wait = pipeline.attempts[2] - pipeline.attempts[1]
+        assert first_wait >= 0.35 and second_wait >= 0.75
+        live = client.post(
+            "/api/matches/m02/start?speed=20", headers={"X-Client-ID": "warmup-recovered"}
+        )
+        assert live.status_code == 200
+        assert live.json()["mode"] == "live" and live.json()["notice"] is None

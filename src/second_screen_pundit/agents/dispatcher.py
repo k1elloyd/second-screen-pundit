@@ -14,6 +14,7 @@ from second_screen_pundit.agents.wording import (
     LATE_DRAMA_MINUTE,
     apply_clock_rules,
     clock_budget_allows,
+    strip_repeated_score,
 )
 from second_screen_pundit.engine.broadcast import BroadcastDelay
 from second_screen_pundit.engine.schema import Event, MatchInfo
@@ -23,6 +24,10 @@ from second_screen_pundit.observability import record_result, turn_span
 WINDOW_MATCH_MINUTES = 3
 PENDING_SIGNAL_EXPIRY_MINUTES = 10
 RECENT_LINES_FOR_COMMENTATOR = 3
+# A line published within this many real seconds of another doesn't repeat its score.
+REPEATED_SCORE_SECONDS = 30
+# Lines whose score is the news: they keep it even if another line has just given it.
+SCORE_TIERS = frozenset({"goal_peak", "goal_equaliser", "goal", "red_card"})
 logger = logging.getLogger(__name__)
 
 BoundaryDecision = Literal["no_signal", "held_cooldown", "held_in_flight", "dispatched"]
@@ -89,6 +94,8 @@ class LiveDispatcher:
         self._generation = 0
         self._in_flight = 0
         self._recent_lines: list[str] = []
+        # (monotonic time, text) of each published line, for the repeated-score rule.
+        self._published_at: list[tuple[float, str]] = []
         # Lines already sent. In cached mode a pre-generated line can match two windows (the
         # goal's fast path and the next tactical window, which holds the goal's shot).
         self._published_line_ids: set[str] = set()
@@ -309,11 +316,29 @@ class LiveDispatcher:
                     line.text,
                     clock_allowed=clock_budget_allows(self._recent_lines, late_drama=late_drama),
                 )
+                # The other lane may have given this score seconds ago (a tactical line
+                # written while the goal line was being published).
+                published_now = time.monotonic()
+                if line.delivery_tier not in SCORE_TIERS:
+                    recent = [
+                        earlier
+                        for at, earlier in self._published_at
+                        if published_now - at <= REPEATED_SCORE_SECONDS
+                    ]
+                    unrepeated = strip_repeated_score(text, recent)
+                    if unrepeated != text:
+                        logger.info(
+                            "repeated_score_removed match_id=%s line_id=%s",
+                            self.info.match_id,
+                            line.line_id,
+                        )
+                        text = unrepeated
                 if text != line.text:
                     line = line.model_copy(update={"text": text})
                     outcome.result = replace(outcome.result, line=line)
                 self._published_line_ids.add(line.line_id)
                 self._recent_lines.append(line.text)
+                self._published_at.append((published_now, line.text))
         except Exception as exc:  # noqa: BLE001 - one failed window must not stop the replay
             outcome.error = f"{type(exc).__name__}: {str(exc)[:160]}"
             logger.warning(

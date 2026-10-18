@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 
-from second_screen_pundit.agents.evidence import mentions_score
+from second_screen_pundit.agents.evidence import SCORE_PATTERN, mentions_score
 from second_screen_pundit.engine.schema import MatchInfo
 from second_screen_pundit.engine.teams import team_name
 
@@ -224,7 +224,8 @@ _BANNED_PATTERNS = (
 # Allowed only for a team that trailed earlier and is now level or ahead.
 COMEBACK_PHRASES = ("comeback", "turnaround")
 BANNED_OPENERS = (
-    "and", "what a", "there it is", "here we go", "the home side", "the visitors",
+    "and", "what a", "there it is", "here we go", "the home side", "the away side",
+    "the visitors",
 )
 
 
@@ -451,6 +452,40 @@ def strip_withheld_score(text: str) -> str:
         and mentions_score(last)
         and _SCORE_WORDS.search(last)
         and len(last.split()) <= 8
+    ):
+        return " ".join(sentences[:-1])
+    return text
+
+
+# A score sentence from either side's view: "Port Calder lead 2-1", "Ashbridge trail 1-2".
+_REPEAT_SCORE_WORDS = re.compile(
+    r"\b(?:lead|leads|level|ahead|all square|trail|trails|behind)\b", re.IGNORECASE
+)
+
+
+def _scores(text: str) -> set[tuple[int, int]]:
+    """Each score the text states, either way round ("lead 2-1" and "trail 1-2" are one)."""
+    return {
+        tuple(sorted((int(match.group("home")), int(match.group("away")))))  # type: ignore[misc]
+        for match in SCORE_PATTERN.finditer(text)
+    }
+
+
+def strip_repeated_score(text: str, recent: Iterable[str]) -> str:
+    """Drop a short trailing score sentence when a recent line already gave that score.
+
+    The two live lanes write in parallel, so a tactical line written before a goal line was
+    published can repeat the score a few seconds after it. Only a trailing sentence like
+    strip_withheld_score's is removed; a score inside another sentence stays.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    last = sentences[-1]
+    if (
+        len(sentences) > 1
+        and _REPEAT_SCORE_WORDS.search(last)
+        and len(last.split()) <= 8
+        and (stated := _scores(last))
+        and stated & set().union(*(_scores(line) for line in recent))
     ):
         return " ".join(sentences[:-1])
     return text

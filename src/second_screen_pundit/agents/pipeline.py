@@ -50,7 +50,11 @@ from second_screen_pundit.agents.commentator import (
     validate_plain_spoken_text,
 )
 from second_screen_pundit.agents.config import AgentSettings
-from second_screen_pundit.agents.content_filter import OUT_OF_SCOPE_ANSWER, question_scope_reason
+from second_screen_pundit.agents.content_filter import (
+    OUT_OF_SCOPE_ANSWER,
+    question_scope_reason,
+    restricted_content_failures,
+)
 from second_screen_pundit.agents.delivery import TIER_TONES, tier_for_event, tier_for_signals
 from second_screen_pundit.agents.evidence import (
     EvidenceReport,
@@ -949,6 +953,28 @@ def _snapshot_fact_ids(snapshot: Sequence[ToolResult]) -> list[str]:
     return [fact.fact_id for result in snapshot for fact in result.facts]
 
 
+def recap_wording_failures(recap: Recap, info: MatchInfo, goals: Sequence[str]) -> list[str]:
+    """The live lines' banned phrases and the real-name check, on every recap field.
+
+    "The winner" and "consolation" are banned only live, where the result isn't known yet.
+    """
+    fields = [
+        ("headline", recap.headline),
+        ("summary", recap.summary),
+        ("audio_script", recap.audio_script),
+        *((f"key moment {index}", moment.text) for index, moment in enumerate(recap.key_moments, 1)),
+    ]
+    failures = []
+    for name, text in fields:
+        failures.extend(
+            f"{name}: banned phrase {hit}"
+            for hit in banned_phrase_hits(text, info, goals)
+            if not hit.startswith("live only:")
+        )
+        failures.extend(f"{name}: {failure}" for failure in restricted_content_failures(text))
+    return failures
+
+
 def _recap_from_reply(
     reply: RecapReply,
     aliases: _FactAliases,
@@ -1763,6 +1789,7 @@ class PunditPipeline:
                 )
                 wording = [
                     *(f"banned phrase {hit}" for hit in hits),
+                    *restricted_content_failures(text),
                     *(
                         scorer_phrase_failures(text, info, must_say_event.team)
                         if must_say_event is not None
@@ -2017,6 +2044,7 @@ class PunditPipeline:
         )
         wording = [
             *(f"banned phrase {hit}" for hit in hits),
+            *restricted_content_failures(text),
             *comparison_failures(text),
             *phase_failures,
         ]
@@ -2530,6 +2558,11 @@ class PunditPipeline:
             )
 
         deadline = self.settings.recap_timeout_seconds
+        visible_goals = [
+            str(event.team)
+            for event in events
+            if event.seq <= as_of and event.type == "goal" and event.team is not None
+        ]
         snapshot = await asyncio.to_thread(_recap_snapshot, events, as_of)
         aliases = _FactAliases()
         stats_facts, moment_facts = _prompt_facts(snapshot, aliases, moment_event_ids=True)
@@ -2629,6 +2662,17 @@ class PunditPipeline:
                     recap, problems = None, [
                         f"the headline must contain score_phrase word for word: "
                         f"{recap_score_phrase!r}"
+                    ]
+                if recap is not None and (wording := recap_wording_failures(recap, info, visible_goals)):
+                    logger.warning(
+                        "recap_wording_rejected match_id=%s attempt=%d failures=%s",
+                        info.match_id,
+                        attempt,
+                        " | ".join(wording),
+                    )
+                    recap, problems = None, [
+                        *wording,
+                        "rewrite those parts without the listed words; say only what the facts show",
                     ]
                 if recap is None:
                     feedback = "; ".join(problems)

@@ -197,8 +197,11 @@ async function checkWarmup() {
   const busy = Boolean(state.replayId) && !state.replayComplete;
   el("match-picker").disabled = !health.ready || busy;
   el("start-button").disabled = !health.ready || busy;
-  // Keep polling only until ready; a failed warm-up is retried slowly in case it recovers.
-  if (!health.ready) setTimeout(checkWarmup, health.warmup === "failed" ? 15000 : WARMUP_POLL_MS);
+  // Keep polling only until ready. While a failed warm-up is retried on the server, Start
+  // already works (cached mode), and a slow poll shows when live commentary is back.
+  if (!health.ready || health.warmup === "failed") {
+    setTimeout(checkWarmup, health.warmup === "failed" ? 15000 : WARMUP_POLL_MS);
+  }
 }
 
 function eventText(event) {

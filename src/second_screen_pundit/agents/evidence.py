@@ -35,6 +35,8 @@ _NUMBER = re.compile(
 )
 # A score never ends in a minute mark: 59-75' is a minute range.
 _SCORE = re.compile(r"(?<![\w\d-])(?P<home>\d{1,2})\s*[-–—]\s*(?P<away>\d{1,2})(?![-–—\w'’])")
+# A stated score such as 2-1, for callers outside the check.
+SCORE_PATTERN = _SCORE
 _LABEL_MINUTES = re.compile(r"(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?'")
 _FORMATION = re.compile(r"\b\d{1,2}(?:-\d{1,2}){2,3}\b")
 _BACK_LINE = re.compile(r"\bback\s+(?P<count>zero|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b", re.IGNORECASE)

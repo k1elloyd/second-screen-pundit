@@ -51,7 +51,13 @@ class ColourLineGate:
     used_versions: set[str] = field(default_factory=set)
     used_statistics: set[str] = field(default_factory=set)
     count: int = 0
+    # Bumped by a real line or a change in the viewer's audio queue: a candidate built before
+    # either is out of date. Routine events don't bump it (they arrive several times a second,
+    # while a candidate takes about a second to build off the event loop); events that would
+    # contradict a candidate are checked against what the viewer was sent instead.
     generation: int = 0
+    # Events seen so far: a candidate that wasn't available may become available after more.
+    events_seen: int = 0
 
     def update_viewer_queue(self, busy: bool, now: float) -> None:
         changed = not self.viewer_state_received or self.viewer_line_busy != busy
@@ -65,7 +71,7 @@ class ColourLineGate:
             self.generation += 1
 
     def record_event(self) -> None:
-        self.generation += 1
+        self.events_seen += 1
 
     def record_real_line(self, now: float, *, audio_enabled: bool) -> None:
         self.generation += 1

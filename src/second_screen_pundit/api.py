@@ -9,7 +9,7 @@ import secrets
 import time
 import wave
 from collections import defaultdict, deque
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -56,6 +56,14 @@ _WEB_DIR = Path(__file__).with_name("web")
 SSE_HEARTBEAT_SECONDS = 15
 # How long the browser waits before reconnecting a stream that closed or dropped.
 SSE_RETRY_MILLISECONDS = 1000
+# Seconds before each warm-up retry after a failure; the last value repeats until it succeeds.
+WARMUP_RETRY_SECONDS: tuple[float, ...] = (5, 15, 30, 60)
+# Least real time between colour-line attempts; each attempt costs about a second of CPU.
+COLOUR_RETRY_SECONDS = 2.0
+WARMUP_NOTICE = (
+    "The live pundit isn't available right now, so this match uses pre-written commentary "
+    "with audio off. Live commentary returns as soon as it reconnects."
+)
 
 
 class QuestionRequest(BaseModel):
@@ -110,7 +118,10 @@ class ReplaySession:
     # Line audio started while the line waits for release, keyed by the internal line ID.
     line_audio_tasks: dict[str, asyncio.Task[str | None]] = field(default_factory=dict)
     colour_gate: ColourLineGate = field(default_factory=ColourLineGate)
-    colour_attempted_generation: int = -1
+    # The gate's (generation, events_seen) at the last colour attempt, and when it started:
+    # a new attempt needs something to have changed and COLOUR_RETRY_SECONDS to have passed.
+    colour_attempt_key: tuple[int, int] | None = None
+    colour_attempted_at: float = -math.inf
     viewer_line_state_revision: int = -1
     pending_real_events: set[int] = field(default_factory=set)
     dispatcher: LiveDispatcher | None = None
@@ -126,24 +137,57 @@ class ReplaySession:
 
 
 class QuestionRateLimiter:
-    def __init__(self, limit: int = 6, window_seconds: float = 60) -> None:
+    """Questions per viewer per window, inside a higher ceiling per network address.
+
+    Judges on one office network share an address, so the per-viewer limit is keyed on the
+    viewer (X-Client-ID, held on their replay). Rotating client IDs from one address still
+    meets the address ceiling. Without a client ID, the address gets the per-viewer limit.
+    """
+
+    def __init__(
+        self,
+        limit: int = 6,
+        window_seconds: float = 60,
+        address_limit: int | None = None,
+    ) -> None:
         self.limit = limit
+        self.address_limit = limit if address_limit is None else address_limit
         self.window_seconds = window_seconds
         self._requests: dict[str, deque[float]] = defaultdict(deque)
 
-    def check(self, client_ip: str, *, now: float | None = None) -> None:
-        current = time.monotonic() if now is None else now
-        requests = self._requests[client_ip]
+    def _recent(self, key: str, current: float) -> deque[float]:
+        requests = self._requests[key]
         while requests and current - requests[0] >= self.window_seconds:
             requests.popleft()
-        if len(requests) >= self.limit:
-            retry_after = max(1, math.ceil(self.window_seconds - (current - requests[0])))
-            raise HTTPException(
-                status_code=429,
-                detail="Question limit reached: 6 questions per minute. Please wait and try again.",
-                headers={"Retry-After": str(retry_after)},
-            )
-        requests.append(current)
+        return requests
+
+    def _refuse(self, requests: deque[float], current: float, detail: str) -> None:
+        retry_after = max(1, math.ceil(self.window_seconds - (current - requests[0])))
+        raise HTTPException(status_code=429, detail=detail, headers={"Retry-After": str(retry_after)})
+
+    def check(
+        self, client_ip: str, *, client_id: str | None = None, now: float | None = None
+    ) -> None:
+        current = time.monotonic() if now is None else now
+        if client_id is None:
+            limits = [(f"address:{client_ip}", self.limit)]
+        else:
+            limits = [(f"client:{client_id}", self.limit), (f"address:{client_ip}", self.address_limit)]
+        # Check every limit before counting, so a refused question uses up nothing.
+        for key, limit in limits:
+            requests = self._recent(key, current)
+            if len(requests) >= limit:
+                per_viewer = key.startswith("client:") or client_id is None
+                self._refuse(
+                    requests,
+                    current,
+                    f"Question limit reached: {limit} questions per minute. Please wait and try again."
+                    if per_viewer
+                    else "Your network has asked a lot of questions in the last minute. "
+                    "Please wait a moment and try again.",
+                )
+        for key, _limit in limits:
+            self._requests[key].append(current)
 
 
 def _client_ip(request: Request) -> str:
@@ -313,11 +357,15 @@ def create_app(
     credential: Any | None = None,
     speech_recognizer: SpeechRecognizer | None = None,
     speech_synthesizer: SpeechSynthesizer | None = None,
+    warmup_retry_seconds: Sequence[float] = WARMUP_RETRY_SECONDS,
 ) -> FastAPI:
+    if not warmup_retry_seconds:
+        raise ValueError("warmup_retry_seconds must not be empty")
     configured_settings = settings or AgentSettings.from_environment()
     limiter = QuestionRateLimiter(
         limit=configured_settings.questions_per_minute,
         window_seconds=configured_settings.question_rate_window_seconds,
+        address_limit=configured_settings.questions_per_address_per_minute,
     )
     manager = ReplayManager(max_concurrent=configured_settings.max_concurrent_replays)
     guard = SpendingGuard(
@@ -359,16 +407,37 @@ def create_app(
             app.state.warmup = {"status": "warming", "error": None}
 
             async def warm_up() -> None:
-                try:
-                    await app.state.pipeline.warm_up()
-                except Exception as exc:
-                    logger.exception("model_warm_up_failed")
-                    app.state.warmup = {
-                        "status": "failed",
-                        "error": "Warm-up failed; check server configuration and logs",
-                    }
-                else:
-                    app.state.warmup = {"status": "ready", "error": None}
+                # A failed warm-up is retried with backoff for as long as the app runs: a
+                # restart that meets a slow model or identity endpoint must not leave the app
+                # unusable. Meanwhile Start serves cached mode (see `degraded`).
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        await app.state.pipeline.warm_up()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        delay = warmup_retry_seconds[min(attempt, len(warmup_retry_seconds)) - 1]
+                        if attempt == 1:
+                            logger.exception("model_warm_up_failed attempt=1 retry_in=%s", delay)
+                        else:
+                            logger.warning(
+                                "model_warm_up_failed attempt=%d retry_in=%s error=%s",
+                                attempt,
+                                delay,
+                                type(exc).__name__,
+                            )
+                        app.state.warmup = {
+                            "status": "failed",
+                            "error": "Warm-up failed; retrying.",
+                        }
+                        await asyncio.sleep(delay)
+                    else:
+                        if attempt > 1:
+                            logger.warning("model_warm_up_recovered attempts=%d", attempt)
+                        app.state.warmup = {"status": "ready", "error": None}
+                        return
 
             app.state.warmup_task = asyncio.create_task(warm_up())
         else:
@@ -401,6 +470,10 @@ def create_app(
                 replace(configured_settings, mode="cached"), None
             )
         return app.state.cached_pipeline
+
+    def warm_up_failed() -> bool:
+        """The live model's warm-up failed and is being retried: new viewers get cached mode."""
+        return app.state.warmup["status"] == "failed"
 
     def session_pipeline(session: ReplaySession) -> Any:
         return session.pipeline if session.pipeline is not None else app.state.pipeline
@@ -496,26 +569,29 @@ def create_app(
     ) -> bool:
         if outcome.result is None:
             return False
-        if outcome.result.insight is not None:
-            await session.outbox.put(
-                (
-                    "insight",
-                    {
-                        "match_id": session.info.match_id,
-                        "insight": outcome.result.insight.model_dump(mode="json"),
-                        "event_id": outcome.event.event_id,
-                    },
-                )
-            )
         line = outcome.result.line
-        if line is None:
+        if line is None and outcome.result.insight is None:
             return False
-        # A line never reaches the viewer before its event: wait for the viewer stream, not
-        # only for the delay, since the two release loops can wake in either order.
+        # Nothing about a window reaches the viewer before its event, the insight included
+        # (its headline and event IDs would be a spoiler on the stream): wait for the viewer
+        # stream, not only for the delay, since the two release loops can wake in either order.
         async with session.release_condition:
             await session.release_condition.wait_for(
                 lambda: session.viewer_released_as_of >= outcome.event.seq
             )
+            if outcome.result.insight is not None:
+                await session.outbox.put(
+                    (
+                        "insight",
+                        {
+                            "match_id": session.info.match_id,
+                            "insight": outcome.result.insight.model_dump(mode="json"),
+                            "event_id": outcome.event.event_id,
+                        },
+                    )
+                )
+            if line is None:
+                return False
             if colour_generation is not None and (
                 not session.colour_gate.candidate_is_current(colour_generation)
                 or bool(session.pending_real_events)
@@ -684,6 +760,15 @@ def create_app(
             if event.type == "full_time":
                 session.recap_task = asyncio.create_task(make_recap(session, event.seq))
 
+    def colour_overtaken(session: ReplaySession, as_of: int) -> bool:
+        """A shot or a must-say event reached the viewer after `as_of`."""
+        for event in reversed(session.released_events):
+            if event.seq <= as_of:
+                return False
+            if event.type == "shot" or is_must_say(event, session.events):
+                return True
+        return False
+
     async def colour_lines(session: ReplaySession) -> None:
         while not session.stopped and session.replay.state in {"running", "paused"}:
             await asyncio.sleep(0.05)
@@ -699,31 +784,47 @@ def create_app(
             if line_event is None:
                 continue
             match_minute = min(90, line_event.minute + line_event.added_minute)
-            generation = session.colour_gate.generation
-            if generation == session.colour_attempted_generation:
+            gate = session.colour_gate
+            generation = gate.generation
+            attempt_key = (generation, gate.events_seen)
+            now = time.monotonic()
+            if (
+                attempt_key == session.colour_attempt_key
+                or now - session.colour_attempted_at < COLOUR_RETRY_SECONDS
+            ):
                 continue
-            if not session.colour_gate.is_due(
-                time.monotonic(),
+            if not gate.is_due(
+                now,
                 match_minute,
                 event_pending=bool(session.pending_real_events),
                 stream_open=session.stream_open,
                 replay_running=session.replay.state == "running",
             ):
                 continue
-            session.colour_attempted_generation = generation
+            session.colour_attempt_key = attempt_key
+            session.colour_attempted_at = now
             line_pipeline = session_pipeline(session)
             if not isinstance(line_pipeline, PunditPipeline):
                 continue
             try:
-                candidate = build_colour_candidate(
+                # About a second of CPU over the match so far: in a worker thread, so every
+                # viewer's stream, audio and questions keep moving meanwhile. The match's
+                # events never change; the used sets are copied because a release on the
+                # loop adds to them.
+                candidate = await asyncio.to_thread(
+                    build_colour_candidate,
                     session.info,
                     session.events,
                     as_of=as_of,
-                    ordinal=session.colour_gate.count + 1,
-                    used_versions=session.colour_gate.used_versions,
-                    used_statistics=session.colour_gate.used_statistics,
+                    ordinal=gate.count + 1,
+                    used_versions=set(gate.used_versions),
+                    used_statistics=set(gate.used_statistics),
                 )
-                if candidate is None:
+                if candidate is None or session.stopped:
+                    continue
+                if colour_overtaken(session, as_of):
+                    # The viewer saw a shot or a must-say event while it was being built,
+                    # so its statistics could already read as out of date.
                     continue
                 result = line_pipeline.validate_colour_line(
                     candidate.line,
@@ -883,7 +984,7 @@ def create_app(
                 status_code=409,
                 detail="The viewer has not received a match event yet. Please try again shortly.",
             )
-        limiter.check(_client_ip(request))
+        limiter.check(_client_ip(request), client_id=session.client_id)
         return session
 
     @app.get("/")
@@ -952,16 +1053,14 @@ def create_app(
         speed: int = 1,
     ) -> dict[str, Any]:
         warmup = app.state.warmup
-        limited = guard.tripped
+        # Cached mode, audio off, for either reason: today's spending cap, or a live model
+        # that failed its warm-up and is still being retried.
+        spending_limited = guard.tripped
+        limited = spending_limited or warm_up_failed()
         if warmup["status"] != "ready" and not limited:
-            message = (
-                "Pundit warm-up failed; check the server configuration and logs."
-                if warmup["status"] == "failed"
-                else "Pundit warming up; Start will be available when it is ready."
-            )
             raise HTTPException(
                 status_code=503,
-                detail=message,
+                detail="Pundit warming up; Start will be available when it is ready.",
                 headers={"Retry-After": "5"},
             )
         client_id = request.headers.get("x-client-id", "").strip()
@@ -1038,7 +1137,9 @@ def create_app(
         )
         if limited:
             logger.warning(
-                "replay_started_limited replay_id=%s mode=cached audio=off", replay_id
+                "replay_started_limited replay_id=%s mode=cached audio=off reason=%s",
+                replay_id,
+                "spending_cap" if spending_limited else "warm_up_failed",
             )
         session.dispatcher = LiveDispatcher(
             session_pipeline(session),
@@ -1066,7 +1167,9 @@ def create_app(
             "state": replay.state,
             "mode": "cached" if limited else configured_settings.mode,
             "audio": session.audio_enabled,
-            "notice": CACHED_NOTICE if limited else None,
+            "notice": (
+                CACHED_NOTICE if spending_limited else WARMUP_NOTICE if limited else None
+            ),
         }
 
     async def set_paused(session: ReplaySession, paused: bool) -> str:
@@ -1326,10 +1429,11 @@ def create_app(
             {
                 "status": "ok",
                 "warmup": warmup["status"],
-                "ready": warmup["status"] == "ready" or guard.tripped,
+                "ready": warmup["status"] == "ready" or guard.tripped or warm_up_failed(),
                 "error": warmup["error"],
-                # True once today's spending cap is reached: new replays are cached, audio off.
-                "limited": guard.tripped,
+                # True once today's spending cap is reached, or while a failed warm-up is
+                # retried: new replays are cached, audio off.
+                "limited": guard.tripped or warm_up_failed(),
                 "limits": {
                     "question_characters": configured_settings.question_max_characters,
                     "question_audio_seconds": configured_settings.question_audio_max_seconds,

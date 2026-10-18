@@ -68,6 +68,12 @@ def viewer_output_block_reason(texts: Iterable[str], info: MatchInfo | None = No
     return _block_reason("\n".join(texts))
 
 
+def restricted_content_failures(*texts: str) -> list[str]:
+    """The real-name and betting check as wording failures, for lines and the recap."""
+    reason = _block_reason("\n".join(texts))
+    return [f"restricted content: {reason}"] if reason else []
+
+
 def question_scope_reason(question: str) -> str | None:
     """Why a viewer question is out of scope (betting or a real club), or None."""
     return _block_reason(question)
