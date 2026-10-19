@@ -337,7 +337,7 @@ These come from the official rules. They change the lists above.
   - This is a scope change from the build prompt, so it's your decision.
 - **Should: say why there's no multi-language output.** §4.1(vi) lists it among the challenge areas, and the build prompt puts it out of scope. Say so in the README. If there's time, an `xml:lang` voice switch on the recap alone would show it.
 - **Should: keep the URL up until 10 Nov, 23:59 PT** (§1; that's 07:59 on 11 Nov UK time). The access must be "free of charge and without any restriction" (§4.8). The daily caps degrade the app rather than block it, which I'd consider fine. The per-address limits (item 8) are the nearest thing to a restriction.
-- **Should: no third-party trademarks in the video** (§4.4). Leave "Premier League" out of the video, and out of its title to be safe. That's stricter than the build prompt's allowance.
+- **Should: no third-party trademarks in the video** (§4.4). Leave the league's name out of the video, and out of its title to be safe. That's stricter than the build prompt's allowance.
 - **Should: the pitch must name the Microsoft and Azure technology used** (§4.4). Item 5's list covers it.
 - **Optional: MCP.** The judging criteria name Azure MCP and "MCP integration" among the hero technologies. Exposing the read-only analytics tools as an MCP server, for Copilot or another agent to query a match, would score on both technological implementation and agentic design.
 

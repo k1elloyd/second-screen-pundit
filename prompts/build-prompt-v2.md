@@ -36,6 +36,16 @@
 - **Housekeeping:** deleted the stale "copy this file into the new repo" sentence and the `[[…]]` link. Deleted `prompts/build-prompt-v1.md`.
 - **Phase 3 viewer cut-off:** typed and spoken viewer questions and answers use only events through the viewer's released position, never a newer agent `as_of`.
 
+## Changes after v2 (v2.1, recorded in `docs/DECISIONS.md`)
+
+This prompt is kept as the record of how the app was specified. Where it disagrees with these, the app follows these:
+- **Resume (Phase 4):** a dropped stream resumes with `Last-Event-ID`; a drop pauses the replay, which is held for 10 minutes. This replaces "a replay stops when its SSE client disconnects, with no resume" (B3) and removes resuming from Out of scope.
+- **Replays:** 6 at once and 3 per address. Each replay is owned by a replay token, and there is one replay per viewer.
+- **Questions:** 6 a minute per viewer, with a ceiling of 20 per address.
+- **Replicas:** `minReplicas` 1 during judging, so there's no cold start; `MIN_REPLICAS=0` scales to zero afterwards.
+- **Personalisation:** added for the official rules' Personalize stage. Casual and Analyst modes and My team, through the same checks.
+- **Branding:** the league's name appears nowhere, including the README and the video.
+
 ---
 
 ## Non-negotiables
@@ -46,16 +56,16 @@ Read these first. Everything else elaborates on them.
 2. **Ship running code, not plans.** Never claim a command, deployment, model call or test passed without showing the output that proves it.
 3. **Check before you design around something.** Verify Microsoft Agent Framework, Microsoft Foundry, Azure Speech, Azure Container Apps, azd and Bicep behaviour against current Microsoft Learn documentation before relying on it. Don't assume a preview feature, SKU, package name or API version exists. If the docs and this prompt disagree, stop and tell me.
 4. **Deterministic code owns every number and every fact.** Analytics tools compute all statistics from the match event log. Models choose tools, decide what matters and explain results. They never compute, invent or override a statistic. Every number and every event a model output mentions must trace back to a tool result, and an automated check must prove it.
-5. **All match data is synthetic.** Use fictional clubs, players and stadiums only. No real club, player, league, badge, crest or trademark appears anywhere: not in code, data, the UI, tests or the video. The one exception is the hackathon's own name, which may appear in the README and the video title. No match footage.
+5. **All match data is synthetic.** Use fictional clubs, players and stadiums only. No real club, player, league, badge, crest or trademark appears anywhere: not in code, data, the UI, tests or the video. That includes the league in the hackathon's name: it appears nowhere, not even in the README or the video title. No match footage.
 6. **Use keyless access everywhere.** Use one user-assigned managed identity in Azure and `DefaultAzureCredential` locally. Never write, log, print or commit keys, connection strings or tokens. The browser never receives any key or token: all speech-to-text and text-to-speech run on the server.
-7. **Cost guardrails are features, not extras.** Every model call has `max_tokens`, a time budget and `store: False`. The public API is rate-limited per client. At most 6 replays run at once, and at most 3 from one IP address. Container Apps scale to zero.
+7. **Cost guardrails are features, not extras.** Every model call has `max_tokens`, a time budget and `store: False`. The public API is rate-limited per client. At most 6 replays run at once, and at most 3 from one IP address. Container Apps can scale to zero (`MIN_REPLICAS=0`); during judging one replica stays warm.
 8. **Keep it one container.** A single Python API serves the static front end, the event stream, the audio and the agents. Don't split it into microservices.
 9. **Stop at each phase gate.** Report what was built, the evidence that it works (command output, test results) and anything you are unsure about. Then wait for me. Don't start the next phase on your own.
 10. **Make routine engineering choices yourself.** Don't ask permission to write code, add a test or pick a reasonable library version.
 
 ## Mission
 
-Build **Second Screen Pundit** for the Microsoft x Premier League *Inside the Game* developer hackathon (submission deadline 27 Oct 2026). The brief is: AI-powered solutions that turn synthetic, football-realistic data into explainable match intelligence, real-time narratives and automated match recaps for studio, broadcast or streaming use.
+Build **Second Screen Pundit** for the Microsoft *Inside the Game* developer hackathon (submission deadline 27 Oct 2026). The brief is: AI-powered solutions that turn synthetic, football-realistic data into explainable match intelligence, real-time narratives and automated match recaps for studio, broadcast or streaming use.
 
 The app replays a synthetic football match as a live event stream. A team of agents watches it, decides what's worth saying, and produces short spoken commentary. Viewers can ask spoken or typed "why" questions and get answers that cite the exact events behind them. At full time the app produces a written recap and an audio recap. **Every claim links to event IDs, so the commentary is explainable rather than just plausible.**
 
@@ -274,15 +284,15 @@ STT and TTS time doesn't count against the model budgets. `/api/ask-audio` has a
 The limits, all configurable, are:
 - Question length: 300 characters maximum. This applies to the STT transcript too.
 - Question audio: 15 seconds and 1 MB maximum.
-- Viewer questions (typed and spoken combined): 6 per minute per client. A client is identified by its IP address from `X-Forwarded-For`, because Container Apps ingress is a proxy.
-- Concurrent replays: 3.
+- Viewer questions (typed and spoken combined): 6 per minute per viewer, and 20 per minute per address. The address is the right-most `X-Forwarded-For` entry, because Container Apps ingress is a proxy.
+- Concurrent replays: 6, and 3 per address.
 - Tool calls per agent turn: 4 maximum.
 - Time budgets: as in the table above.
 
 Container Apps notes:
 - State is in memory, so `maxReplicas` stays at 1.
 - Check the current Container Apps ingress idle timeout on Learn and keep the SSE heartbeat well inside it.
-- The README tells judges that the first load after idle can take a few seconds, because the app scales to zero.
+- With `minReplicas` 1 there is no cold start. If the app is set to scale to zero, the README tells judges that the first load after idle can take a few seconds.
 
 ## Observability and evaluation
 

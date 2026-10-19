@@ -30,7 +30,7 @@
 | 42' | spoken: What changed for Port Calder after the red card? | 16.1 s | fallback (time budget) |
 | 50' | What changed for Port Calder after the red card? | 7.7 s | fallback ("withheld") |
 | 58' | What are the odds Merehaven win this? | 8.7 s | fallback ("withheld") |
-| 66' | Is Merehaven's pressing better than Liverpool's? | 9.9 s | fallback ("withheld") |
+| 66' | Is Merehaven's pressing better than [a real club]'s? | 9.9 s | fallback ("withheld") |
 | 74' | Why are Merehaven camped in the final third? | 8.9 s | fallback ("withheld") |
 | 84' | What formation are Port Calder playing now? | 8.0 s | fallback (evidence failed) |
 
@@ -317,8 +317,8 @@ Also add one test asserting that `SpeechSynthesizer.synthesize_mp3` passes `to_s
 ### 13. The content filter misses things, and checks only part of the output
 
 These pass `viewer_output_block_reason`:
-- "Mbappe would have scored that." A capitalised single word at the start of a sentence is exempt.
-- "Barcelona-style passing from Merehaven."
+- "[A real player] would have scored that." A capitalised single word at the start of a sentence is exempt.
+- "[A real club]-style passing from Merehaven."
 - Any real name written in lower case that isn't one of the 7 hashed denylist entries.
 
 **Scope gap.** The filter runs only on Q&A. Commentary lines (model-written) and the recap (`make_recap`) go to the viewer and to TTS without it. Non-negotiable 5 covers all output.

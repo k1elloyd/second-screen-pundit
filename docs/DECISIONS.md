@@ -1,4 +1,18 @@
-# Phase 0 decisions
+# Decisions
+
+Every design decision and gate result, in the order they were made. Later sections supersede earlier ones where they disagree, and say so. For the summary, see the [README](../README.md), [ARCHITECTURE.md](ARCHITECTURE.md) and [EVALUATION.md](EVALUATION.md).
+
+**Contents:**
+- **Phase 0:** Agent Framework, Speech, packages and azd, verified against Microsoft Learn.
+- **Phases 1–2c:** the engine, the five agents, the evidence check, live latency, the tactical lane, the broadcast delay, the voice and commentary style.
+- **Phase 3:** review 2 fixes; Session B on audio, trust and accuracy, robustness, and the app shell.
+- **Phase 4:** stream resume, infrastructure, the spending guard, warm-up, cost, and the deployed gate.
+- **Polish:** wording rules, follow-ups and gates.
+- **Mobile session:** phone layout, leaving and coming back, slot eviction, colour lines.
+- **Review 3 fixes.**
+- **Personalisation:** the viewer profile; Casual and Analyst, My team; the comparison check.
+
+## Phase 0
 
 Verified on 2026-10-16 against Microsoft Learn and the current package index.
 
@@ -388,7 +402,7 @@ Same questions and viewer clocks as review 2, final code. Time to text runs from
 | 42' | spoken: What changed for Port Calder after the red card? | model | 1 | stop | 6.3 s (transcript 3.4 s, audio 8.7 s) |
 | 50' | What changed for Port Calder after the red card? | model | 1 | stop | 3.4 s |
 | 58' | What are the odds Merehaven win this? | fixed reply | 0 | – | 0.004 s |
-| 66' | Is Merehaven's pressing better than Liverpool's? | fixed reply | 0 | – | 0.006 s |
+| 66' | Is Merehaven's pressing better than [a real club]'s? | fixed reply | 0 | – | 0.006 s |
 | 74' | Why are Merehaven camped in the final third? | model | 1 | stop | 3.2 s |
 | 84' | What formation are Port Calder playing now? | model | 1 | stop | 2.5 s |
 
@@ -519,7 +533,7 @@ m01 has no red card, so the red-card style was checked on m02.
 - **Q&A in the feed.** "YOU ASKED", then "Thinking…", replaced by the answer card with Why? and Replay. An answer's Why? is built from its own payload and the events the page has already received, so it needs no API call.
 - **Mini-map.** An SVG pitch showing the latest event's position, and its pass or carry end, in the team's colour. Away coordinates are flipped for display, as the spec says. It uses event data only.
 - **Shortcuts.** `/` focuses the ask box (not from inside another text field). Enter sends; Shift+Enter starts a new line.
-- **Crowd.** A disabled toggle marked "soon"; there is no crowd audio.
+- **Crowd.** A disabled toggle marked "soon"; there is no crowd audio. *(Superseded: the crowd bed was built in group 1 above, and the toggle works. The screenshots in `docs/screenshots/app-shell/` predate it and the mobile session.)*
 
 ### Phone keyboard
 
@@ -645,7 +659,7 @@ Plain container environment variables, no secrets and no keys: `NARRATIVE_MODE`,
 
 ### Spending guard
 
-- **Caps.** `MODEL_CALLS_PER_DAY` (default 900) and `TTS_CHARACTERS_PER_DAY` (default 45,000; set from the measurements below), per UTC day, for the whole app. Both are Bicep parameters, so `azd env set MODEL_CALLS_PER_DAY 0` then `azd provision` forces cached mode. 0 trips the guard at once.
+- **Caps.** `MODEL_CALLS_PER_DAY` (default 900; the deployed app uses 450, see "Caps" under the Phase 4 gate) and `TTS_CHARACTERS_PER_DAY` (default 45,000; set from the measurements below), per UTC day, for the whole app. Both are Bicep parameters, so `azd env set MODEL_CALLS_PER_DAY 0` then `azd provision` forces cached mode. 0 trips the guard at once.
 - **Counting.** `PunditPipeline` reports every model call *before* making it (live windows, questions and the recap, retries included), so a failed call still counts. TTS characters are counted before each synthesis. Counts are in memory: one replica; they reset at midnight UTC and on a restart.
 - **When either cap is reached:**
   - A new viewer's `/start` returns `mode: "cached"`, `audio: false` and a short notice: "The pundit has reached today's limit, so this match uses pre-written commentary with audio off. Live commentary is back tomorrow." The page shows it as a card in the feed and disables the mic. That replay uses the cached pipeline: pre-written lines, cached Q&A, the deterministic recap, no model calls and no speech. Lines arrive with `audio_pending: false`, so no card waits for audio.
@@ -703,7 +717,7 @@ Live commentary varies by a few calls from run to run (director and commentator 
 
 ### Replay cap 6, and a friendly "busy"
 
-- `MAX_CONCURRENT_REPLAYS` defaults to **6** (was 3; the build prompt's non-negotiable 7 and the Copilot instructions still say 3 and need updating). The per-address limit stays at 3, so one office can't take every slot.
+- `MAX_CONCURRENT_REPLAYS` defaults to **6** (was 3; the build prompt's non-negotiable 7 and the Copilot instructions said 3 then; both now say 6). The per-address limit stays at 3, so one office can't take every slot.
 - When every slot is in use, `/start` returns 503 with `Retry-After: 60` and `{"detail": {"code": "busy", "message": "The pundit is busy, try again in a minute."}}`. The page shows that message as a card in the feed with a **Try again** button (a click, so autoplay stays unlocked), re-enables Start, and shows nothing in red. Checked in a browser against a one-slot local server.
 - Tests: the default cap is 6 with 3 per address (two offices of 3; a seventh viewer gets "busy"); the busy body and `Retry-After`.
 
@@ -720,7 +734,9 @@ Live commentary varies by a few calls from run to run (director and commentator 
 | Spending cap forced to 0 | `azd env set MODEL_CALLS_PER_DAY 0`, `azd provision`: `/healthz` `ready: true, limited: true`, chip "Pundit ready · cached". Start in the browser: the notice card, "pre-written commentary" in the status line, mic disabled, cached lines with no audio events and nothing played, no errors. Restored with `azd env set MODEL_CALLS_PER_DAY 900` (`azd env unset` didn't remove the value) and `azd provision`: `limited: false`. |
 | No keys in the repo, the image or the deployed settings | Repo: a pattern scan (account keys, SAS, private keys, instrumentation keys, API-key and secret assignments, common token prefixes) of every tracked file and of `git log -p --all` found nothing; no `.env`, `.azure/`, `.pem` or `.pfx` was ever committed. Image (an `az acr run` of the deployed tag): `/app` holds `LICENSE`, `README.md`, `build`, `data`, `pyproject.toml`, `src`, `third_party`; no `.env`, `.azure`, `.git`, `.venv`, screenshots or key files (only the public CA bundle); no key patterns under `/app`; the image environment has no secrets; runs as `pundit` (uid 10001). Deployed: `secrets` null, no registry password, no key-like setting values, App Insights local auth disabled. |
 
-**Open:** the existing Speech resource `pundit-speech-swc-kl` still has local (key) auth enabled, and the Foundry account doesn't report the flag. The app never uses keys; disabling local auth on both would close that door.
+**Local auth (closed 18 Oct 2026).** At this gate the existing Speech resource `pundit-speech-swc-kl` still had local (key) auth enabled, and the Foundry account didn't report the flag. Both now report `disableLocalAuth: true` (`az cognitiveservices account list`, 18 Oct 2026), and the three unused Cognitive Services accounts that review 3 found in `rg-pundit` have been removed.
+
+**Caps (changed after this gate).** The deployed `MODEL_CALLS_PER_DAY` is **450**, not 900. Review 3 costed the period to 10 Nov: at 900 the worst case goes over the £75 spending target; at 450 it's about £70–75, with a realistic £15–25. 450 is about 13 live matches a UTC day. The template default stays 900.
 
 ### Monthly cost estimate (USD list prices, 30 days)
 
@@ -952,7 +968,7 @@ Every viewer-facing difference below runs through the same evidence and wording 
 
 - The Explainer prompt gets `viewer: {mode, my_team}`. Casual: one or two short sentences, under 45 words, at most two numbers, no xG. Analyst: up to four sentences. With My team set, the answer says "your side" or "your team" at least once; without one, it never does. Each rule is checked and retried with feedback, like an evidence failure.
 - **Framing doesn't change the evidence.** The evidence check reads "your side" (and "your side's") as My team's name (`unframe`), so the number in "Your side have had 57% of the possession" is grounded exactly as in "Port Calder have had 57%…", and the answer shown keeps the framing. A test asks the same question neutral and as an away fan: the framing differs; the facts and events cited are the same.
-- **Words must follow the facts.** A live probe found casual answers swapping numbers for comparisons that were wrong ("your side have had more of the ball" for a side on 43%). The evidence check reads numbers, not comparisons in words. The Explainer now has a rule: more of the ball, more shots or the better of the chances only for the team whose fact is higher, and say when it is only the recent spell. In 6 casual probes after the rule, every comparison matched the facts. It is a prompt rule, not a check.
+- **Words must follow the facts.** A live probe found casual answers swapping numbers for comparisons that were wrong ("your side have had more of the ball" for a side on 43%). The evidence check reads numbers, not comparisons in words. The Explainer now has a rule: more of the ball, more shots or the better of the chances only for the team whose fact is higher, and say when it is only the recent spell. In 6 casual probes after the rule, every comparison matched the facts. It is a prompt rule, not a check. *(Superseded: "Comparisons in words are checked" below makes it a check.)*
 
 ### Recap, interface, crowd
 
