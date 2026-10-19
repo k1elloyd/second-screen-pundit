@@ -129,6 +129,7 @@ azd also asks for a subscription and a location on first use. The app deploys to
 
 ## Costs and caps
 
+- **Budget.** Azure budget alert at £75, plus in-app daily caps.
 - **Measured cost.** One live match with three questions makes about 34 model calls and speaks about 1,800 characters. That's roughly $0.11–0.13 at list prices.
 - **Spend to date.** Azure spend for October to 18 Oct was £4.45.
 - **Daily caps** (UTC, in memory): 450 model calls and 45,000 TTS characters on the live app. That's about 13 live matches a day, and at most about $2.10 a day of usage.

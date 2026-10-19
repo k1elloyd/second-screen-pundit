@@ -512,6 +512,7 @@ def test_every_cached_line_passes_the_banned_phrase_and_evidence_checks(match_id
     for line in cached.commentary:
         as_of = max(seq[event_id] for event_id in line.event_ids)
         published = line.model_copy(update={"text": name_teams(line.text, info)})
+        assert not _NICKNAMES.search(published.text), published.text
         assert banned_phrase_hits(published.text, info, _goal_sides(events, as_of)) == [], (
             published.text
         )
@@ -529,7 +530,27 @@ def test_every_cached_line_passes_the_banned_phrase_and_evidence_checks(match_id
         assert banned_phrase_hits(text, info, _goal_sides(events, events[-1].seq)) == [], text
 
 
-_NICKNAMES = re.compile(r"\b(?:the home side|the visitors|the hosts|the home team)\b", re.IGNORECASE)
+# Generic stand-ins for a team's name: cached lines, recaps, answers and questions name the team.
+_NICKNAMES = re.compile(
+    r"\b(?:the\s+)?(?:home|away|visiting)\s+"
+    r"(?:side|team|defence|defense|goals?|supporters|fans|end)\b"
+    r"|\bthe\s+(?:visitors|hosts|opposition)\b",
+    re.IGNORECASE,
+)
+
+
+def test_the_generic_team_pattern_catches_each_stand_in() -> None:
+    for text in (
+        "The home side need a response.",
+        "It stretches the visitors.",
+        "The away team respond.",
+        "Another home goal.",
+        "The logged away goals.",
+        "Leaving the home defence to regroup.",
+        "The hosts press.",
+    ):
+        assert _NICKNAMES.search(text), text
+    assert not _NICKNAMES.search("Ashbridge Rovers refuse to let the match drift away.")
 
 
 @pytest.mark.parametrize("match_id", ["m01", "m02", "m03"])
@@ -546,6 +567,8 @@ def test_cached_recaps_and_answers_use_team_names_full_then_short(match_id: str)
         *(moment.text for moment in recap.key_moments),
         *(question.answer for question in cached.questions),
     ]
+    for question in cached.questions:
+        assert not _NICKNAMES.search(question.question), question.question
     for text in texts:
         assert not _NICKNAMES.search(text), text
         assert banned_phrase_hits(text, info, _goal_sides(events, events[-1].seq)) == [], text

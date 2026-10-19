@@ -61,6 +61,9 @@ SSE_RETRY_MILLISECONDS = 1000
 WARMUP_RETRY_SECONDS: tuple[float, ...] = (5, 15, 30, 60)
 # Least real time between colour-line attempts; each attempt costs about a second of CPU.
 COLOUR_RETRY_SECONDS = 2.0
+# A tactical or colour line whose window ended more match minutes than this before the latest
+# published line is dropped: it would read out of order in the feed.
+STALE_LINE_MINUTES = 2
 WARMUP_NOTICE = (
     "The live pundit isn't available right now, so this match uses pre-written commentary "
     "with audio off. Live commentary returns as soon as it reconnects."
@@ -130,6 +133,8 @@ class ReplaySession:
     colour_attempted_at: float = -math.inf
     viewer_line_state_revision: int = -1
     pending_real_events: set[int] = field(default_factory=set)
+    # The match minute of the latest line published to the viewer, for the stale-line rule.
+    latest_line_minute: int | None = None
     dispatcher: LiveDispatcher | None = None
     dispatch_source: AsyncIterator[Event] | None = None
     viewer_source: AsyncIterator[Event] | None = None
@@ -196,6 +201,20 @@ class QuestionRateLimiter:
                 )
         for key, _limit in limits:
             self._requests[key].append(current)
+
+
+def is_stale_line(path: str, minute: int, latest_line_minute: int | None) -> bool:
+    """A tactical or colour line about a window that ended well before the latest line.
+
+    A slow tactical window (or a colour line) can be ready after a later line has gone out;
+    published then, the feed would read 24' after 29'. Fast-path lines (goals, cards,
+    substitutions, formation changes, big chances) are never stale.
+    """
+    return (
+        path != "fast_path"
+        and latest_line_minute is not None
+        and latest_line_minute - minute > STALE_LINE_MINUTES
+    )
 
 
 def _client_ip(request: Request) -> str:
@@ -617,6 +636,23 @@ def create_app(
                 if audio_task is not None and not audio_task.done():
                     audio_task.cancel()
                 return False
+            if is_stale_line(outcome.path, outcome.minute, session.latest_line_minute):
+                logger.info(
+                    "stale_line_dropped match_id=%s line_id=%s minute=%d latest_line_minute=%s "
+                    "source=%s",
+                    session.info.match_id,
+                    line.line_id,
+                    outcome.minute,
+                    session.latest_line_minute,
+                    line.source,
+                )
+                audio_task = session.line_audio_tasks.pop(line.line_id, None)
+                if audio_task is not None and not audio_task.done():
+                    audio_task.cancel()
+                return False
+            # Checked and recorded under the release lock, so two lines can't both pass
+            # against the same latest minute.
+            session.latest_line_minute = max(session.latest_line_minute or 0, outcome.minute)
         public_line_id = f"{session.replay_id}-{line.line_id}"
         # The side the line is about, for the page's My team accent: a must-say event's team,
         # or the one team behind a tactical window's signals. None for both or neither.

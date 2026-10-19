@@ -12,7 +12,7 @@
     },
     {
       "line_id": "m01-l002",
-      "text": "Port Calder lead 1-0 after turning a decisive attack into a breakthrough, leaving the home defence to regroup.",
+      "text": "Port Calder lead 1-0 after turning a decisive attack into a breakthrough, leaving the Ashbridge Rovers defence to regroup.",
       "insight_id": "m01-i0395",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m01-e0394", "m01-e0395"],
@@ -28,7 +28,7 @@
     },
     {
       "line_id": "m01-l004",
-      "text": "Port Calder lead 2-0 after making their pressure count again, and the home side need a response.",
+      "text": "Port Calder lead 2-0 after making their pressure count again, and Ashbridge Rovers need a response.",
       "insight_id": "m01-i1045",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m01-e1044", "m01-e1045"],
@@ -52,7 +52,7 @@
     },
     {
       "line_id": "m01-l007",
-      "text": "Ashbridge Rovers now commit to a more aggressive shape, with the back three giving them another way to stretch the visitors.",
+      "text": "Ashbridge Rovers now commit to a more aggressive shape, with the back three giving them another way to stretch Port Calder FC.",
       "insight_id": "m01-i1235",
       "fact_ids": ["formation_at:home_formation"],
       "event_ids": ["m01-e1235"],
@@ -76,7 +76,7 @@
     },
     {
       "line_id": "m01-l010",
-      "text": "Ashbridge Rovers score again, and the game has become a much tighter contest as the home side turn their pressure into another breakthrough.",
+      "text": "Ashbridge Rovers score again, and the game has become a much tighter contest as Ashbridge turn their pressure into another breakthrough.",
       "insight_id": "m01-i1392",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m01-e1391", "m01-e1392"],
@@ -92,7 +92,7 @@
     },
     {
       "line_id": "m01-l012",
-      "text": "Ashbridge Rovers keep pushing and find another goal, completing a remarkable swing in momentum after the visitors had controlled the earlier scoring.",
+      "text": "Ashbridge Rovers keep pushing and find another goal, completing a remarkable swing in momentum after Port Calder FC had controlled the earlier scoring.",
       "insight_id": "m01-i1513",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m01-e1512", "m01-e1513"],
@@ -116,7 +116,7 @@
     },
     {
       "line_id": "m01-l015",
-      "text": "Port Calder began with the advantage, but the home side have transformed the ending through a new shape and a sustained run of incisive attacks.",
+      "text": "Port Calder FC began with the advantage, but Ashbridge Rovers have transformed the ending through a new shape and a sustained run of incisive attacks.",
       "insight_id": "m01-i1513",
       "fact_ids": ["match_state:score", "formation_at:home_formation"],
       "event_ids": ["m01-e1235", "m01-e1513"],
@@ -125,14 +125,14 @@
   ],
   "questions": [
     {
-      "question": "What changed before the home side came back?",
+      "question": "What changed before Ashbridge Rovers came back?",
       "answer": "Ashbridge Rovers changed their formation before the later goals, and the match log records the scoring events behind the recovery.",
       "fact_ids": ["match_state:score", "formation_at:home_formation"],
       "event_ids": ["m01-e1235", "m01-e1271", "m01-e1392", "m01-e1513"]
     },
     {
       "question": "How did Port Calder take control early?",
-      "answer": "The logged away goals put Port Calder FC in front before Ashbridge Rovers reshaped their approach.",
+      "answer": "Early goals put Port Calder FC in front before Ashbridge Rovers reshaped their approach.",
       "fact_ids": ["match_state:score", "formation_at:home_formation"],
       "event_ids": ["m01-e0395", "m01-e1045", "m01-e1235"]
     }

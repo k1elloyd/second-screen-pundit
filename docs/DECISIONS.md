@@ -1033,3 +1033,29 @@ The lines' comparisons ("Ashbridge Rovers have the edge in possession now, up to
 **Known limitation: the spell rule is lenient.** A comparison passes if it is true for the match so far, the last 10 minutes or the last 15, so near full time both teams can pass the same phrase: one on the match total, the other on the late spell (at m01's full time, "more of the ball" passes for either side). Kept on purpose: the lines and answers are written from the 10-minute signals or the 15-minute snapshot, and a stricter match-only rule would reject true descriptions of the current spell. The check catches claims that are false on every measure, like the 43% case; it does not pick the better of two true readings.
 
 **Answers rejected before the evidence check are logged.** `answer_rejected match_id=… as_of=… reason=… attempt=N detail=…`, where reason is `truncated` or `agent_error` (the agent call raised), `parse` (the reply isn't a valid ExplainerReply), or `empty`, `word_limit` (over 80 words) or `unknown_fact_id` (from the reply checks; several are comma-joined). The detail is the validation message (at most 240 characters) or the exception's class name. Profile and comparison failures keep their own lines (`question_profile_failed`, `comparison_failed`). Test: `test_answers_rejected_before_the_evidence_check_are_logged_with_reason_and_attempt`.
+
+## Feed order, cached wording, crowd babble (19 Oct 2026)
+
+**Stale lines.** At publish, a tactical or colour line whose window ended more than `STALE_LINE_MINUTES` (2) match minutes before the latest published line is dropped and logged as `stale_line_dropped`; fast-path lines never are (`api.is_stale_line`, checked and recorded under the release lock). A slow tactical window had published a 24' line after a 29' colour line. Test: `tests/test_feed_order.py` (a full m01 replay with 3-second tactical windows drops the late 57', 72' and 84' lines and publishes every fast-path line).
+
+**Cached wording.** "The home side", "the visitors", "the home team", "the home defence", "another home goal" and "the logged away goals" are replaced with team names in the cached lines, answers and the m01 question. The cached-content tests fail on any home/away/visiting + side/team/defence/goal/supporters/fans/end, "the visitors", "the hosts" or "the opposition".
+
+**Crowd: a babble, rendered ahead.** The noise layers are replaced with a babble scene:
+- **Voices:** 24 voices, each with its own syllable-shaped noise (3–6 Hz, some syllables silent). Each runs through two band-pass formants (300–800 Hz and 900–2,500 Hz) that glide to new targets every 2–5 s, with slow fades in and out, spread across the stereo field.
+- **Rumble:** under 120 Hz.
+- **Reverb:** a convolver with a 2.5-second decaying-noise impulse, 35% wet, on the whole crowd bus.
+- **Murmurs:** swells of 5–15 s at random times, applied live on the crowd only.
+
+Played live, that graph cost about 18–20% of a desktop core (offline render time against audio time, Chromium). The old bed cost about 3–4%. About 7 points of the new graph's cost is the convolver and 5–7 points the voices, so no live version fits 5% on a phone. The scene is therefore rendered once per page, at load and in the background, at 16 kHz, into two loops of 17 s and 29 s with 12 voices each. Each loop's last 3 s is crossfaded over its start, so there's no seam and the reverb is already full. Together they repeat only about every 8 minutes.
+
+**Measurements (Chromium):**
+
+| Measure | Result |
+| :-- | :-- |
+| Runtime, desktop | about 1.3% of a core for the two loops, against 4.2% for the old bed in the same run |
+| Pre-render, desktop | 3–6 s, off the main thread |
+| Pre-render, 4× CPU throttle | ready 3.7–4.9 s after load; longest main-thread task 120–230 ms (the voice buffers are built three at a time with a pause between; a sine table replaced a sine per sample) |
+| Loudness at the base gain | `CROWD_BED_TRIM` 2.2 brings the babble within 1% of the old bed's RMS (0.00839 against 0.00828, 8 renders each) |
+| Level and ducking | unchanged: base gain 0.04, ducked 0.01, released 0.04, checked on the page |
+
+Not measured: a real phone in Chrome's performance panel.

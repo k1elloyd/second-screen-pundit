@@ -4,7 +4,7 @@
   "commentary": [
     {
       "line_id": "m02-l001",
-      "text": "Port Calder make the breakthrough, giving the home side an early foothold and setting up a demanding response for Merehaven Athletic.",
+      "text": "Port Calder make the breakthrough, giving themselves an early foothold and setting up a demanding response for Merehaven Athletic.",
       "insight_id": "m02-i0463",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m02-e0462", "m02-e0463"],
@@ -12,7 +12,7 @@
     },
     {
       "line_id": "m02-l002",
-      "text": "Port Calder are shown a red card, a major turning point that immediately changes the home side's task without the ball.",
+      "text": "Port Calder are shown a red card, a major turning point that immediately changes Port Calder's task without the ball.",
       "insight_id": "m02-i0651",
       "fact_ids": [],
       "event_ids": ["m02-e0651"],
@@ -20,7 +20,7 @@
     },
     {
       "line_id": "m02-l003",
-      "text": "The home team respond by reshaping their formation, looking to protect the middle while keeping an outlet available for a counter.",
+      "text": "Port Calder FC respond by reshaping their formation, looking to protect the middle while keeping an outlet available for a counter.",
       "insight_id": "m02-i0669",
       "fact_ids": ["formation_at:home_formation"],
       "event_ids": ["m02-e0669"],
@@ -28,7 +28,7 @@
     },
     {
       "line_id": "m02-l004",
-      "text": "Merehaven Athletic take advantage of the open space and score, testing Port Calder's revised structure as the visitors look to extend their control.",
+      "text": "Merehaven Athletic take advantage of the open space and score, testing Port Calder FC's revised structure as Merehaven look to extend their control.",
       "insight_id": "m02-i0928",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m02-e0927", "m02-e0928"],
@@ -44,7 +44,7 @@
     },
     {
       "line_id": "m02-l006",
-      "text": "Merehaven Athletic lead 2-1 after finishing the move with a goal, while the home side's reshaped formation remains visible.",
+      "text": "Merehaven Athletic lead 2-1 after finishing the move with a goal, while Port Calder FC's reshaped formation remains visible.",
       "insight_id": "m02-i1418",
       "fact_ids": ["match_state:score", "formation_at:home_formation"],
       "event_ids": ["m02-e0669", "m02-e1418"],

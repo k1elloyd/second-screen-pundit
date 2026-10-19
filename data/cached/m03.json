@@ -4,7 +4,7 @@
   "commentary": [
     {
       "line_id": "m03-l001",
-      "text": "Ashbridge Rovers open the scoring, giving the home side a foothold and making Merehaven Athletic adjust to the match's first goal.",
+      "text": "Ashbridge Rovers open the scoring, giving themselves a foothold and making Merehaven Athletic adjust to the match's first goal.",
       "insight_id": "m03-i0379",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m03-e0379"],
@@ -20,7 +20,7 @@
     },
     {
       "line_id": "m03-l003",
-      "text": "Ashbridge Rovers keep finding dangerous territory, and another home goal gives the match a clear direction.",
+      "text": "Ashbridge Rovers keep finding dangerous territory, and another Ashbridge goal gives the match a clear direction.",
       "insight_id": "m03-i1325",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m03-e1324", "m03-e1325"],
@@ -28,7 +28,7 @@
     },
     {
       "line_id": "m03-l004",
-      "text": "Merehaven Athletic are forced into another defensive response as the home side turn a strong spell into a further scoring opportunity.",
+      "text": "Merehaven Athletic are forced into another defensive response as Ashbridge turn a strong spell into a further scoring opportunity.",
       "insight_id": "m03-i1325",
       "fact_ids": ["match_state:score"],
       "event_ids": ["m03-e1324", "m03-e1325"],
