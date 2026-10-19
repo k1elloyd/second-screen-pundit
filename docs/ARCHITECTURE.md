@@ -94,4 +94,6 @@ flowchart TB
 
 **Managed identity.** One user-assigned identity holds four roles, assigned by GUID and scoped to each resource: Foundry User, Cognitive Services Speech User, AcrPull and Monitoring Metrics Publisher. Local auth is disabled on Foundry, Speech and Application Insights, the registry's admin user is off, and the container app has no secrets.
 
+**MCP server (local).** `mcp_server.py` serves five read-only analytics tools (`list_matches`, `match_state`, `key_moments`, `possession_window`, `formation_at`) over stdio, for GitHub Copilot in VS Code or an Agent Framework agent on a developer's machine. Each wraps the same analytics function the Analyst calls and returns its facts with their IDs, cut off at the requested minute. It imports only the engine and the analytics: no model, speech or web app code. It isn't part of the running container app: mounted in FastAPI, the MCP session manager slowed the event loop past the robustness test's limit (see DECISIONS.md).
+
 **Application Insights.** Agent Framework emits `invoke_agent`, `chat` and `execute_tool` spans with token counts. The app wraps each live window, question and recap in a `pundit.turn` span with the route, evidence result and viewer profile, and adds spans for speech. No question or answer text goes into telemetry.

@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "second-screen-pundit": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["-m", "second_screen_pundit.mcp_server"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}

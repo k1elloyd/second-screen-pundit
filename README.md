@@ -127,6 +127,53 @@ azd also asks for a subscription and a location on first use. The app deploys to
 3. Start the app: `.venv\Scripts\python.exe -m uvicorn second_screen_pundit.api:app --port 8000 --env-file .env`, then open http://127.0.0.1:8000.
 4. Run the tests: `.venv\Scripts\python.exe -m pytest`. Live Azure tests are excluded by default.
 
+## MCP server (local, read-only)
+
+The analytics tools are also a local [MCP](https://modelcontextprotocol.io) server over stdio, so GitHub Copilot or an Agent Framework agent can query a match with the same cut-off and the same fact IDs the evidence check uses. It runs on your machine, not in the deployed app, and makes no model or speech calls.
+
+| Tool | Returns |
+| :-- | :-- |
+| `list_matches` | The three fictional fixtures: ID, teams, stadium |
+| `match_state(match_id, minute)` | Score, possession, shots, xG, cards and formations through the minute |
+| `key_moments(match_id, up_to_minute, limit=10)` | Goals, red cards, formation changes, big chances, bookings |
+| `possession_window(match_id, minute, window=10)` | Each team's possession over the `window` minutes up to the minute |
+| `formation_at(match_id, minute)` | Both teams' formations and the event that set each one |
+
+Every result lists facts with IDs (`tool:<uuid>:<label>`) and their event IDs, and nothing after the requested minute (0–90). An unknown match or a minute outside the match comes back as a tool error.
+
+**GitHub Copilot in VS Code.** The repository includes [.vscode/mcp.json](.vscode/mcp.json). Open the folder, start `second-screen-pundit` from **MCP: List Servers**, and pick it from the tools in Agent mode:
+
+```json
+{
+  "servers": {
+    "second-screen-pundit": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["-m", "second_screen_pundit.mcp_server"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
+```
+
+On macOS/Linux, change the command in `.vscode/mcp.json` to `${workspaceFolder}/.venv/bin/python` (and in the Agent Framework example below, to `.venv/bin/python`).
+
+**Microsoft Agent Framework.**
+
+```python
+from agent_framework import Agent, MCPStdioTool
+
+async with MCPStdioTool(
+    name="pundit-analytics",
+    command=".venv/Scripts/python.exe",
+    args=["-m", "second_screen_pundit.mcp_server"],
+) as analytics:
+    agent = Agent(client=client, instructions="Answer from the tools' facts only.", tools=analytics)
+    print(await agent.run("In m01, who had more of the ball between minutes 20 and 30?"))
+```
+
+It isn't served from the web app; [DECISIONS.md](docs/DECISIONS.md#mcp-server-local-over-stdio-19-oct-2026) has the measurements.
+
 ## Costs and caps
 
 - **Budget.** Azure budget alert at £75, plus in-app daily caps.
@@ -153,7 +200,7 @@ azd also asks for a subscription and a location on first use. The app deploys to
 ## Future work
 
 - **More languages.** The Explainer and the recap could answer in the viewer's language, with a multilingual voice reading them through Azure AI Speech. The facts and citations wouldn't change. The checks would need their number words and phrase lists in each language.
-- **MCP.** The read-only analytics tools could become an MCP server, so GitHub Copilot or another agent could query a match with the same cut-off and the same citations.
+- **A hosted MCP endpoint.** The MCP server runs locally over stdio. Serving it from the deployed app first needs it out of the app's event loop (see DECISIONS.md).
 
 ## Repository
 
@@ -161,6 +208,7 @@ azd also asks for a subscription and a location on first use. The app deploys to
   - `src/second_screen_pundit/engine/`: the match generator and replay.
   - `src/second_screen_pundit/agents/`: the agents, tools and checks.
   - `src/second_screen_pundit/api.py`: the API.
+  - `src/second_screen_pundit/mcp_server.py`: the local MCP server.
   - `src/second_screen_pundit/web/`: the page.
   - `infra/`: Bicep.
 - **Docs:**

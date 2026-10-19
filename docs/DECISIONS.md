@@ -1069,3 +1069,23 @@ Not measured: a real phone in Chrome's performance panel.
 - **Limiter.** The recording peaks about 26 dB over its average, so a My-team late-goal swell (output 0.196) could take a peak near full scale. A limiter (threshold -3 dB, ratio 20, no knee) after `output` catches those peaks; below the threshold it does nothing.
 - **Loading.** Both files are fetched and decoded at page load (when the crowd is on and not muted) with an OfflineAudioContext, so Start doesn't wait. A failed load is retried on the next Start.
 - **Source files.** The originals stay in `data/audio/`, now git-ignored.
+
+## MCP server: local, over stdio (19 Oct 2026)
+
+`python -m second_screen_pundit.mcp_server` serves five read-only tools over stdio: `list_matches`, `match_state`, `key_moments`, `possession_window` and `formation_at`. Each wraps the existing analytics function and returns its `ToolResult`, so the facts and fact IDs are the ones the agents and the evidence check see (`tool:<uuid>:<label>`, new on every call). A minute is answered at `as_of`, the last event at or before it on the match clock, and the analytics functions read nothing after `as_of`. The data has no stoppage time (every match's clock ends at 90), so minutes are 0–90. `possession_window` covers `minute − window` to `minute`, the convention the tactical signals use. `formation_at` returns both teams. An unknown match or a minute outside the match is a tool error (`isError`), not a crash. The module imports only the engine and the analytics; a test checks that no Agent Framework, Azure, FastAPI, pipeline or speech module is loaded. `.vscode/mcp.json` starts it for GitHub Copilot.
+
+- **`mcp==1.30.0`, not 2.x.** The SDK's current release is 2.3.0, which renames `FastMCP` to `MCPServer`, moves the transport options to the app builders and moves the client to `httpx2`. `agent-framework-core` declares `mcp>=1.24.0,<2` and passes an `httpx.AsyncClient` to the MCP client, so with v2 Agent Framework's MCP tools would break. 1.30.0 is the latest 1.x.
+- **Logging.** FastMCP's constructor calls `logging.basicConfig` (a console handler at INFO on an unconfigured root logger). `build_server` restores the root logger afterwards, so building one in tests changes nothing.
+
+**Tried first, and dropped: Streamable HTTP at `/mcp` on the web app.** It was mounted the way Learn's Container Apps and App Service tutorials and the SDK docs describe: stateless JSON responses, the host app's lifespan entering `session_manager.run()`, an exact `/mcp` route, and the questions limiter with its own 30-a-minute budget. It worked: every tool answered through the SDK's client, and the 429 with `Retry-After` held. But `tests/test_robustness.py::test_colour_lines_are_built_without_blocking_the_event_loop` failed (its limit is a median longest loop gap under 100 ms). Adding one piece at a time to the committed `api.py`, 3 runs a test:
+
+| `api.py` | Longest gap per run |
+| :-- | :-- |
+| Committed (three tests) | 31, 37, 36 · 37, 31, 32 · 35, 36, 29 ms |
+| + MCP endpoint built, + `/mcp` route | 35, 37, 33 · 37, 35, 37 ms |
+| + session manager running in the lifespan | 223, 192, 370 · 138, 202, 156 ms |
+| Session manager in a task of its own instead | 197, 743, 168 · 302, 219, 206 · 210, 240, 217 ms |
+
+With it mounted, the full suite gave 610 passed and 1 failed (this test) in each of two runs. The session manager's `run()` only holds an anyio task group open; why that costs the loop wasn't found in the time allowed, and the test exists to catch exactly that kind of stall in every viewer's stream. So the web app has no MCP route, session manager or limiter, and `api.py` and `config.py` are as committed. **The deployed app is unaffected**: the image installs the `mcp` package and contains the module, but nothing in the app imports or starts it.
+
+Two traps from that attempt, for whoever tries again: with the default host, the SDK's Host allowlist rejects any non-localhost `Host` with 421; and a mount at `/mcp` serves `/mcp/mcp` or redirects `/mcp` to `/mcp/`.
