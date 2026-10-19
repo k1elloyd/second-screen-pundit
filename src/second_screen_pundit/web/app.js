@@ -489,44 +489,28 @@ const CROWD_SWELL_MS = 3000;
 const CROWD_DUCK_RELEASE_MS = 400;
 const CROWD_DUCK_FADE_SECONDS = 0.08;
 const CROWD_LEVEL_FADE_SECONDS = 0.14;
-// The bed is a babble of voice-like sources: noise shaped into syllables, through two band-pass
-// "formant" filters at vowel frequencies that drift, with slow fades and stereo spread; a low
-// rumble; and a stadium reverb on the whole crowd bus. Played live, that graph costs about a
-// fifth of a desktop core (a 2.5-second convolver and 24 voices), far more on a phone, so it is
-// rendered once, ahead of the match, into two seamless loops of different lengths (half the
-// voices each; together they repeat only every few minutes). The match plays just those two
-// loops; murmur swells, the level and the ducking are applied live.
-const CROWD_VOICES = 24;
-// The scene renders at a low rate: its formants are under 2.5 kHz and the rumble under 150 Hz.
-const CROWD_RENDER_RATE = 16000;
-const CROWD_LOOP_SECONDS = [17, 29];
-// Each loop's end is crossfaded over its start, so it has no seam and no reverb gap.
-const CROWD_LOOP_CROSSFADE_SECONDS = 3;
-const CROWD_VOICE_SECONDS = 3.5;
-const CROWD_SYLLABLE_HZ = [3, 6];
-const CROWD_SYLLABLE_PAUSE = 0.18;
-const CROWD_FORMANT_ONE_HZ = [300, 800];
-const CROWD_FORMANT_TWO_HZ = [900, 2500];
-const CROWD_FORMANT_ONE_Q = 4;
-const CROWD_FORMANT_TWO_Q = 6;
-// A formant glides to a new random target every few seconds: a vowel changing.
-const CROWD_FORMANT_MOVE_SECONDS = [2, 5];
-const CROWD_FORMANT_GLIDE_SECONDS = 1.2;
-const CROWD_FADE_SECONDS = [2, 6];
-const CROWD_HOLD_SECONDS = [3, 12];
-const CROWD_REST_SECONDS = [1, 8];
-const CROWD_VOICE_LEVEL = [0.35, 1];
-const CROWD_PAN_WIDTH = 0.9;
-const CROWD_RUMBLE_HZ = 120;
-const CROWD_RUMBLE_GAIN = 0.12;
+// The bed is a crowd recording (see CREDITS.md), looped without a seam: at each loop point
+// two copies overlap for CROWD_LOOP_CROSSFADE_SECONDS with an equal-power crossfade. Goals add
+// a recorded roar. Both feed `output`, whose gain alone sets the level and the ducking.
+const CROWD_BED_URL = "/static/audio/crowd-bed.mp3";
+const CROWD_ROAR_URL = "/static/audio/goal-roar.mp3";
+const CROWD_LOOP_CROSSFADE_SECONDS = 2;
+// Copies of the bed are scheduled this far ahead of the audio clock, checked every second.
+const CROWD_SCHEDULE_AHEAD_SECONDS = 10;
+const CROWD_SCHEDULE_MS = 1000;
+const CROWD_FADE_POINTS = 64;
+// The recording is quiet (about -36 dB RMS): this brings it to the loudness of the bed it
+// replaced, so CROWD_BASE_GAIN and the ducking levels mean what they did.
+const CROWD_BED_TRIM = 13.2;
+// The roar's peak sits about 4 dB over the bed; goalSwellFactor scales it for My team.
+const CROWD_ROAR_GAIN = 1.3;
+// A limiter on the crowd output catches the recording's rare peaks when a goal swell lifts it;
+// below the threshold it does nothing, so the level and the ducking are unchanged.
+const CROWD_LIMIT_THRESHOLD_DB = -3;
+const CROWD_LIMIT_RATIO = 20;
 const CROWD_MURMUR_SECONDS = [5, 15];
 const CROWD_MURMUR_GAP_SECONDS = [12, 40];
 const CROWD_MURMUR_PEAK = [1.25, 1.6];
-const CROWD_REVERB_SECONDS = 2.5;
-const CROWD_REVERB_WET = 0.35;
-// Brings the babble to the loudness of the noise bed it replaced, so CROWD_BASE_GAIN and the
-// ducking levels mean what they did (measured: rendered RMS of both beds at the base gain).
-const CROWD_BED_TRIM = 2.2;
 const WHISTLE_SHORT_SECONDS = 0.16;
 const WHISTLE_LONG_SECONDS = 0.42;
 const WHISTLE_GAP_SECONDS = 0.12;
@@ -540,214 +524,35 @@ function between(low, high) {
   return low + Math.random() * (high - low);
 }
 
-// A voice's noise, shaped into syllables at its own rate: each syllable a smooth rise and fall
-// of random strength, some of them silent. The buffer holds whole syllables, so it loops
-// without a click.
-function crowdVoiceBuffer(context) {
-  const rate = context.sampleRate;
-  const syllableHz = between(...CROWD_SYLLABLE_HZ);
-  const lengths = [];
-  let total = 0;
-  while (total < CROWD_VOICE_SECONDS * rate) {
-    const length = Math.round((rate / syllableHz) * between(0.75, 1.25));
-    lengths.push(length);
-    total += length;
+// An equal-power fade: sine rising, or cosine falling, so the two overlapping copies' squares
+// add up to 1 throughout the crossfade.
+function crowdFadeCurve(rising) {
+  const curve = new Float32Array(CROWD_FADE_POINTS);
+  for (let index = 0; index < curve.length; index += 1) {
+    const angle = (Math.PI / 2) * (index / (curve.length - 1));
+    curve[index] = rising ? Math.sin(angle) : Math.cos(angle);
   }
-  const buffer = context.createBuffer(1, total, rate);
-  const samples = buffer.getChannelData(0);
-  const shape = crowdSyllableShape();
-  let offset = 0;
-  for (const length of lengths) {
-    const strength = Math.random() < CROWD_SYLLABLE_PAUSE ? 0 : between(0.4, 1);
-    const step = shape.length / length;
-    for (let index = 0; index < length; index += 1) {
-      samples[offset + index] = (Math.random() * 2 - 1) * strength * shape[(index * step) | 0];
-    }
-    offset += length;
-  }
-  return buffer;
+  return curve;
 }
 
-// A syllable's rise and fall (sin squared), as a table: a sine per sample made the 24 voices
-// take a fifth of a second to build.
-let crowdSyllableTable = null;
-function crowdSyllableShape() {
-  if (!crowdSyllableTable) {
-    crowdSyllableTable = new Float32Array(1024);
-    for (let index = 0; index < crowdSyllableTable.length; index += 1) {
-      crowdSyllableTable[index] = Math.sin((Math.PI * index) / crowdSyllableTable.length) ** 2;
-    }
-  }
-  return crowdSyllableTable;
-}
-
-// Brown-ish noise for the rumble; the low-pass filter after it hides the loop's seam.
-function crowdRumbleBuffer(context) {
-  const rate = context.sampleRate;
-  const buffer = context.createBuffer(1, rate * 3, rate);
-  const samples = buffer.getChannelData(0);
-  let value = 0;
-  for (let index = 0; index < samples.length; index += 1) {
-    value = value * 0.995 + (Math.random() * 2 - 1) * 0.1;
-    samples[index] = Math.max(-1, Math.min(1, value));
-  }
-  return buffer;
-}
-
-// A stadium echo: 2.5 seconds of stereo noise decaying to about -60 dB, at the context's own
-// rate (a convolver needs it).
-function crowdReverbImpulse(context) {
-  const rate = context.sampleRate;
-  const length = Math.round(rate * CROWD_REVERB_SECONDS);
-  const buffer = context.createBuffer(2, length, rate);
-  for (let channel = 0; channel < 2; channel += 1) {
-    const samples = buffer.getChannelData(channel);
-    for (let index = 0; index < length; index += 1) {
-      samples[index] = (Math.random() * 2 - 1) * Math.exp((-6.9 * index) / length);
-    }
-  }
-  return buffer;
-}
-
-// One voice over `seconds`: fade in to a random level, hold, fade out, rest, again; its
-// formants glide to new vowel targets every few seconds. Scheduled up front, since the scene
-// is rendered offline.
-function scheduleCrowdVoice(voice, seconds) {
-  const level = voice.level.gain;
-  let time = 0;
-  let speaking = Math.random() < 0.6;
-  level.setValueAtTime(speaking ? between(...CROWD_VOICE_LEVEL) : 0, 0);
-  time = speaking ? between(...CROWD_HOLD_SECONDS) : between(...CROWD_REST_SECONDS);
-  while (time < seconds) {
-    speaking = !speaking;
-    const fade = between(...CROWD_FADE_SECONDS);
-    level.setValueAtTime(level.value, time);
-    level.linearRampToValueAtTime(speaking ? between(...CROWD_VOICE_LEVEL) : 0, time + fade);
-    time += fade + (speaking ? between(...CROWD_HOLD_SECONDS) : between(...CROWD_REST_SECONDS));
-  }
-  for (const [filter, range] of [
-    [voice.formantOne, CROWD_FORMANT_ONE_HZ],
-    [voice.formantTwo, CROWD_FORMANT_TWO_HZ],
-  ]) {
-    filter.frequency.setValueAtTime(between(...range), 0);
-    for (let at = between(...CROWD_FORMANT_MOVE_SECONDS); at < seconds;
-      at += between(...CROWD_FORMANT_MOVE_SECONDS)) {
-      filter.frequency.setTargetAtTime(between(...range), at, CROWD_FORMANT_GLIDE_SECONDS / 3);
-    }
-  }
-}
-
-// The crowd scene on `context`, into `destination`: the given voices (by index, for their
-// place in the stereo field), the rumble, and the bus with its reverb.
-function buildCrowdScene(context, destination, voiceIndexes, seconds, voiceBuffers = null) {
-  const bus = context.createGain();
-  bus.gain.value = CROWD_BED_TRIM;
-  const dry = context.createGain();
-  dry.gain.value = 1 - CROWD_REVERB_WET;
-  const wet = context.createGain();
-  wet.gain.value = CROWD_REVERB_WET;
-  const reverb = context.createConvolver();
-  reverb.buffer = crowdReverbImpulse(context);
-  bus.connect(dry);
-  dry.connect(destination);
-  bus.connect(reverb);
-  reverb.connect(wet);
-  wet.connect(destination);
-
-  const voices = voiceIndexes.map((index, position) => {
-    const source = context.createBufferSource();
-    source.buffer = voiceBuffers ? voiceBuffers[position] : crowdVoiceBuffer(context);
-    source.loop = true;
-    // A slightly different speed per voice shifts its syllable rate and its colour.
-    source.playbackRate.value = between(0.92, 1.08);
-    const formantOne = context.createBiquadFilter();
-    formantOne.type = "bandpass";
-    formantOne.Q.value = CROWD_FORMANT_ONE_Q;
-    const formantTwo = context.createBiquadFilter();
-    formantTwo.type = "bandpass";
-    formantTwo.Q.value = CROWD_FORMANT_TWO_Q;
-    const level = context.createGain();
-    const panner = context.createStereoPanner();
-    // Spread evenly across the field, jittered within each voice's slot.
-    panner.pan.value = CROWD_PAN_WIDTH * (((index + Math.random()) / CROWD_VOICES) * 2 - 1);
-    source.connect(formantOne);
-    source.connect(formantTwo);
-    formantOne.connect(level);
-    formantTwo.connect(level);
-    level.connect(panner);
-    panner.connect(bus);
-    const voice = { formantOne, formantTwo, level, panner };
-    scheduleCrowdVoice(voice, seconds);
-    source.start(0, Math.random() * CROWD_VOICE_SECONDS);
-    return voice;
-  });
-
-  const rumbleSource = context.createBufferSource();
-  rumbleSource.buffer = crowdRumbleBuffer(context);
-  rumbleSource.loop = true;
-  const rumbleFilter = context.createBiquadFilter();
-  rumbleFilter.type = "lowpass";
-  rumbleFilter.frequency.value = CROWD_RUMBLE_HZ;
-  const rumbleGain = context.createGain();
-  rumbleGain.gain.value = CROWD_RUMBLE_GAIN * voiceIndexes.length / CROWD_VOICES;
-  rumbleSource.connect(rumbleFilter);
-  rumbleFilter.connect(rumbleGain);
-  rumbleGain.connect(bus);
-  rumbleSource.start(0);
-  return { voices, reverb, wet, bus };
-}
-
-// Render one loop of the scene and fold its last CROWD_LOOP_CROSSFADE_SECONDS over its start
-// (equal power), so it repeats without a seam and starts with the reverb already full.
-async function renderCrowdLoop(OfflineContext, voiceIndexes, seconds) {
-  const rate = CROWD_RENDER_RATE;
-  const overlap = Math.round(CROWD_LOOP_CROSSFADE_SECONDS * rate);
-  const length = Math.round(seconds * rate);
-  const context = new OfflineContext(2, length + overlap, rate);
-  // The voices' noise, a few at a time with a pause between, so building it on the main
-  // thread never makes one long task (a phone would stutter while the page warms up).
-  const voiceBuffers = [];
-  for (const _ of voiceIndexes) {
-    if (voiceBuffers.length % 3 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
-    voiceBuffers.push(crowdVoiceBuffer(context));
-  }
-  buildCrowdScene(
-    context, context.destination, voiceIndexes, seconds + CROWD_LOOP_CROSSFADE_SECONDS, voiceBuffers,
-  );
-  const rendered = await context.startRendering();
-  const loop = context.createBuffer(2, length, rate);
-  for (let channel = 0; channel < 2; channel += 1) {
-    const source = rendered.getChannelData(channel);
-    const target = loop.getChannelData(channel);
-    target.set(source.subarray(0, length));
-    for (let index = 0; index < overlap; index += 1) {
-      const angle = (Math.PI / 2) * (index / overlap);
-      target[index] = source[index] * Math.sin(angle) + source[length + index] * Math.cos(angle);
-    }
-  }
-  return loop;
-}
-
-// Both loops, rendered once per page in the background. The render itself runs off the main
-// thread; building each loop's scene (its noise buffers) is a short main-thread task, so the
-// loops are built one after the other with a pause between, never as one long task.
-let crowdLoopsPromise = null;
-function prepareCrowdLoops() {
-  if (!crowdLoopsPromise) {
+// Both recordings, fetched and decoded once per page; decoding needs no gesture, so it starts
+// while the page warms up. A failure is forgotten, so the next Start tries again.
+let crowdAudioPromise = null;
+function prepareCrowdAudio() {
+  if (!crowdAudioPromise) {
     const OfflineContext = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    if (!OfflineContext) return Promise.reject(new Error("Offline audio is not supported."));
-    const indexes = [...Array(CROWD_VOICES).keys()];
-    crowdLoopsPromise = (async () => {
-      const loops = [];
-      for (const [loop, seconds] of CROWD_LOOP_SECONDS.entries()) {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        const voices = indexes.filter((index) => index % CROWD_LOOP_SECONDS.length === loop);
-        loops.push(await renderCrowdLoop(OfflineContext, voices, seconds));
-      }
-      return loops;
-    })();
+    if (!OfflineContext) return Promise.reject(new Error("Web Audio is not supported."));
+    const decoder = new OfflineContext(2, 1, 48000);
+    const load = async (url) => {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`${url} returned ${response.status}`);
+      return decoder.decodeAudioData(await response.arrayBuffer());
+    };
+    crowdAudioPromise = Promise.all([load(CROWD_BED_URL), load(CROWD_ROAR_URL)])
+      .then(([bed, roar]) => ({ bed, roar }));
+    crowdAudioPromise.catch(() => { crowdAudioPromise = null; });
   }
-  return crowdLoopsPromise;
+  return crowdAudioPromise;
 }
 
 class CrowdBed {
@@ -767,8 +572,12 @@ class CrowdBed {
     this.whistledKickoffs = new Set();
     this.murmur = null;
     this.murmurTimer = null;
-    this.loops = [];
-    this.loopsReady = null;
+    this.audio = null;
+    this.audioReady = null;
+    this.bedCopies = [];
+    this.bedNextStart = 0;
+    this.bedTimer = null;
+    this.lastRoar = null;
     // "home", "away" or "neutral" (the viewer's My team): its goals swell more.
     this.myTeam = "neutral";
   }
@@ -790,34 +599,88 @@ class CrowdBed {
     const context = this.context;
     const output = context.createGain();
     output.gain.value = 0;
+    const limiter = context.createDynamicsCompressor();
+    limiter.threshold.value = CROWD_LIMIT_THRESHOLD_DB;
+    limiter.knee.value = 0;
+    limiter.ratio.value = CROWD_LIMIT_RATIO;
+    limiter.attack.value = 0.003;
+    limiter.release.value = 0.25;
+    output.connect(limiter);
+    limiter.connect(context.destination);
     const effectsOutput = context.createGain();
     effectsOutput.gain.value = 0.65;
-    output.connect(context.destination);
     effectsOutput.connect(context.destination);
-    // Murmur swells rise and fall on the crowd only; `output` keeps the level and the ducking.
+    // Murmur swells lift the bed only; `output` keeps the level and the ducking.
     const murmur = context.createGain();
     murmur.gain.value = 1;
     murmur.connect(output);
+    const bedLevel = context.createGain();
+    bedLevel.gain.value = CROWD_BED_TRIM;
+    bedLevel.connect(murmur);
+    this.limiter = limiter;
     this.murmur = murmur;
+    this.bedLevel = bedLevel;
     this.output = output;
     this.effectsOutput = effectsOutput;
-    // Usually rendered already, while the page warmed up; otherwise the crowd comes in when
-    // it's ready. The two loops start together and never stop.
-    this.loopsReady = prepareCrowdLoops().then((loops) => {
-      this.loops = loops.map((buffer) => {
-        const source = context.createBufferSource();
-        source.buffer = buffer;
-        source.loop = true;
-        source.connect(murmur);
-        source.start();
-        return source;
-      });
-    }).catch((error) => console.error("Could not prepare the crowd audio.", error));
+    // Usually decoded already, while the page warmed up; otherwise the crowd comes in when
+    // it's ready.
+    this.audioReady = prepareCrowdAudio().then((audio) => {
+      this.audio = audio;
+      this.bedNextStart = context.currentTime;
+      this.scheduleBed();
+    }).catch((error) => console.error("Could not load the crowd audio.", error));
     this.scheduleMurmur();
   }
 
-  // Now and then the whole crowd murmurs louder for 5-15 seconds, then settles. Nothing is
-  // scheduled while the crowd is paused or its context suspended.
+  // Keep copies of the bed scheduled CROWD_SCHEDULE_AHEAD_SECONDS ahead: each starts
+  // CROWD_LOOP_CROSSFADE_SECONDS before the last one ends and crossfades with it. The audio
+  // clock stops while the context is suspended, so nothing piles up while paused.
+  scheduleBed() {
+    clearTimeout(this.bedTimer);
+    const duration = this.audio.bed.duration;
+    const fade = Math.min(CROWD_LOOP_CROSSFADE_SECONDS, duration / 4);
+    while (this.bedNextStart < this.context.currentTime + CROWD_SCHEDULE_AHEAD_SECONDS) {
+      this.playBedCopy(this.bedNextStart, fade, this.bedCopies.length > 0);
+      this.bedNextStart += duration - fade;
+    }
+    this.bedTimer = setTimeout(() => this.scheduleBed(), CROWD_SCHEDULE_MS);
+  }
+
+  playBedCopy(at, fade, fadeIn) {
+    const buffer = this.audio.bed;
+    const source = this.context.createBufferSource();
+    source.buffer = buffer;
+    const level = this.context.createGain();
+    // The first copy starts at full level (`output` fades the crowd in); later ones rise as
+    // the one before falls.
+    if (fadeIn) level.gain.setValueCurveAtTime(crowdFadeCurve(true), at, fade);
+    else level.gain.value = 1;
+    level.gain.setValueCurveAtTime(crowdFadeCurve(false), at + buffer.duration - fade, fade);
+    source.connect(level);
+    level.connect(this.bedLevel);
+    source.start(at);
+    source.stop(at + buffer.duration);
+    this.bedCopies.push({ source, level, at });
+    // Only the playing copy and the next one matter.
+    if (this.bedCopies.length > 4) this.bedCopies.shift();
+  }
+
+  // A goal's roar, through `output` so it follows the level, the swell and the ducking; louder
+  // for My team's goals and quieter for the other side's, as the swell is.
+  playRoar(team) {
+    if (!this.active || !this.enabled || this.muted || !this.context || !this.audio) return;
+    const source = this.context.createBufferSource();
+    source.buffer = this.audio.roar;
+    const level = this.context.createGain();
+    level.gain.value = CROWD_ROAR_GAIN * this.goalSwellFactor(team);
+    source.connect(level);
+    level.connect(this.output);
+    source.start();
+    this.lastRoar = { source, level };
+  }
+
+  // Now and then the bed murmurs louder for 5-15 seconds, then settles. Nothing is scheduled
+  // while the crowd is paused or its context suspended.
   scheduleMurmur() {
     clearTimeout(this.murmurTimer);
     this.murmurTimer = setTimeout(() => {
@@ -922,6 +785,7 @@ class CrowdBed {
 
     if (event.type === "goal") {
       this.swell(((event.clock || 0) >= 75 ? 0.14 : 0.09) * this.goalSwellFactor(event.team));
+      this.playRoar(event.team);
     } else if (event.type === "card" && event.detail?.colour === "red") {
       this.swell(0.06);
     } else if (event.type === "shot" && event.xg != null && event.xg >= 0.3) {
@@ -1198,9 +1062,9 @@ class AudioQueue {
 const audioQueue = new AudioQueue();
 const crowdBed = new CrowdBed();
 audioQueue.onPlaybackChange = (speaking) => crowdBed.setDucked(speaking);
-// Render the crowd loops while the page warms up, so Start doesn't wait for them.
+// Load the crowd recordings while the page warms up, so Start doesn't wait for them.
 if (crowdBed.enabled && !crowdBed.muted) {
-  prepareCrowdLoops().catch((error) => console.error("Could not prepare the crowd audio.", error));
+  prepareCrowdAudio().catch((error) => console.error("Could not load the crowd audio.", error));
 }
 let playbackStateRevision = 0;
 let playbackStateRequests = Promise.resolve();

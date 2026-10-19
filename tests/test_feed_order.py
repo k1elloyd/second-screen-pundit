@@ -9,10 +9,12 @@ from dataclasses import replace
 import pytest
 from fastapi import Request
 
+from second_screen_pundit.agents.dispatcher import LiveDispatcher
 from second_screen_pundit.agents.models import CommentaryLine
 from second_screen_pundit.agents.pipeline import LiveWindowResult
 from second_screen_pundit.api import STALE_LINE_MINUTES, create_app, is_stale_line
 from tests.test_api import _settings
+from tests.test_review3_fixes import _line, _publish
 from tests.test_stream_resume import _TOKENS, _Connection, _faster_clock, _scope, _stream
 
 # Real seconds a tactical window takes. This replay runs at about 0.3 s a match minute, so a
@@ -60,6 +62,14 @@ def test_a_late_tactical_line_is_dropped_and_fast_path_lines_never_are(
     caplog.set_level(logging.INFO, logger="second_screen_pundit")
     _faster_clock(monkeypatch, 10)
     pipeline = _SlowTacticalPipeline()
+    retracted: list[str] = []
+    original_retract = LiveDispatcher.retract_line
+
+    def retract_line(self, line_id: str) -> None:
+        retracted.append(line_id)
+        original_retract(self, line_id)
+
+    monkeypatch.setattr(LiveDispatcher, "retract_line", retract_line)
     settings = replace(_settings(delay=0.2), mode="cached")
     app = create_app(settings=settings, pipeline=pipeline)  # type: ignore[arg-type]
     routes = {route.path: route.endpoint for route in app.routes if hasattr(route, "endpoint")}
@@ -95,6 +105,52 @@ def test_a_late_tactical_line_is_dropped_and_fast_path_lines_never_are(
     assert tactical_written and dropped, "no tactical line was late enough to be dropped"
     assert set(fast_written) <= set(published), "a fast-path line was dropped"
     assert len(published) == len(pipeline.lines) - len(dropped)
-    for message in dropped:
-        line_id = message.split("line_id=")[1].split()[0]
+    dropped_ids = [message.split("line_id=")[1].split()[0] for message in dropped]
+    for line_id in dropped_ids:
         assert pipeline.lines[line_id] == "tactical" and line_id not in published
+    # Every dropped line is taken out of the dispatcher's recent lines.
+    assert retracted == dropped_ids
+
+
+def test_a_dropped_line_no_longer_counts_as_said(monkeypatch: pytest.MonkeyPatch) -> None:
+    import second_screen_pundit.agents.dispatcher as dispatcher_module
+    from second_screen_pundit.engine.generate import generate_match, get_match_info
+
+    first = "Port Calder have more of the ball. Port Calder FC lead 2-1."
+    second = "Port Calder press high now. Port Calder lead 2-1."
+
+    # Control: the first line was seen, so the second loses its repeated score.
+    published = _publish(
+        monkeypatch, [_line(1, first, "tactical"), _line(2, second, "tactical")], window=30
+    )
+    assert published[1] == "Port Calder press high now."
+
+    # The first line is dropped as stale before the second is written: the second keeps its
+    # score, and the first is gone from the lines the clock budget and the Commentator see.
+    monkeypatch.setattr(dispatcher_module, "REPEATED_SCORE_SECONDS", 30)
+    events = generate_match("m01")
+    lines = [_line(1, first, "tactical"), _line(2, second, "tactical")]
+
+    class _Queued:
+        async def comment_on_window(self, *_args, **kwargs) -> LiveWindowResult:
+            prompts.append(kwargs)
+            return LiveWindowResult("commentary", lines.pop(0), None, (), None)
+
+    prompts: list[dict] = []
+    dispatcher = LiveDispatcher(
+        _Queued(), get_match_info("m01"), events, _settings()  # type: ignore[arg-type]
+    )
+
+    async def run() -> None:
+        from second_screen_pundit.agents.dispatcher import WindowOutcome
+
+        await dispatcher._run(WindowOutcome("tactical", events[100], 20), [events[100]], (), None)
+        assert dispatcher._recent_lines == [first]
+        dispatcher.retract_line("m01-l001")
+        await dispatcher._run(WindowOutcome("tactical", events[101], 21), [events[101]], (), None)
+
+    asyncio.run(run())
+    assert dispatcher.outcomes[1].result.line.text == second  # type: ignore[union-attr]
+    assert prompts[1]["recent_lines"] == ()
+    assert dispatcher._recent_lines == [second]
+    assert [entry[1] for entry in dispatcher._published_at] == [second]

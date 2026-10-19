@@ -646,6 +646,10 @@ def create_app(
                     session.latest_line_minute,
                     line.source,
                 )
+                # The viewer never sees it, so it mustn't spend the clock budget or make the
+                # next line drop a score it repeats.
+                if session.dispatcher is not None:
+                    session.dispatcher.retract_line(line.line_id)
                 audio_task = session.line_audio_tasks.pop(line.line_id, None)
                 if audio_task is not None and not audio_task.done():
                     audio_task.cancel()

@@ -56,6 +56,9 @@ class FakeParam {
     this.value = value;
     this.events.push({ kind: "ramp", value, time });
   }
+  setValueCurveAtTime(values, time, duration) {
+    this.events.push({ kind: "curve", values: [...values], time, duration });
+  }
 }
 class FakeNode {
   constructor() {
@@ -75,26 +78,31 @@ class FakeNode {
   play() { this.playCount += 1; return Promise.resolve(); }
   pause() {}
 }
+// The recordings' lengths, as the page's real files have them.
+const FAKE_DURATIONS = { "/static/audio/crowd-bed.mp3": 66, "/static/audio/goal-roar.mp3": 14 };
 class FakeAudioContext {
   constructor() {
     this.sampleRate = 100;
-    this.currentTime = now / 1000;
+    // The audio clock follows the fake time while running and stands still while suspended.
+    this.offset = now / 1000;
+    this.frozenAt = null;
     this.state = "running";
     this.destination = new FakeNode();
-    this.filters = [];
     this.gains = [];
     this.oscillators = [];
-    this.panners = [];
-    this.convolvers = [];
+    this.sources = [];
+    this.compressors = [];
+  }
+  get currentTime() {
+    return this.frozenAt !== null ? this.frozenAt : now / 1000 - this.offset;
   }
   createBuffer(_channels, length) {
     const samples = new Float32Array(length);
     return { getChannelData: () => samples };
   }
-  createBufferSource() { return new FakeNode(); }
-  createBiquadFilter() {
+  createBufferSource() {
     const node = new FakeNode();
-    this.filters.push(node);
+    this.sources.push(node);
     return node;
   }
   createGain() {
@@ -107,40 +115,40 @@ class FakeAudioContext {
     this.oscillators.push(node);
     return node;
   }
-  createConvolver() {
+  createDynamicsCompressor() {
     const node = new FakeNode();
-    this.convolvers.push(node);
+    for (const name of ["threshold", "knee", "ratio", "attack", "release"]) {
+      node[name] = new FakeParam();
+    }
+    this.compressors.push(node);
     return node;
   }
-  createStereoPanner() {
-    const node = new FakeNode();
-    this.panners.push(node);
-    return node;
+  decodeAudioData(data) {
+    return Promise.resolve({ url: data.url, duration: FAKE_DURATIONS[data.url] });
   }
-  resume() { this.state = "running"; return Promise.resolve(); }
-  suspend() { this.state = "suspended"; return Promise.resolve(); }
-}
-// Renders silence of the right length; a test can replace `fill` to give it content.
-class FakeOfflineAudioContext extends FakeAudioContext {
-  constructor(channels, length, rate) {
-    super();
-    this.sampleRate = rate;
-    this.length = length;
-    this.channels = channels;
+  resume() {
+    if (this.frozenAt !== null) this.offset = now / 1000 - this.frozenAt;
+    this.frozenAt = null;
+    this.state = "running";
+    return Promise.resolve();
   }
-  startRendering() {
-    const buffer = this.createBuffer(this.channels, this.length, this.sampleRate);
-    FakeOfflineAudioContext.fill(buffer.getChannelData(0));
-    return Promise.resolve(buffer);
+  suspend() {
+    if (this.frozenAt === null) this.frozenAt = this.currentTime;
+    this.state = "suspended";
+    return Promise.resolve();
   }
 }
-FakeOfflineAudioContext.fill = () => {};
+class FakeOfflineAudioContext extends FakeAudioContext {}
 globalThis.window = { AudioContext: FakeAudioContext, OfflineAudioContext: FakeOfflineAudioContext };
 globalThis.Audio = class extends FakeNode {
   constructor() { super(); this.src = ""; }
 };
 globalThis.document = { querySelector: () => null, querySelectorAll: () => [] };
-globalThis.fetch = () => Promise.resolve();
+const fetched = [];
+globalThis.fetch = (url) => {
+  fetched.push(url);
+  return Promise.resolve({ ok: true, arrayBuffer: () => Promise.resolve({ url }) });
+};
 let audioQueue;
 let crowdBed;
 let state = {
@@ -166,8 +174,7 @@ __PAGE_HIDDEN__
   const queue = audioQueue;
   queue.onPlaybackChange = (speaking) => bed.setDucked(speaking);
   await bed.startInGesture();
-  // The loops are built with timers between their parts: step the fake clock.
-  await settle(bed.loopsReady);
+  await settle(bed.audioReady);
   // Oscillators made after this point are the whistles.
   const crowdOscillators = bed.context.oscillators.length;
   __ACTIONS__
@@ -269,163 +276,153 @@ def test_big_chances_and_red_cards_have_smaller_swells() -> None:
     assert result["redCard"] == pytest.approx(0.06)
 
 
-def test_the_scene_has_24_voices_with_two_formants_spread_in_stereo_and_a_rumble() -> None:
+def test_the_bed_is_the_recording_looped_by_two_copies_with_an_equal_power_crossfade() -> None:
     result = _run("""
-      const context = new FakeOfflineAudioContext(2, 16000, CROWD_RENDER_RATE);
-      const scene = buildCrowdScene(
-        context, context.destination, [...Array(CROWD_VOICES).keys()], 30);
-      const bandpass = context.filters.filter(filter => filter.type === "bandpass");
-      const lowpass = context.filters.filter(filter => filter.type === "lowpass");
-      const firstValue = param => param.events.find(event => event.kind === "set").value;
+      // Play past the first loop point (66 s recording, 2 s crossfade: the next copy at 64 s).
+      for (let second = 0; second < 70; second += 1) advance(1000);
+      const [first, second] = bed.bedCopies;
+      const curve = (copy, kind) => copy.level.gain.events.find(event => event.kind === kind
+        && event.time === second.at);
+      const fadeOut = curve(first, "curve");
+      const fadeIn = curve(second, "curve");
       console.log(JSON.stringify({
-        voices: scene.voices.length,
-        bandpass: bandpass.length,
-        formantOne: scene.voices.map(voice => firstValue(voice.formantOne.frequency)),
-        formantTwo: scene.voices.map(voice => firstValue(voice.formantTwo.frequency)),
-        rumble: lowpass.map(filter => filter.frequency.value),
-        panning: scene.voices.map(voice => voice.panner.pan.value),
-      }));
-    """)
-    assert result["voices"] == 24
-    assert result["bandpass"] == 48
-    assert all(300 <= frequency <= 800 for frequency in result["formantOne"])
-    assert all(900 <= frequency <= 2500 for frequency in result["formantTwo"])
-    # The rumble: one low-pass under 150 Hz.
-    assert len(result["rumble"]) == 1 and result["rumble"][0] < 150
-    panning = sorted(result["panning"])
-    assert all(abs(pan) <= 0.9 for pan in panning)
-    assert panning[0] < -0.75 and panning[-1] > 0.75
-    # Evenly spread: no gap between neighbouring voices wider than two slots.
-    assert max(right - left for left, right in zip(panning, panning[1:])) < 4 * 0.9 / 24
-
-
-def test_each_voice_pulses_in_whole_syllables_at_three_to_six_per_second() -> None:
-    result = _run("""
-      const context = new FakeOfflineAudioContext(2, 16000, CROWD_RENDER_RATE);
-      const voices = [];
-      for (let index = 0; index < 20; index += 1) {
-        const samples = crowdVoiceBuffer(context).getChannelData(0);
-        // Count the bursts between silent runs, in windows of 1 ms (16 samples).
-        let bursts = 0;
-        let inBurst = false;
-        for (let start = 0; start + 16 <= samples.length; start += 16) {
-          let peak = 0;
-          for (let offset = 0; offset < 16; offset += 1) {
-            peak = Math.max(peak, Math.abs(samples[start + offset]));
-          }
-          if (peak > 0.02 && !inBurst) { bursts += 1; inBurst = true; }
-          if (peak <= 0.02) inBurst = false;
-        }
-        voices.push({
-          seconds: samples.length / CROWD_RENDER_RATE,
-          first: samples[0], last: samples.at(-1), bursts,
-        });
-      }
-      console.log(JSON.stringify(voices));
-    """)
-    for voice in result:
-        assert 3.5 <= voice["seconds"] < 3.5 + 1 / 3 * 1.25 + 0.01
-        # Whole syllables: the loop starts and ends at zero, so it has no click.
-        assert voice["first"] == 0 and abs(voice["last"]) < 0.01
-        # 3-6 syllables a second, some silent: between 2 and 7.5 bursts a second.
-        assert 2 * voice["seconds"] <= voice["bursts"] <= 7.5 * voice["seconds"]
-
-
-def test_voices_fade_in_and_out_and_their_formants_drift_through_the_loop() -> None:
-    result = _run("""
-      const context = new FakeOfflineAudioContext(2, 16000, CROWD_RENDER_RATE);
-      const scene = buildCrowdScene(context, context.destination, [0, 1, 2, 3, 4, 5], 60);
-      console.log(JSON.stringify(scene.voices.map(voice => ({
-        ramps: voice.level.gain.events.filter(event => event.kind === "ramp")
-          .map(event => [event.time, event.value]),
-        moves: voice.formantOne.frequency.events.filter(event => event.kind === "target")
-          .map(event => [event.time, event.value]),
-        movesTwo: voice.formantTwo.frequency.events.filter(event => event.kind === "target")
-          .map(event => event.value),
-      }))));
-    """)
-    for voice in result:
-        levels = [value for _, value in voice["ramps"]]
-        # Over a minute: several fades, alternating between silence and a speaking level.
-        assert len(levels) >= 3
-        assert any(value == 0 for value in levels)
-        assert any(0.35 <= value <= 1 for value in levels)
-        times = [time for time, _ in voice["moves"]]
-        gaps = [later - earlier for earlier, later in zip(times, times[1:])]
-        assert len(times) >= 10 and all(2 <= gap <= 5 for gap in gaps)
-        assert all(300 <= value <= 800 for _, value in voice["moves"])
-        assert all(900 <= value <= 2500 for value in voice["movesTwo"])
-
-
-def test_the_crowd_bus_has_a_35_per_cent_stadium_reverb() -> None:
-    result = _run("""
-      const context = new FakeOfflineAudioContext(2, 16000, CROWD_RENDER_RATE);
-      const scene = buildCrowdScene(context, context.destination, [0, 1], 20);
-      console.log(JSON.stringify({
-        convolvers: context.convolvers.length,
-        impulseSeconds: scene.reverb.buffer.getChannelData(0).length / context.sampleRate,
-        wet: scene.wet.gain.value,
-        wetToOutput: scene.wet.connections.includes(context.destination),
-        busToReverb: scene.bus.connections.includes(scene.reverb),
-      }));
-    """)
-    assert result == {
-        "convolvers": 1, "impulseSeconds": 2.5, "wet": pytest.approx(0.35),
-        "wetToOutput": True, "busToReverb": True,
-    }
-
-
-def test_two_loops_of_half_the_voices_each_fold_their_end_over_their_start() -> None:
-    result = _run("""
-      // The rendered audio counts up, so the fold can be read back exactly.
-      FakeOfflineAudioContext.fill = data => data.forEach((_, index) => { data[index] = index; });
-      const loop = await settle(renderCrowdLoop(FakeOfflineAudioContext, [0, 2, 4], 17));
-      const samples = loop.getChannelData(0);
-      const length = 17 * CROWD_RENDER_RATE;
-      const overlap = CROWD_LOOP_CROSSFADE_SECONDS * CROWD_RENDER_RATE;
-      console.log(JSON.stringify({
-        seconds: samples.length / CROWD_RENDER_RATE,
-        start: samples[0], expectedStart: length,
-        middle: samples[overlap + 5], expectedMiddle: overlap + 5,
-        loops: bed.loops.map(source => ({
-          seconds: source.buffer.getChannelData(0).length / CROWD_RENDER_RATE,
-          loop: source.loop, toMurmur: source.connections.includes(bed.murmur),
-        })),
+        fetched,
+        copies: bed.bedCopies.map(copy => ({ at: copy.at, stop: copy.source.stoppedAt })),
+        firstStartsAtFull: first.level.gain.value,
+        fadeOut: { time: fadeOut.time, duration: fadeOut.duration, values: fadeOut.values },
+        fadeIn: { time: fadeIn.time, duration: fadeIn.duration, values: fadeIn.values },
+        toBed: bed.bedCopies.every(copy => copy.level.connections.includes(bed.bedLevel)),
+        trim: bed.bedLevel.gain.value,
+        bedToMurmur: bed.bedLevel.connections.includes(bed.murmur),
         murmurToOutput: bed.murmur.connections.includes(bed.output),
         crowdOscillators: bed.context.oscillators.length,
       }));
     """)
-    # Sample 0 is the rendered end (sample `length`); after the overlap it's the render itself.
-    assert result["seconds"] == 17
-    assert result["start"] == result["expectedStart"]
-    assert result["middle"] == result["expectedMiddle"]
-    assert result["loops"] == [
-        {"seconds": 17, "loop": True, "toMurmur": True},
-        {"seconds": 29, "loop": True, "toMurmur": True},
-    ]
-    assert result["murmurToOutput"] is True
+    assert result["fetched"] == ["/static/audio/crowd-bed.mp3", "/static/audio/goal-roar.mp3"]
+    # Each copy plays the whole recording; the next starts 2 s before the last one ends.
+    assert result["copies"][:2] == [{"at": 0, "stop": 66}, {"at": 64, "stop": 130}]
+    assert result["firstStartsAtFull"] == 1
+    assert result["fadeOut"]["time"] == 64 and result["fadeOut"]["duration"] == 2
+    assert result["fadeIn"]["time"] == 64 and result["fadeIn"]["duration"] == 2
+    falling, rising = result["fadeOut"]["values"], result["fadeIn"]["values"]
+    assert falling[0] == pytest.approx(1) and falling[-1] == pytest.approx(0, abs=1e-6)
+    assert rising[0] == pytest.approx(0) and rising[-1] == pytest.approx(1)
+    # Equal power: the two copies' squares add up to 1 all the way through the crossfade.
+    assert all(out**2 + into**2 == pytest.approx(1, abs=1e-6) for out, into in zip(falling, rising))
+    assert result["toBed"] is True
+    assert result["trim"] == pytest.approx(13.2)
+    assert result["bedToMurmur"] is True and result["murmurToOutput"] is True
     assert result["crowdOscillators"] == 0
 
 
-def test_murmurs_swell_and_settle_only_while_the_crowd_is_running() -> None:
+def test_no_copies_pile_up_while_the_crowd_is_paused() -> None:
+    result = _run("""
+      bed.pause();
+      const copies = bed.bedCopies.length;
+      for (let second = 0; second < 200; second += 1) advance(1000);
+      const whilePaused = bed.bedCopies.length;
+      await bed.resumeInGesture();
+      for (let second = 0; second < 70; second += 1) advance(1000);
+      console.log(JSON.stringify({
+        copies, whilePaused, afterResume: bed.bedCopies.map(copy => copy.at),
+      }));
+    """)
+    assert result["copies"] == result["whilePaused"] == 1
+    # The audio clock stood still while paused, so the next copy still comes 64 s in.
+    assert result["afterResume"] == [0, 64]
+
+
+def test_goals_play_the_roar_louder_for_my_team_and_other_moments_only_swell() -> None:
+    result = _run("""
+      const roars = [];
+      const goal = (team) => {
+        bed.lastRoar = null;
+        bed.handleEvent({ type: "goal", clock: 30, team });
+        roars.push(bed.lastRoar && {
+          gain: bed.lastRoar.level.gain.value,
+          toOutput: bed.lastRoar.level.connections.includes(bed.output),
+          buffer: bed.lastRoar.source.buffer.url,
+        });
+      };
+      goal("home");
+      bed.setMyTeam("home");
+      goal("home");
+      goal("away");
+      bed.lastRoar = null;
+      bed.handleEvent({ type: "card", detail: { colour: "red" } });
+      bed.handleEvent({ type: "shot", xg: 0.4 });
+      const otherMoments = bed.lastRoar;
+      bed.setMuted(true);
+      goal("home");
+      bed.setMuted(false);
+      bed.setEnabled(false);
+      goal("home");
+      console.log(JSON.stringify({ roars, otherMoments }));
+    """)
+    neutral, mine, theirs, muted, disabled = result["roars"]
+    assert neutral == {"gain": pytest.approx(1.3), "toOutput": True,
+                       "buffer": "/static/audio/goal-roar.mp3"}
+    assert mine["gain"] == pytest.approx(1.3 * 1.4)
+    assert theirs["gain"] == pytest.approx(1.3 * 0.6)
+    assert result["otherMoments"] is None
+    assert muted is None and disabled is None
+
+
+def test_murmurs_lift_only_the_bed_and_only_while_the_crowd_is_running() -> None:
     result = _run("""
       advance(41000);
       const murmur = bed.murmur.gain.events.filter(event => event.kind === "ramp")
         .map(event => event.value);
+      bed.handleEvent({ type: "goal", clock: 30 });
+      const roarBypassesMurmur = !bed.lastRoar.level.connections.includes(bed.murmur);
       bed.pause();
       const events = bed.murmur.gain.events.length;
       advance(41000);
       advance(41000);
       console.log(JSON.stringify({
-        murmur, quietWhilePaused: bed.murmur.gain.events.length === events,
+        murmur, roarBypassesMurmur,
+        quietWhilePaused: bed.murmur.gain.events.length === events,
         level: bed.output.gain.value,
       }));
     """)
     # Rise to a peak of 1.25-1.6, then back to 1.
     assert len(result["murmur"]) == 2
     assert 1.25 <= result["murmur"][0] <= 1.6 and result["murmur"][1] == 1
+    assert result["roarBypassesMurmur"] is True
     assert result["quietWhilePaused"] is True
     assert result["level"] == 0
+
+
+def test_a_limiter_guards_the_crowd_output_and_the_whistle_goes_straight_out() -> None:
+    result = _run("""
+      const limiter = bed.limiter;
+      console.log(JSON.stringify({
+        outputToLimiter: bed.output.connections.includes(limiter),
+        limiterOut: limiter.connections.includes(bed.context.destination),
+        threshold: limiter.threshold.value, ratio: limiter.ratio.value, knee: limiter.knee.value,
+        whistleOut: bed.effectsOutput.connections.includes(bed.context.destination),
+      }));
+    """)
+    assert result == {
+        "outputToLimiter": True, "limiterOut": True,
+        "threshold": -3, "ratio": 20, "knee": 0, "whistleOut": True,
+    }
+
+
+def test_the_recordings_are_served_small_and_credited() -> None:
+    audio = Path("src/second_screen_pundit/web/audio")
+    for name in ("crowd-bed.mp3", "goal-roar.mp3"):
+        assert (audio / name).stat().st_size < 1_500_000, name
+    source = APP_JS.read_text(encoding="utf-8")
+    assert '"/static/audio/crowd-bed.mp3"' in source and '"/static/audio/goal-roar.mp3"' in source
+    credits = Path("CREDITS.md").read_text(encoding="utf-8")
+    for url in (
+        "https://freesound.org/people/Vogyik/sounds/868982/",
+        "https://freesound.org/people/D.jones/sounds/528799/",
+    ):
+        assert url in credits
+    assert "CC0" in credits
+    assert "CREDITS.md" in Path("README.md").read_text(encoding="utf-8")
 
 
 def test_goal_swell_is_held_under_speech_then_returns_after_release() -> None:

@@ -225,6 +225,9 @@ __marimo__/
 /data/matches/*.jsonl
 /data/audio/*.mp3
 /data/audio/voice-trials/
+# Source recordings for the crowd (the page uses the edited MP3s in src/.../web/audio)
+/data/audio/*.wav
+/data/audio/*.flac
 
 .playwright-mcp/
 

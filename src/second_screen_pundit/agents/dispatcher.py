@@ -100,8 +100,10 @@ class LiveDispatcher:
         self._generation = 0
         self._in_flight = 0
         self._recent_lines: list[str] = []
-        # (monotonic time, text) of each published line, for the repeated-score rule.
-        self._published_at: list[tuple[float, str]] = []
+        # The line ID behind each entry of _recent_lines, so a line dropped later can be taken out.
+        self._recent_line_ids: list[str] = []
+        # (monotonic time, text, line ID) of each published line, for the repeated-score rule.
+        self._published_at: list[tuple[float, str, str]] = []
         # Lines already sent. In cached mode a pre-generated line can match two windows (the
         # goal's fast path and the next tactical window, which holds the goal's shot).
         self._published_line_ids: set[str] = set()
@@ -145,6 +147,19 @@ class LiveDispatcher:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def retract_line(self, line_id: str) -> None:
+        """Forget a line the viewer never saw (dropped at publish as stale): it no longer counts
+        towards the clock budget, the recent lines the Commentator sees, or the repeated-score
+        rule. Its ID stays published, so the same line can't go out later instead."""
+        kept = [
+            (text, kept_id)
+            for text, kept_id in zip(self._recent_lines, self._recent_line_ids)
+            if kept_id != line_id
+        ]
+        self._recent_lines = [text for text, _ in kept]
+        self._recent_line_ids = [kept_id for _, kept_id in kept]
+        self._published_at = [entry for entry in self._published_at if entry[2] != line_id]
 
     @staticmethod
     def _clock(event: Event) -> int:
@@ -331,7 +346,7 @@ class LiveDispatcher:
                 if line.delivery_tier not in SCORE_TIERS:
                     recent = [
                         earlier
-                        for at, earlier in self._published_at
+                        for at, earlier, _line_id in self._published_at
                         if published_now - at <= REPEATED_SCORE_SECONDS
                     ]
                     unrepeated = strip_repeated_score(text, recent)
@@ -347,7 +362,8 @@ class LiveDispatcher:
                     outcome.result = replace(outcome.result, line=line)
                 self._published_line_ids.add(line.line_id)
                 self._recent_lines.append(line.text)
-                self._published_at.append((published_now, line.text))
+                self._recent_line_ids.append(line.line_id)
+                self._published_at.append((published_now, line.text, line.line_id))
         except Exception as exc:  # noqa: BLE001 - one failed window must not stop the replay
             outcome.error = f"{type(exc).__name__}: {str(exc)[:160]}"
             logger.warning(

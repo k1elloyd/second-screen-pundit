@@ -1036,11 +1036,11 @@ The lines' comparisons ("Ashbridge Rovers have the edge in possession now, up to
 
 ## Feed order, cached wording, crowd babble (19 Oct 2026)
 
-**Stale lines.** At publish, a tactical or colour line whose window ended more than `STALE_LINE_MINUTES` (2) match minutes before the latest published line is dropped and logged as `stale_line_dropped`; fast-path lines never are (`api.is_stale_line`, checked and recorded under the release lock). A slow tactical window had published a 24' line after a 29' colour line. Test: `tests/test_feed_order.py` (a full m01 replay with 3-second tactical windows drops the late 57', 72' and 84' lines and publishes every fast-path line).
+**Stale lines.** At publish, a tactical or colour line whose window ended more than `STALE_LINE_MINUTES` (2) match minutes before the latest published line is dropped and logged as `stale_line_dropped`; fast-path lines never are (`api.is_stale_line`, checked and recorded under the release lock). A slow tactical window had published a 24' line after a 29' colour line. A dropped line is retracted from the dispatcher (`LiveDispatcher.retract_line`): the viewer never saw it, so it no longer counts towards the clock budget, the Commentator's recent lines or the repeated-score rule; its ID stays published so it can't go out later. Tests: `tests/test_feed_order.py` (a full m01 replay with 3-second tactical windows drops the late 57', 72' and 84' lines, retracts each, and publishes every fast-path line; after a retraction the next line keeps the score it would otherwise have dropped as a repeat).
 
 **Cached wording.** "The home side", "the visitors", "the home team", "the home defence", "another home goal" and "the logged away goals" are replaced with team names in the cached lines, answers and the m01 question. The cached-content tests fail on any home/away/visiting + side/team/defence/goal/supporters/fans/end, "the visitors", "the hosts" or "the opposition".
 
-**Crowd: a babble, rendered ahead.** The noise layers are replaced with a babble scene:
+**Crowd: a babble, rendered ahead** *(superseded the same day by the recorded crowd below)*. The noise layers are replaced with a babble scene:
 - **Voices:** 24 voices, each with its own syllable-shaped noise (3–6 Hz, some syllables silent). Each runs through two band-pass formants (300–800 Hz and 900–2,500 Hz) that glide to new targets every 2–5 s, with slow fades in and out, spread across the stereo field.
 - **Rumble:** under 120 Hz.
 - **Reverb:** a convolver with a 2.5-second decaying-noise impulse, 35% wet, on the whole crowd bus.
@@ -1059,3 +1059,13 @@ Played live, that graph cost about 18–20% of a desktop core (offline render ti
 | Level and ducking | unchanged: base gain 0.04, ducked 0.01, released 0.04, checked on the page |
 
 Not measured: a real phone in Chrome's performance panel.
+
+**Crowd: recorded audio (19 Oct 2026).** The generated babble is removed; the whistles are still synthesised. Sources and licences (CC0) are in `CREDITS.md`.
+- **Bed.** `web/audio/crowd-bed.mp3`: 66 s at 112 kbps, 925 KB. The source WAV (25.8 MB) held four takes of about 20 s each, one per microphone setup, with about 3 s of digital silence between them and fades at their edges. Looped as it was, the crowd would have cut out every 23 s. The encode keeps each take's steady middle 18 s and joins them with 2-second equal-power crossfades.
+- **Looping.** In the page, two copies overlap for 2 s at each loop point with an equal-power crossfade (sine in, cosine out; their squares sum to 1). Copies are scheduled up to 10 s ahead on the audio clock, so none pile up while the context is suspended. Rendered across the loop point, the level stays within the recording's normal second-to-second range (-35.5 to -36.8 dB through the crossfade, against -30 to -38 dB elsewhere).
+- **Roar.** `web/audio/goal-roar.mp3`: the first 14 s of the 93 s source (the roar peaks at 4–5 s and then holds) with a 4 s fade-out, 112 kbps, 197 KB. It plays on goals only, at 1.3 × `goalSwellFactor` (1.82 for My team, 0.78 for the other side), through `output`, so it follows the level, the goal swell and the ducking.
+- **Murmurs** lift the bed only (a gain between the bed and `output`; the roar bypasses it).
+- **Level unchanged.** `CROWD_BED_TRIM` 13.2 brings the bed to 0.00831 RMS at the base gain, against 0.0083 for the previous beds. Base, ducked and released levels (0.04, 0.01, 0.04), Mute, Pause, page-hide, the Crowd toggle and the My-team swell are untouched.
+- **Limiter.** The recording peaks about 26 dB over its average, so a My-team late-goal swell (output 0.196) could take a peak near full scale. A limiter (threshold -3 dB, ratio 20, no knee) after `output` catches those peaks; below the threshold it does nothing.
+- **Loading.** Both files are fetched and decoded at page load (when the crowd is on and not muted) with an OfflineAudioContext, so Start doesn't wait. A failed load is retried on the next Start.
+- **Source files.** The originals stay in `data/audio/`, now git-ignored.

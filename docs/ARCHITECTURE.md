@@ -66,7 +66,7 @@ flowchart TB
 
 ## The parts
 
-**Browser.** A single page that works from 360px phones to desktop. It holds the replay token in memory, reconnects its stream with `Last-Event-ID`, pauses the match when the tab is hidden, and plays lines, answers and the recap through one audio queue. The crowd bed and whistles are generated in the browser.
+**Browser.** A single page that works from 360px phones to desktop. It holds the replay token in memory, reconnects its stream with `Last-Event-ID`, pauses the match when the tab is hidden, and plays lines, answers and the recap through one audio queue. The crowd is a looped CC0 recording with a goal roar ([CREDITS.md](../CREDITS.md)); the whistles are synthesised in the browser.
 
 **Container Apps.** One FastAPI process on one replica (`minReplicas` 1, `maxReplicas` 1), because replays, outboxes and resume positions live in memory. The image is built remotely in Azure Container Registry by `azd`.
 
