@@ -674,3 +674,70 @@ def test_the_clip_behind_a_goal_line_plays_next_in_order() -> None:
     assert result["first"] == ["goal-line"]
     assert result["order"] == ["goal-line", "next-line"]
     assert result["nextAfter"] == 300
+
+
+# Live mode: the goal often lands while another line is being spoken. With a voice to come,
+# the roar waits for the goal line's turn instead of going in under that line.
+
+
+def test_a_goal_during_another_line_holds_the_roar_for_the_goal_lines_turn() -> None:
+    result = _goal_lead("""
+      bed.expectsGoalVoice = () => true;
+      queue.enqueue({ id: "tactical-line", kind: "line", lineId: "tactical-line", tier: "tactical",
+                      expiresAt: now + LINE_AUDIO_STALE_MS });
+      step(1000);
+      const goalAt = now;
+      bed.handleEvent({ type: "goal", clock: 23, team: "away" });
+      queue.enqueue({ id: "goal-line", kind: "line", lineId: "goal-line", tier: "goal",
+                      team: "away", expiresAt: now + LINE_AUDIO_STALE_MS });
+      step(2000);
+      const roarsDuringOtherLine = roars().length;
+      queue.el.handlers.ended();
+      const turnAt = now;
+      const roarsAtTurn = roars().length;
+      step(2500);
+      console.log(JSON.stringify({
+        roarsDuringOtherLine, roarsAtTurn, swellAtGoal: bed.swellLevel > 0,
+        order: plays.map((p) => p.src), voiceAfterTurn: plays[1].at - turnAt,
+        roarAfterGoal: turnAt - goalAt,
+      }));
+    """)
+    assert result["roarsDuringOtherLine"] == 0
+    assert result["roarsAtTurn"] == 1
+    assert result["order"] == ["tactical-line", "goal-line"]
+    assert result["voiceAfterTurn"] == 1800
+
+
+def test_a_held_roar_plays_at_once_when_the_goal_line_has_no_voice() -> None:
+    result = _goal_lead("""
+      bed.expectsGoalVoice = () => true;
+      bed.handleEvent({ type: "goal", clock: 23, team: "away" });
+      const held = roars().length;
+      bed.playHeldRoar();
+      const afterUnavailable = roars().length;
+      bed.playHeldRoar();
+      bed.handleEvent({ type: "goal", clock: 60, team: "home" });
+      bed.setMuted(true);
+      bed.setMuted(false);
+      bed.playHeldRoar();
+      console.log(JSON.stringify({ held, afterUnavailable, total: roars().length }));
+    """)
+    # Held at the event; played once when the line's audio is unavailable; a mute drops it.
+    assert result == {"held": 0, "afterUnavailable": 1, "total": 1}
+
+
+def test_without_a_voice_to_come_the_roar_plays_on_the_goal_event() -> None:
+    result = _goal_lead("""
+      bed.expectsGoalVoice = () => false;
+      bed.handleEvent({ type: "goal", clock: 23, team: "away" });
+      console.log(JSON.stringify({ roars: roars().length }));
+    """)
+    assert result == {"roars": 1}
+
+
+def test_the_page_expects_a_goal_voice_only_with_audio_on_and_not_muted() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "crowdBed.expectsGoalVoice = () => state.audio && !audioQueue.muted;" in source
+    # A goal line whose audio never comes still gets its roar.
+    unavailable = _source_between(source, 'if (name === "commentary_audio_unavailable") {', "}")
+    assert "crowdBed.playHeldRoar()" in unavailable

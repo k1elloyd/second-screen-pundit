@@ -591,6 +591,11 @@ class CrowdBed {
     this.bedTimer = null;
     this.lastRoar = null;
     this.roarDucked = false;
+    // A goal's roar held for its line: when the voice will say the goal, the roar comes with
+    // the line's turn in the queue, not with the event, which can land mid-way through
+    // another line. The page says whether a voice is expected (audio on, not muted).
+    this.heldRoar = null;
+    this.expectsGoalVoice = () => false;
     // "home", "away" or "neutral" (the viewer's My team): its goals swell more.
     this.myTeam = "neutral";
   }
@@ -705,13 +710,25 @@ class CrowdBed {
     if (!this.active || !this.enabled || this.muted || !this.context || !this.audio) return false;
     const recent = this.lastRoar
       && this.context.currentTime - this.lastRoar.at < CROWD_ROAR_REUSE_SECONDS;
-    if (recent) {
+    if (this.heldRoar) {
+      const held = this.heldRoar;
+      this.heldRoar = null;
+      this.playRoar(held.team ?? team);
+    } else if (recent) {
       this.roarDucked = false;
       this.applyLevel();
     } else {
       this.playRoar(team);
     }
     return true;
+  }
+
+  // The goal's line will not be spoken (its audio is off or unavailable): roar now instead.
+  playHeldRoar() {
+    if (!this.heldRoar) return;
+    const held = this.heldRoar;
+    this.heldRoar = null;
+    this.playRoar(held.team);
   }
 
   // A clip has started: the roar dips to half and fades out with the recording.
@@ -795,7 +812,10 @@ class CrowdBed {
 
   setMuted(muted) {
     this.muted = muted;
-    if (muted) this.clearWhistles();
+    if (muted) {
+      this.clearWhistles();
+      this.heldRoar = null;
+    }
     this.applyLevel();
   }
 
@@ -834,7 +854,8 @@ class CrowdBed {
 
     if (event.type === "goal") {
       this.swell(((event.clock || 0) >= 75 ? 0.14 : 0.09) * this.goalSwellFactor(event.team));
-      this.playRoar(event.team);
+      if (this.expectsGoalVoice()) this.heldRoar = { team: event.team };
+      else this.playRoar(event.team);
     } else if (event.type === "card" && event.detail?.colour === "red") {
       this.swell(0.06);
     } else if (event.type === "shot" && event.xg != null && event.xg >= 0.3) {
@@ -1132,6 +1153,7 @@ const crowdBed = new CrowdBed();
 audioQueue.onPlaybackChange = (speaking) => crowdBed.setDucked(speaking);
 audioQueue.onGoalLead = (item) => crowdBed.startGoalRoar(item.team);
 audioQueue.onClipStart = () => crowdBed.duckRoar();
+crowdBed.expectsGoalVoice = () => state.audio && !audioQueue.muted;
 // Load the crowd recordings while the page warms up, so Start doesn't wait for them.
 if (crowdBed.enabled && !crowdBed.muted) {
   prepareCrowdAudio().catch((error) => console.error("Could not load the crowd audio.", error));
@@ -1309,6 +1331,8 @@ function renderCommentary(payload) {
     });
   } else if (payload.audio_pending) {
     audioQueue.setLinePending(line.line_id, true);
+  } else if (GOAL_AUDIO_TIERS.has(card.dataset.tier)) {
+    crowdBed.playHeldRoar();
   }
   audioQueue.notifyLineQueueChange(true);
 }
@@ -1453,6 +1477,7 @@ function handleSse(name, payload) {
     audioQueue.setLinePending(payload.line_id, false);
     const card = [...document.querySelectorAll(".commentary-card")]
       .find((item) => item.dataset.lineId === payload.line_id);
+    if (GOAL_AUDIO_TIERS.has(card?.dataset.tier)) crowdBed.playHeldRoar();
     const notice = card?.querySelector(".audio-status");
     if (notice) notice.textContent = "Audio off";
   }
