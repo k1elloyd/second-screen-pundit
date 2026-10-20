@@ -154,3 +154,79 @@ def test_a_dropped_line_no_longer_counts_as_said(monkeypatch: pytest.MonkeyPatch
     assert prompts[1]["recent_lines"] == ()
     assert dispatcher._recent_lines == [second]
     assert [entry[1] for entry in dispatcher._published_at] == [second]
+
+
+# Every source but the fast path, and the half-time summary.
+
+
+def test_every_line_source_but_the_fast_path_is_under_the_stale_rule() -> None:
+    from typing import get_args, get_type_hints
+
+    from second_screen_pundit.agents.dispatcher import WindowOutcome
+
+    # Tactical windows, cached lines and colour lines are all published as "tactical"; the
+    # only other path is the fast path (goals, cards, substitutions, shape changes, big chances).
+    paths = set(get_args(get_type_hints(WindowOutcome)["path"]))
+    assert paths == {"fast_path", "tactical"}
+    assert [path for path in paths if is_stale_line(path, 44, 74)] == ["tactical"]
+
+
+def _colour_versions(match_id: str, as_of: int) -> list[str]:
+    from second_screen_pundit.agents.colour import build_colour_candidate
+    from second_screen_pundit.engine.generate import generate_match, get_match_info
+
+    events, info = generate_match(match_id), get_match_info(match_id)
+    used: set[str] = set()
+    for ordinal in range(1, 12):
+        candidate = build_colour_candidate(
+            info, events, as_of=as_of, ordinal=ordinal, used_versions=used, used_statistics=set()
+        )
+        if candidate is None:
+            break
+        used.add(candidate.version)
+    return sorted(used)
+
+
+@pytest.mark.parametrize("match_id", ["m01", "m02", "m03"])
+def test_a_half_time_summary_is_offered_at_the_break_and_never_in_the_second_half(
+    match_id: str,
+) -> None:
+    from second_screen_pundit.engine.generate import generate_match
+
+    events = generate_match(match_id)
+    break_as_of = max(event.seq for event in events if event.period == 1)
+    assert {"possession-first-half-v1", "shots-first-half-v1"} <= set(
+        _colour_versions(match_id, break_as_of)
+    )
+    for minute in range(46, 91, 4):
+        as_of = max(event.seq for event in events if event.minute + event.added_minute <= minute)
+        assert not [v for v in _colour_versions(match_id, as_of) if "first-half" in v], minute
+
+
+def test_a_half_time_summary_ready_after_the_kickoff_is_dropped() -> None:
+    from second_screen_pundit.agents.colour import build_colour_candidate
+    from second_screen_pundit.api import is_late_half_time_summary
+    from second_screen_pundit.engine.generate import generate_match, get_match_info
+
+    events, info = generate_match("m01"), get_match_info("m01")
+    break_as_of = max(event.seq for event in events if event.period == 1)
+    kickoff = min(event.seq for event in events if event.period == 2)
+    candidates = []
+    used: set[str] = set()
+    for ordinal in range(1, 12):
+        candidate = build_colour_candidate(
+            info, events, as_of=break_as_of, ordinal=ordinal, used_versions=used,
+            used_statistics=set(),
+        )
+        if candidate is None:
+            break
+        used.add(candidate.version)
+        candidates.append(candidate)
+    summary = next(c for c in candidates if c.version == "possession-first-half-v1")
+    match_line = next(c for c in candidates if c.version == "possession-match-v1")
+    # Before the second half kicks off on the viewer's stream it goes out; after, it's dropped.
+    assert not is_late_half_time_summary(summary, kickoff - 1, events)
+    assert is_late_half_time_summary(summary, kickoff, events)
+    assert is_late_half_time_summary(summary, max(e.seq for e in events), events)
+    # Other colour lines are left to the ordinary stale rule.
+    assert not is_late_half_time_summary(match_line, kickoff, events)

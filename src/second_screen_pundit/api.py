@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -18,7 +19,13 @@ from uuid import uuid4
 
 from azure.identity import DefaultAzureCredential
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -26,6 +33,7 @@ from second_screen_pundit.agents.colour import (
     ColourLineCandidate,
     ColourLineGate,
     build_colour_candidate,
+    is_half_time_summary,
 )
 from second_screen_pundit.agents.config import AgentSettings
 from second_screen_pundit.agents.content_filter import viewer_output_block_reason
@@ -214,6 +222,47 @@ def is_stale_line(path: str, minute: int, latest_line_minute: int | None) -> boo
         path != "fast_path"
         and latest_line_minute is not None
         and latest_line_minute - minute > STALE_LINE_MINUTES
+    )
+
+
+def is_late_half_time_summary(
+    candidate: ColourLineCandidate, viewer_released_as_of: int, events: Sequence[Event]
+) -> bool:
+    """A first-half summary once the viewer's stream has released the second-half kick-off.
+
+    It is built at the break, but a line waits for its event's release and the build runs off
+    the event loop, so it can be ready after the second half has started: then it's dropped.
+    """
+    kickoff = min((event.seq for event in events if event.period == 2), default=math.inf)
+    return is_half_time_summary(candidate) and viewer_released_as_of >= kickoff
+
+
+def asset_version(web_dir: Path = _WEB_DIR) -> str:
+    """A hash of the page's files: it changes whenever a deploy changes any of them.
+
+    The image has no git checkout, so the build is identified by what it serves.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(web_dir.rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts:
+            digest.update(path.relative_to(web_dir).as_posix().encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def versioned_index(version: str, web_dir: Path = _WEB_DIR) -> str:
+    """index.html with the version on its script and stylesheet, and in a meta tag that
+    app.js reads to version the audio it fetches. A new deploy means new URLs, so no
+    browser or proxy can serve the old files under them."""
+    html = (web_dir / "index.html").read_text(encoding="utf-8")
+    for path in ("/static/app.js", "/static/styles.css"):
+        if f'"{path}"' not in html:
+            raise RuntimeError(f"index.html no longer references {path}")
+        html = html.replace(f'"{path}"', f'"{path}?v={version}"')
+    return html.replace(
+        '<meta charset="utf-8">',
+        f'<meta charset="utf-8">\n  <meta name="asset-version" content="{version}">',
+        1,
     )
 
 
@@ -636,15 +685,23 @@ def create_app(
                 if audio_task is not None and not audio_task.done():
                     audio_task.cancel()
                 return False
-            if is_stale_line(outcome.path, outcome.minute, session.latest_line_minute):
+            # A first-half summary built at the break can be ready after the second half has
+            # kicked off on the viewer's stream; by then it reads as a line from the past.
+            late_summary = colour_candidate is not None and is_late_half_time_summary(
+                colour_candidate, session.viewer_released_as_of, session.events
+            )
+            if late_summary or is_stale_line(
+                outcome.path, outcome.minute, session.latest_line_minute
+            ):
                 logger.info(
                     "stale_line_dropped match_id=%s line_id=%s minute=%d latest_line_minute=%s "
-                    "source=%s",
+                    "source=%s reason=%s",
                     session.info.match_id,
                     line.line_id,
                     outcome.minute,
                     session.latest_line_minute,
                     line.source,
+                    "half_time_summary" if late_summary else "behind_latest_line",
                 )
                 # The viewer never sees it, so it mustn't spend the clock budget or make the
                 # next line drop a score it repeats.
@@ -1048,9 +1105,12 @@ def create_app(
         limiter.check(_client_ip(request), client_id=session.client_id)
         return session
 
+    page = versioned_index(asset_version())
+
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(_WEB_DIR / "index.html")
+    async def index() -> HTMLResponse:
+        # Always revalidated, so the browser picks up a new deploy's versioned URLs.
+        return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/matches")
     async def matches() -> list[dict[str, str]]:

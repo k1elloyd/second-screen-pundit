@@ -58,3 +58,31 @@ def test_cached_lines_get_early_audio_and_count_as_lines(match_id: str) -> None:
     assert prepared == published
     with_lines = [outcome for outcome in dispatcher.outcomes if outcome.result and outcome.result.line]
     assert all(outcome.released_late_ms is not None for outcome in with_lines)
+
+
+@pytest.mark.parametrize("match_id", ["m01", "m02", "m03"])
+def test_cached_lines_get_the_delivery_tier_of_the_event_they_describe(match_id: str) -> None:
+    """The stored lines predate delivery tiers: a cached goal line must still be a goal clip.
+
+    Without the tier the page's goal-roar lead and the goal voice style never applied in
+    cached mode (every cached line arrived as "tactical").
+    """
+    from second_screen_pundit.agents.delivery import TIER_TONES
+    from second_screen_pundit.agents.pipeline import is_must_say
+
+    settings = replace(_settings(), mode="cached")
+    pipeline = PunditPipeline(settings, None)
+    events, info = generate_match(match_id), get_match_info(match_id)
+    tiers = {}
+    for event in events:
+        if event.type == "goal":
+            result = pipeline._cached_live_window(info, events, [event], event.seq)
+            if result.line is not None:
+                tiers[event.minute] = result.line.delivery_tier
+                assert result.line.tone == TIER_TONES[result.line.delivery_tier]
+    assert tiers
+    assert set(tiers.values()) <= {"goal", "goal_equaliser", "goal_peak"}, tiers
+    # A window with no must-say event in the line keeps the tactical tier.
+    quiet = next(e for e in events if e.minute > 10 and not is_must_say(e, events))
+    result = pipeline._cached_live_window(info, events, [quiet], quiet.seq)
+    assert result.line is None or result.line.delivery_tier == "tactical"

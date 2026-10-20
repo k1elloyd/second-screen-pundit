@@ -70,6 +70,7 @@ from second_screen_pundit.agents.models import (
     Claim,
     CommentaryLine,
     CommentaryReply,
+    DeliveryTier,
     DirectorDecision,
     ExplainerReply,
     Explanation,
@@ -98,6 +99,7 @@ from second_screen_pundit.agents.tools.analytics import (
     Fact,
     ToolResult,
     chance_summary,
+    goal_context,
     is_big_chance,
     key_moments,
     match_context,
@@ -123,6 +125,7 @@ from second_screen_pundit.agents.wording import (
     name_teams,
     scorer_phrase_failures,
     sentence_count,
+    shape_change_phrase,
     strip_withheld_score,
     unframe,
 )
@@ -208,6 +211,15 @@ def _event_clock(event: Event) -> int:
 
 # Goals and red cards always carry the score; the delivery tier already identifies them.
 _SCORE_TIERS = {"goal_peak", "goal_equaliser", "goal", "red_card"}
+
+
+def _trailing(score: str, team: str | None) -> bool:
+    """Whether ``team`` ("home" or "away") is behind on a "home-away" match score."""
+    try:
+        home, away = (int(part) for part in score.split("-"))
+    except ValueError:
+        return False
+    return home < away if team == "home" else away < home if team == "away" else False
 RECENT_LINES_FOR_SCORE = 3
 
 
@@ -1460,6 +1472,11 @@ class PunditPipeline:
                     back_line=back_line_note(
                         previous_formation, str(formation) if formation else None
                     ),
+                    shape_change=shape_change_phrase(
+                        previous_formation,
+                        str(formation) if formation else None,
+                        trailing=_trailing(str(score_fact.value), event.team),
+                    ),
                     chance_descriptor=descriptor,
                     chance_descriptor_title=(
                         descriptor[:1].upper() + descriptor[1:] if descriptor else None
@@ -1504,6 +1521,11 @@ class PunditPipeline:
             values["back_line"] = back_line_note(
                 values.get("previous_formation"),  # type: ignore[arg-type]
                 values.get("new_formation"),  # type: ignore[arg-type]
+            )
+            values["shape_change"] = shape_change_phrase(
+                values.get("previous_formation"),  # type: ignore[arg-type]
+                values.get("new_formation"),  # type: ignore[arg-type]
+                trailing=_trailing(str(score_fact.value), signal.team),
             )
             fact_ids = list(
                 dict.fromkeys(
@@ -2317,7 +2339,34 @@ class PunditPipeline:
                 None,
                 "No pre-generated line covers this event window.",
             )
-        line = line.model_copy(update={"text": apply_house_style(line.text, info)})
+        # The stored lines predate delivery tiers, so set the tier as the live path does: from
+        # the must-say event the line describes. A goal line then gets its voice style and the
+        # page's goal-roar lead.
+        must_say_event = next(
+            (
+                event
+                for event in window
+                if event.event_id in line.event_ids and is_must_say(event, events)
+            ),
+            None,
+        )
+        if must_say_event is None:
+            delivery_tier: DeliveryTier = "tactical"
+        else:
+            delivery_tier = tier_for_event(
+                must_say_event,
+                goal_context=(
+                    goal_context(events, must_say_event) if must_say_event.type == "goal" else None
+                ),
+                clock=must_say_event.minute + must_say_event.added_minute,
+            )
+        line = line.model_copy(
+            update={
+                "text": apply_house_style(line.text, info),
+                "delivery_tier": delivery_tier,
+                "tone": TIER_TONES[delivery_tier],
+            }
+        )
         results = _cached_tool_results(events, as_of=as_of, fact_ids=line.fact_ids)
         report = check_evidence(
             line,

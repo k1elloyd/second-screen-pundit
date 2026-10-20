@@ -492,8 +492,15 @@ const CROWD_LEVEL_FADE_SECONDS = 0.14;
 // The bed is a crowd recording (see CREDITS.md), looped without a seam: at each loop point
 // two copies overlap for CROWD_LOOP_CROSSFADE_SECONDS with an equal-power crossfade. Goals add
 // a recorded roar. Both feed `output`, whose gain alone sets the level and the ducking.
-const CROWD_BED_URL = "/static/audio/crowd-bed.mp3";
-const CROWD_ROAR_URL = "/static/audio/goal-roar.mp3";
+// The server stamps the page with its build's asset version; the audio URLs carry it, so a
+// deploy is never served the previous recordings from a cache.
+const ASSET_VERSION =
+  globalThis.document?.querySelector?.('meta[name="asset-version"]')?.content || "";
+function versionedUrl(url) {
+  return ASSET_VERSION ? `${url}?v=${encodeURIComponent(ASSET_VERSION)}` : url;
+}
+const CROWD_BED_URL = versionedUrl("/static/audio/crowd-bed.mp3");
+const CROWD_ROAR_URL = versionedUrl("/static/audio/goal-roar.mp3");
 const CROWD_LOOP_CROSSFADE_SECONDS = 2;
 // Copies of the bed are scheduled this far ahead of the audio clock, checked every second.
 const CROWD_SCHEDULE_AHEAD_SECONDS = 10;
@@ -504,6 +511,11 @@ const CROWD_FADE_POINTS = 64;
 const CROWD_BED_TRIM = 13.2;
 // The roar's peak sits about 4 dB over the bed; goalSwellFactor scales it for My team.
 const CROWD_ROAR_GAIN = 1.3;
+// Under a goal line the roar dips to half its level, not to the bed's duck, so the
+// celebration carries on under the voice.
+const CROWD_ROAR_DUCK_FACTOR = 0.5;
+// A goal line reuses the goal event's roar if it began this recently (the roar peaks at 4-5 s).
+const CROWD_ROAR_REUSE_SECONDS = 6;
 // A limiter on the crowd output catches the recording's rare peaks when a goal swell lifts it;
 // below the threshold it does nothing, so the level and the ducking are unchanged.
 const CROWD_LIMIT_THRESHOLD_DB = -3;
@@ -578,6 +590,7 @@ class CrowdBed {
     this.bedNextStart = 0;
     this.bedTimer = null;
     this.lastRoar = null;
+    this.roarDucked = false;
     // "home", "away" or "neutral" (the viewer's My team): its goals swell more.
     this.myTeam = "neutral";
   }
@@ -607,6 +620,11 @@ class CrowdBed {
     limiter.release.value = 0.25;
     output.connect(limiter);
     limiter.connect(context.destination);
+    // The roar has its own bus at the crowd's level, so it can duck less than the bed.
+    const roarBus = context.createGain();
+    roarBus.gain.value = 0;
+    roarBus.connect(limiter);
+    this.roarBus = roarBus;
     const effectsOutput = context.createGain();
     effectsOutput.gain.value = 0.65;
     effectsOutput.connect(context.destination);
@@ -665,8 +683,8 @@ class CrowdBed {
     if (this.bedCopies.length > 4) this.bedCopies.shift();
   }
 
-  // A goal's roar, through `output` so it follows the level, the swell and the ducking; louder
-  // for My team's goals and quieter for the other side's, as the swell is.
+  // A goal's roar, through the roar bus so it follows the level and the swell; louder for My
+  // team's goals and quieter for the other side's, as the swell is.
   playRoar(team) {
     if (!this.active || !this.enabled || this.muted || !this.context || !this.audio) return;
     const source = this.context.createBufferSource();
@@ -674,9 +692,32 @@ class CrowdBed {
     const level = this.context.createGain();
     level.gain.value = CROWD_ROAR_GAIN * this.goalSwellFactor(team);
     source.connect(level);
-    level.connect(this.output);
+    level.connect(this.roarBus);
     source.start();
-    this.lastRoar = { source, level };
+    this.lastRoar = { source, level, at: this.context.currentTime };
+    this.roarDucked = false;
+    this.applyLevel();
+  }
+
+  // A goal line's turn has come: the roar sounds now (the goal event's, if recent) and the
+  // line waits behind it. False when the crowd is off, muted or not running: no lead then.
+  startGoalRoar(team) {
+    if (!this.active || !this.enabled || this.muted || !this.context || !this.audio) return false;
+    const recent = this.lastRoar
+      && this.context.currentTime - this.lastRoar.at < CROWD_ROAR_REUSE_SECONDS;
+    if (recent) {
+      this.roarDucked = false;
+      this.applyLevel();
+    } else {
+      this.playRoar(team);
+    }
+    return true;
+  }
+
+  // A clip has started: the roar dips to half and fades out with the recording.
+  duckRoar() {
+    this.roarDucked = true;
+    this.applyLevel();
   }
 
   // Now and then the bed murmurs louder for 5-15 seconds, then settles. Nothing is scheduled
@@ -715,10 +756,10 @@ class CrowdBed {
     if (!this.context || !this.output) return;
     const now = Date.now();
     let level = 0;
+    let open = 0;
     if (this.active && this.enabled && !this.muted) {
-      level = this.ducked
-        ? CROWD_BASE_GAIN * CROWD_DUCK_FACTOR
-        : this.swellUntil > now ? Math.max(CROWD_BASE_GAIN, this.swellLevel) : CROWD_BASE_GAIN;
+      open = this.swellUntil > now ? Math.max(CROWD_BASE_GAIN, this.swellLevel) : CROWD_BASE_GAIN;
+      level = this.ducked ? CROWD_BASE_GAIN * CROWD_DUCK_FACTOR : open;
     }
     const parameter = this.output.gain;
     parameter.cancelScheduledValues(this.context.currentTime);
@@ -726,6 +767,14 @@ class CrowdBed {
       level,
       this.context.currentTime,
       this.ducked ? CROWD_DUCK_FADE_SECONDS : CROWD_LEVEL_FADE_SECONDS,
+    );
+    // The roar sits at the crowd's open level, or half of it once a clip has started.
+    const roar = this.roarBus.gain;
+    roar.cancelScheduledValues(this.context.currentTime);
+    roar.setTargetAtTime(
+      this.roarDucked ? open * CROWD_ROAR_DUCK_FACTOR : open,
+      this.context.currentTime,
+      this.roarDucked ? CROWD_DUCK_FADE_SECONDS : CROWD_LEVEL_FADE_SECONDS,
     );
   }
 
@@ -843,9 +892,10 @@ class CrowdBed {
     this.swellLevel = 0;
     this.swellUntil = 0;
     if (!this.context || !this.output) return;
-    const parameter = this.output.gain;
-    parameter.cancelScheduledValues(this.context.currentTime);
-    parameter.setValueAtTime(0, this.context.currentTime);
+    for (const parameter of [this.output.gain, this.roarBus.gain]) {
+      parameter.cancelScheduledValues(this.context.currentTime);
+      parameter.setValueAtTime(0, this.context.currentTime);
+    }
     if (this.context.state !== "suspended") {
       this.context.suspend().catch((error) => console.error("Could not suspend crowd audio.", error));
     }
@@ -860,6 +910,9 @@ class CrowdBed {
 const PRIORITY_AUDIO_TIERS = new Set(["goal_peak", "goal_equaliser", "goal", "red_card", "big_chance"]);
 const MAX_WAITING_LINES = 1;
 const AUDIO_PRE_DUCK_MS = 300;
+// A goal line's voice starts this long after the goal roar, when the crowd is on and unmuted.
+const GOAL_AUDIO_TIERS = new Set(["goal", "goal_equaliser", "goal_peak"]);
+const GOAL_LEAD_MS = 1800;
 
 class AudioQueue {
   constructor() {
@@ -873,6 +926,9 @@ class AudioQueue {
     this.muted = readStored("pundit-muted") === "1";
     this.onPlaybackChange = () => {};
     this.onLineQueueChange = () => {};
+    // Asked when a goal line's turn comes: true if the roar is sounding, so the line waits.
+    this.onGoalLead = () => false;
+    this.onClipStart = () => {};
     this.pendingLines = new Set();
     this.lineQueueBusy = false;
     this.playTimer = null;
@@ -894,14 +950,15 @@ class AudioQueue {
       .finally(() => URL.revokeObjectURL(url));
   }
 
-  enqueue({ id, kind, lineId = null, expiresAt = null, tier = null }) {
+  enqueue({ id, kind, lineId = null, expiresAt = null, tier = null, team = null }) {
     if (kind === "line" && lineId) this.pendingLines.delete(lineId);
     if (!id || this.muted) {
       this.notifyLineQueueChange();
       return;
     }
     const priority = kind === "line" && PRIORITY_AUDIO_TIERS.has(tier);
-    const item = { url: audioUrl(id), kind, lineId, expiresAt, priority };
+    const goal = kind === "line" && GOAL_AUDIO_TIERS.has(tier);
+    const item = { url: audioUrl(id), kind, lineId, expiresAt, priority, goal, team };
     if (kind === "line") {
       this.items.push(item);
       this.trimLines();
@@ -968,7 +1025,17 @@ class AudioQueue {
     this.schedulePlay(item);
   }
 
+  // A goal line waits GOAL_LEAD_MS behind the roar (once), the pre-duck ending the wait.
   schedulePlay(item) {
+    if (item.goal && !item.leadDone && this.onGoalLead(item)) {
+      this.playTimer = setTimeout(() => {
+        this.playTimer = null;
+        if (this.paused || this.playing !== item) return;
+        item.leadDone = true;
+        this.schedulePlay(item);
+      }, GOAL_LEAD_MS - AUDIO_PRE_DUCK_MS);
+      return;
+    }
     this.onPlaybackChange(true);
     this.playTimer = setTimeout(() => {
       this.playTimer = null;
@@ -979,6 +1046,7 @@ class AudioQueue {
       }
       this.playbackStarted = true;
       this.el.src = item.url;
+      this.onClipStart(item);
       if (item.lineId) {
         [...document.querySelectorAll(".commentary-card")]
           .find((card) => card.dataset.lineId === item.lineId)?.classList.add("speaking");
@@ -1062,6 +1130,8 @@ class AudioQueue {
 const audioQueue = new AudioQueue();
 const crowdBed = new CrowdBed();
 audioQueue.onPlaybackChange = (speaking) => crowdBed.setDucked(speaking);
+audioQueue.onGoalLead = (item) => crowdBed.startGoalRoar(item.team);
+audioQueue.onClipStart = () => crowdBed.duckRoar();
 // Load the crowd recordings while the page warms up, so Start doesn't wait for them.
 if (crowdBed.enabled && !crowdBed.muted) {
   prepareCrowdAudio().catch((error) => console.error("Could not load the crowd audio.", error));
@@ -1234,6 +1304,7 @@ function renderCommentary(payload) {
       kind: "line",
       lineId: line.line_id,
       tier: card.dataset.tier,
+      team: card.dataset.team || null,
       expiresAt: Date.now() + LINE_AUDIO_STALE_MS,
     });
   } else if (payload.audio_pending) {
@@ -1255,6 +1326,7 @@ function updateCommentaryAudio(payload) {
     kind: "line",
     lineId: payload.line_id,
     tier: card.dataset.tier,
+    team: card.dataset.team || null,
     expiresAt: Number(card.dataset.arrivedAt) + LINE_AUDIO_STALE_MS + pausedSince,
   });
   audioQueue.notifyLineQueueChange(true);

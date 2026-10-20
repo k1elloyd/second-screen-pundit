@@ -105,10 +105,12 @@ CASUAL_FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
     "red_card": FALLBACK_VARIANTS["red_card"],
     "booking": FALLBACK_VARIANTS["booking"],
     "substitution": FALLBACK_VARIANTS["substitution"],
+    # {shape_change} is the change in words (agents/wording.shape_change_phrase), such as
+    # "go to a back three as they chase this" or "put an extra body in midfield".
     "formation_change": (
-        "{team} have changed their shape. {score_phrase}.",
-        "A change of shape from {team}. {score_phrase}.",
-        "{team} reorganise, with a new shape. {score_phrase}.",
+        "{team} {shape_change}. {score_phrase}.",
+        "A change of shape: {team} {shape_change}. {score_phrase}.",
+        "{team} reorganise and {shape_change}. {score_phrase}.",
     ),
     "big_chance": FALLBACK_VARIANTS["big_chance"],
     "signal_red_card": (
@@ -116,13 +118,13 @@ CASUAL_FALLBACK_VARIANTS: dict[FallbackKind, tuple[str, ...]] = {
         "A player light now, {team} must find a new balance. {score_phrase}.",
     ),
     "signal_red_card_formation": (
-        "A player short, {team} change their shape. {score_phrase}.",
-        "{team} must reorganise a player short, with a new shape. {score_phrase}.",
+        "A player short, {team} {shape_change}. {score_phrase}.",
+        "{team} must reorganise a player short, and they {shape_change}. {score_phrase}.",
     ),
     "signal_formation_change": (
-        "{team} have changed their shape. {score_phrase}.",
-        "A change of shape from {team}. {score_phrase}.",
-        "{team} reorganise, with a new shape. {score_phrase}.",
+        "{team} {shape_change}. {score_phrase}.",
+        "A change of shape: {team} {shape_change}. {score_phrase}.",
+        "{team} reorganise and {shape_change}. {score_phrase}.",
     ),
     "possession_swing": (
         "{team} have taken control of the ball in this spell. {score_phrase}.",

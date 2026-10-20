@@ -18,7 +18,12 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 
-from second_screen_pundit.agents.evidence import SCORE_PATTERN, extract_numbers, mentions_score
+from second_screen_pundit.agents.evidence import (
+    _BACK_LINE,
+    SCORE_PATTERN,
+    extract_numbers,
+    mentions_score,
+)
 from second_screen_pundit.engine.schema import MatchInfo
 from second_screen_pundit.engine.teams import team_name
 
@@ -501,6 +506,37 @@ def back_line_note(previous: str | None, new: str | None) -> str:
     return f", a back {_BACK_WORDS[after]} now"
 
 
+def shape_change_phrase(previous: str | None, new: str | None, *, trailing: bool = False) -> str:
+    """A formation change in words for a casual line, as a verb phrase after the team name.
+
+    "go to a back three" when the back line changes (the one shape the evidence check lets a
+    line name, and only then); otherwise where the extra or missing player went. "as they
+    chase this" when the team is behind. "change their shape" when neither can be told.
+    """
+    try:
+        before = [int(part) for part in (previous or "").split("-")]
+        after = [int(part) for part in (new or "").split("-")]
+    except ValueError:
+        return "change their shape"
+    if len(before) < 3 or len(after) < 3:
+        return "change their shape"
+    middle_before, middle_after = sum(before[1:-1]), sum(after[1:-1])
+    if after[0] != before[0] and str(after[0]) in _BACK_WORDS:
+        word = _BACK_WORDS[str(after[0])]
+        phrase = f"go back to a back {word}" if after[0] == 4 else f"go to a back {word}"
+    elif sum(after) < sum(before):
+        phrase = (
+            "drop a player from up front" if after[-1] < before[-1] else "drop a player from midfield"
+        )
+    elif middle_after > middle_before:
+        phrase = "put an extra body in midfield"
+    elif after[-1] > before[-1]:
+        phrase = "push an extra player up front"
+    else:
+        phrase = "change their shape"
+    return f"{phrase} as they chase this" if trailing else phrase
+
+
 def back_line_failures(text: str, changes: Iterable[tuple[str, str]]) -> list[str]:
     """A back line may be described only when a formation change moved its first number."""
     changed = {
@@ -532,6 +568,8 @@ def count_numbers(text: str) -> int:
     """How many numbers a line states: each score and each formation once, then each other
     digit or number word (zero to ten) the evidence check would read."""
     count = 0
+    # "a back three" describes a shape, as "a change of shape" does: words, not a statistic.
+    text = _BACK_LINE.sub(" ", text)
     for pattern in (_FORMATION_TEXT, SCORE_PATTERN):
         count += len(pattern.findall(text))
         text = pattern.sub(" ", text)

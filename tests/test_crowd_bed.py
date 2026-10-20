@@ -333,6 +333,7 @@ def test_no_copies_pile_up_while_the_crowd_is_paused() -> None:
 
 
 def test_goals_play_the_roar_louder_for_my_team_and_other_moments_only_swell() -> None:
+    # The roar has its own bus into the limiter, so it can duck less than the bed.
     result = _run("""
       const roars = [];
       const goal = (team) => {
@@ -340,7 +341,8 @@ def test_goals_play_the_roar_louder_for_my_team_and_other_moments_only_swell() -
         bed.handleEvent({ type: "goal", clock: 30, team });
         roars.push(bed.lastRoar && {
           gain: bed.lastRoar.level.gain.value,
-          toOutput: bed.lastRoar.level.connections.includes(bed.output),
+          toOutput: bed.lastRoar.level.connections.includes(bed.roarBus)
+            && bed.roarBus.connections.includes(bed.limiter),
           buffer: bed.lastRoar.source.buffer.url,
         });
       };
@@ -562,3 +564,113 @@ def test_start_event_mute_and_phone_toggle_are_wired_to_the_bed() -> None:
     assert "crowdBed.setMuted(muted);" in source
     assert 'el("crowd-button").addEventListener("click"' in source
     assert "startCrowdInGesture({ starting: true });" in source
+
+
+# A goal line's voice waits 1.8 s behind the goal roar, with the crowd on.
+
+_GOAL_LEAD_SETUP = """
+  queue.onGoalLead = (item) => bed.startGoalRoar(item.team);
+  queue.onClipStart = () => bed.duckRoar();
+  const plays = [];
+  const play = queue.el.play.bind(queue.el);
+  queue.el.play = () => { plays.push({ src: queue.el.src, at: now }); return play(); };
+  const roars = () => bed.context.sources.filter((s) => s.buffer?.url === "/static/audio/goal-roar.mp3");
+  const step = (ms) => { for (let t = 0; t < ms; t += 50) advance(50); };
+"""
+
+
+def _goal_lead(actions: str) -> dict[str, object]:
+    return _run(_GOAL_LEAD_SETUP + actions)
+
+
+@pytest.mark.parametrize("tier", ["goal", "goal_equaliser", "goal_peak"])
+def test_a_goal_line_starts_the_roar_and_waits_1_8_s_before_the_voice(tier: str) -> None:
+    result = _goal_lead(f"""
+      const enqueuedAt = now;
+      queue.enqueue({{ id: "goal-line", kind: "line", lineId: "goal-line", tier: "{tier}",
+                       team: "home" }});
+      const roarAtOnce = roars().length;
+      step(3000);
+      console.log(JSON.stringify({{ roarAtOnce, lead: plays[0].at - enqueuedAt,
+                                    roarStartedAt: roars()[0].startedAt }}));
+    """)
+    assert result["roarAtOnce"] == 1
+    assert result["lead"] == 1800
+
+
+@pytest.mark.parametrize(
+    ("setup", "tier", "kind"),
+    [
+        ("", "tactical", "line"),
+        ("", "red_card", "line"),
+        ("", "goal", "answer"),
+        ("", "goal", "recap"),
+        ("bed.setEnabled(false);", "goal", "line"),
+        ("bed.setMuted(true);", "goal", "line"),
+    ],
+    ids=["tactical", "red-card", "answer", "recap", "crowd-off", "crowd-muted"],
+)
+def test_no_lead_for_other_clips_or_with_the_crowd_off_or_muted(setup: str, tier: str, kind: str) -> None:
+    result = _goal_lead(f"""
+      {setup}
+      const enqueuedAt = now;
+      queue.enqueue({{ id: "clip", kind: "{kind}", lineId: "clip", tier: "{tier}" }});
+      step(3000);
+      console.log(JSON.stringify({{ lead: plays[0].at - enqueuedAt, roars: roars().length }}));
+    """)
+    # The usual 300 ms pre-duck only, and no roar started for the clip.
+    assert result == {"lead": 300, "roars": 0}
+
+
+def test_a_muted_queue_plays_nothing_and_starts_no_roar() -> None:
+    result = _goal_lead("""
+      bed.setMuted(true);
+      queue.setMuted(true);
+      queue.enqueue({ id: "goal-line", kind: "line", lineId: "goal-line", tier: "goal" });
+      step(3000);
+      console.log(JSON.stringify({ plays: plays.length, roars: roars().length }));
+    """)
+    assert result == {"plays": 0, "roars": 0}
+
+
+def test_the_roar_ducks_to_half_when_the_voice_starts_and_the_bed_ducks_as_before() -> None:
+    result = _goal_lead("""
+      bed.handleEvent({ type: "goal", clock: 30, team: "home" });
+      const swell = bed.output.gain.value;
+      step(500);
+      queue.enqueue({ id: "goal-line", kind: "line", lineId: "goal-line", tier: "goal" });
+      step(1000);
+      const duringLead = { roar: bed.roarBus.gain.value, roars: roars().length };
+      step(800);
+      const duringVoice = { roar: bed.roarBus.gain.value, bed: bed.output.gain.value };
+      console.log(JSON.stringify({ swell, duringLead, duringVoice, plays: plays.length }));
+    """)
+    swell = result["swell"]
+    assert swell == pytest.approx(0.09)
+    # The goal event's roar is reused, at the crowd's full level through the lead.
+    assert result["duringLead"] == {"roar": pytest.approx(swell), "roars": 1}
+    assert result["plays"] == 1
+    # Half the roar under the voice; the bed takes its usual duck.
+    assert result["duringVoice"]["roar"] == pytest.approx(swell * 0.5)
+    assert result["duringVoice"]["bed"] == pytest.approx(0.01)
+
+
+def test_the_clip_behind_a_goal_line_plays_next_in_order() -> None:
+    result = _goal_lead("""
+      queue.enqueue({ id: "goal-line", kind: "line", lineId: "goal-line", tier: "goal",
+                      expiresAt: now + LINE_AUDIO_STALE_MS });
+      step(100);
+      queue.enqueue({ id: "next-line", kind: "line", lineId: "next-line", tier: "tactical",
+                      expiresAt: now + LINE_AUDIO_STALE_MS });
+      step(1800);
+      const first = plays.map((p) => p.src);
+      step(2000);
+      queue.el.handlers.ended();
+      const endedAt = now;
+      step(1000);
+      console.log(JSON.stringify({ first, order: plays.map((p) => p.src),
+                                   nextAfter: plays[1].at - endedAt }));
+    """)
+    assert result["first"] == ["goal-line"]
+    assert result["order"] == ["goal-line", "next-line"]
+    assert result["nextAfter"] == 300

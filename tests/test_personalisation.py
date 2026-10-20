@@ -85,6 +85,11 @@ def test_the_same_match_reads_differently_in_casual_and_analyst(
     casual_shape = [r.line.text for r in casual if r.line.delivery_tier == "formation"]
     analyst_shape = [r.line.text for r in analyst if r.line.delivery_tier == "formation"]
     assert casual_shape and all("-" not in text.split(".")[0] for text in casual_shape)
+    # Casual says what changed, in words: m01's 4-3-3 to 4-2-3-1, then the back three, both
+    # while Ashbridge chase the game.
+    assert any("an extra body in midfield as they chase this" in text for text in casual_shape)
+    assert any("go to a back three as they chase this" in text for text in casual_shape)
+    assert not any("change their shape" in text for text in casual_shape)
     assert any("3-4-3" in text for text in analyst_shape)
 
 
@@ -93,7 +98,8 @@ def test_every_casual_fallback_template_states_at_most_one_number() -> None:
         "team": "Ashbridge Rovers", "player_name": "Juno Kestrelane", "colour": "yellow",
         "player_on_name": "Ivo Brackwater", "player_off_name": "Pell Dunmore",
         "formation": "3-4-3", "previous_formation": "4-2-3-1", "new_formation": "3-4-3",
-        "back_line": ", a back three now", "chance_descriptor": "a big chance",
+        "back_line": ", a back three now", "shape_change": "go to a back three as they chase this",
+        "chance_descriptor": "a big chance",
         "chance_descriptor_title": "A big chance", "players_on_pitch": 10, "after": 61,
         "before": 45, "window": 10, "window_words": "ten", "recent": 6,
         "score_phrase": "Ashbridge lead 2-1",
@@ -386,3 +392,26 @@ def test_my_teams_goals_swell_more_and_the_other_sides_less() -> None:
     assert result["home"] == pytest.approx(0.09 * 1.4)
     assert result["away"] == pytest.approx(0.09 * 0.6)
     assert json.dumps(result)  # plain numbers
+
+
+@pytest.mark.parametrize(
+    ("previous", "new", "trailing", "phrase"),
+    [
+        ("4-2-3-1", "3-4-3", True, "go to a back three as they chase this"),
+        ("4-3-3", "4-2-3-1", False, "put an extra body in midfield"),
+        ("4-4-2", "4-3-3", False, "push an extra player up front"),
+        ("4-2-3-1", "4-4-1", False, "drop a player from midfield"),  # m02's red-card reshape
+        ("4-4-2", "4-4-1", False, "drop a player from up front"),
+        ("3-4-3", "4-4-2", False, "go back to a back four"),
+        (None, "4-4-2", False, "change their shape"),
+    ],
+)
+def test_casual_shape_changes_are_described_without_formation_numbers(
+    previous: str | None, new: str, trailing: bool, phrase: str
+) -> None:
+    from second_screen_pundit.agents.wording import shape_change_phrase
+
+    assert shape_change_phrase(previous, new, trailing=trailing) == phrase
+    line = f"Ashbridge Rovers {phrase}. Port Calder lead 2-1."
+    # The score is the line's one number; "a back three" is shape, not a statistic.
+    assert count_numbers(line) == 1

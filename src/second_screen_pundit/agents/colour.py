@@ -234,6 +234,15 @@ def _as_of_minute(events: list[Event], as_of: int, minute: int) -> int:
     )
 
 
+def second_half_started(events: list[Event], as_of: int) -> bool:
+    return any(event.period == 2 for event in events if event.seq <= as_of)
+
+
+def is_half_time_summary(candidate: ColourLineCandidate) -> bool:
+    """A line about the first half as a whole: said at the break or not at all."""
+    return any(key.endswith(":first_half") for key in candidate.statistic_keys)
+
+
 def _possession_candidates(
     info: MatchInfo,
     events: list[Event],
@@ -252,7 +261,7 @@ def _possession_candidates(
         specs.append(("possession-match-v1", "match_to_date", 0, min(91, clock + 1), "match"))
     if clock >= 45:
         first_half_as_of = _as_of_minute(events, as_of, 45)
-        if first_half_as_of:
+        if first_half_as_of and not second_half_started(events, as_of):
             specs.append(("possession-first-half-v1", "first_half", 0, 45, "first"))
         if clock > 45:
             specs.append(
@@ -351,7 +360,7 @@ def _shots_candidates(
         specs.append(("shots-match-v1", "match_to_date", 0, min(91, clock + 1), "match"))
     if clock >= 45:
         first_half_as_of = _as_of_minute(events, as_of, 45)
-        if first_half_as_of:
+        if first_half_as_of and not second_half_started(events, as_of):
             specs.append(("shots-first-half-v1", "first_half", 0, 45, "first"))
         if clock > 45:
             specs.append(
