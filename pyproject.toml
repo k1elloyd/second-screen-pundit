@@ -25,6 +25,8 @@ dependencies = [
 dev = [
     "pytest==9.1.1",
     "python-dotenv==1.2.4",
+    # The build backend, so the package-data test can build the wheel offline.
+    "setuptools==84.0.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -32,7 +34,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "second_screen_pundit.engine" = ["*.yaml"]
-"second_screen_pundit" = ["web/*"]
+# A glob does not reach into subfolders, so web/audio needs its own entry.
+"second_screen_pundit" = ["web/*", "web/audio/*.mp3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
